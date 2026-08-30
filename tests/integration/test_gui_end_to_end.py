@@ -24,7 +24,6 @@ def test_gui_edit_and_save_roundtrip(work_xlam: Path):
         window = MainWindow(root)
         window.load_path(work_xlam)
         assert window.draft is not None
-        before = work_xlam.read_bytes()
 
         # Select Module1 and type into the real Text widget.
         module_id = next(

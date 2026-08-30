@@ -53,7 +53,7 @@ def split_attribute_header(source: str) -> tuple[str, str]:
         header_lines.pop()
     header = "\n".join(header_lines)
     body = "\n".join(lines[header_end:])
-    if body.startswith("\r") or body.startswith("\n"):
+    if body.startswith(("\r", "\n")):
         body = body[1:]
     return header, body
 

@@ -338,7 +338,7 @@ class PyOpenVBAAdapter:
         if len(raw) > 8 * 1024 * 1024:
             raise AdapterError("Import file is unreasonably large.")
         text = to_editor_text(raw.decode("utf-8", errors="strict"))
-        header, body = split_attribute_header(text)
+        header, _ = split_attribute_header(text)
         is_class = "VERSION 1.0 CLASS" in header
         name = path.stem
         return name, text, is_class

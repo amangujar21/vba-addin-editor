@@ -71,7 +71,7 @@ class ImportExportService:
         return path.stem, text, is_class
 
     def import_as_new(self, draft: DocumentDraft, path: Path, name: str) -> ModuleDraft:
-        suggested, text, is_class = self.read_import(path)
+        _, text, is_class = self.read_import(path)
         mod = ModuleDraft(
             id=new_module_id(),
             origin_name=None,

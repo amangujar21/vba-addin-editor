@@ -14,13 +14,13 @@ def _adapter():
 
 
 def make_service(**overrides):
-    base = dict(
-        adapter=_adapter(),
-        process_probe=lambda p: False,
-        exclusive_probe=lambda p: None,
-        commit=None,
-        progress=None,
-    )
+    base = {
+        "adapter": _adapter(),
+        "process_probe": lambda p: False,
+        "exclusive_probe": lambda p: None,
+        "commit": None,
+        "progress": None,
+    }
     base.update(overrides)
     return SaveService(**base)
 
@@ -200,7 +200,6 @@ def test_signature_confirmation_required(work_xlam):
 
 def test_save_copy_does_not_touch_original(work_xlam, tmp_path):
     draft = DocumentService().open(work_xlam)
-    before = work_xlam.read_bytes()
     edit_module1(draft)
     dest = tmp_path / "copy.xlam"
     result = make_service().save_copy(draft, dest)
