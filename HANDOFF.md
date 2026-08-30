@@ -28,15 +28,25 @@ Dependency pin: `pyopenvba==3.4.0` exact. Python 3.10.10 used for dev/build.
 
 ## Verified state
 
-- `python -m pytest tests -q` → 33 passed. Includes: full save→backup→
-  in-place-replace round trip on an Excel-authored template; rename chains;
-  combined add+rename+delete; blocked saves (Office running / locked /
-  external change / commit failure) leave the original byte-identical;
-  no-change save writes nothing; scripted GUI end-to-end save.
-- Onedir build (`dist\VBAAddinEditor\VBAAddinEditor.exe`) packaged and
-  smoke-tested: `--self-test` and `--self-roundtrip` exit 0.
-- Not yet run: `scripts\build.ps1 -Onefile` (single-file release exe + SHA-256).
-- Repo is **not** under git yet — no commits made.
+- `python -m pytest tests -q` → 35 passed (4 skips: live fixtures absent).
+  Unit/integration coverage includes: full save→backup→in-place-replace
+  round trip on an Excel-authored template; rename chains; combined
+  add+rename+delete; blocked saves (Office running / locked / external
+  change / commit failure) leave the original byte-identical; no-change
+  save writes nothing; scripted GUI end-to-end save.
+- `tests/integration/test_live_office_fixtures.py` stages the release gate
+  (plan §4.3/§4.5) as `@pytest.mark.live` tests: edit+add+rename+delete +
+  real in-place save + reopen verification, plus a no-change-write check,
+  parametrized over authentic fixtures
+  `tests/fixtures/xlam/RealAddin.xlam` / `tests/fixtures/ppam/RealAddin.ppam`.
+  They skip with fixture-creation instructions until a human drops real
+  Office-authored add-ins in (fixtures dir is gitignored).
+- `ruff check .` → clean (all 7 prior findings resolved).
+- Onefile release built and smoke-tested:
+  `dist\VBAAddinEditor.exe` + `dist\VBAAddinEditor.exe.sha256`
+  (SHA-256 9883B694…4528BA from the pre-lint-fix build was refreshed by the
+  final rebuild; the `.sha256` file is authoritative).
+- Repo is under git; two commits on `main`.
 
 ## Key decisions (why the code looks like this)
 
@@ -69,26 +79,16 @@ restores the backup if final verification fails.
 
 ## Remaining work
 
-1. **Run the onefile release build** (the plan's release artifact):
-   ```powershell
-   powershell -File scripts\build.ps1 -Onefile
-   ```
-   Confirms `dist\VBAAddinEditor.exe` (single file) + `dist\VBAAddinEditor.exe.sha256`.
-2. **Live Office release qualification** (plan §4, §29) — **requires a human
+1. **Live Office release qualification** (plan §4, §29) — **requires a human
    with real Office**; the agent cannot do this:
    - Create authentic `.xlam` and `.ppam` via Office "Save As" (not synthetic
      templates) and drop them in `tests/fixtures/xlam/` and `tests/fixtures/ppam/`.
-   - Run the edit / add / rename / delete cycle against them.
-   - Reopen from the installed path in Excel/PowerPoint; verify **no repair
-     dialog** and that the updated macro runs.
-   - Everything is staged for this: add adapter round-trip tests marked
-     `@pytest.mark.live` that skip when the fixtures are absent.
-3. **Initialize git** in this directory and commit (nothing is version
-   controlled yet). Suggested sequence mirrors plan §66.
-4. Optional: fix the 7 remaining ruff findings (intentional local-time backup
-   stamp DTZ005, C408, PIE810, RUF059 unused unpacks) or add `# noqa` where
-   intentional.
-5. After live PPAM/XLAM proof passes: update README "Release gating" section;
+   - Run `pytest tests -m live -v` — the staged release-gate cycle
+     (edit / add / rename / delete / in-place save / reopen verify) now runs
+     against the real fixtures automatically.
+   - Human steps the tests cannot do: reopen from the installed path in
+     Excel/PowerPoint; verify **no repair dialog** and that the updated macro runs.
+2. After live PPAM/XLAM proof passes: update README "Release gating" section;
    consider upstreaming the PPAM patch to pyOpenVBA (plan §49).
 
 ## Maintenance notes
