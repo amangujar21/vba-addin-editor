@@ -1,6 +1,6 @@
 # HANDOFF — VBA Add-in Editor project state
 
-_Date: 2026-08-30. Implementation of
+_Date: 2026-08-31. Implementation of
 `VBA_Addin_Editor_XML_and_Context_Menu_Implementation_Plan.md` (3169 lines) is
 complete, including the source fix specified by
 `XML_MALFORMED_PART_FIX_HANDOFF.md`. Automated qualification is complete;
@@ -14,7 +14,7 @@ Single app in this directory (`vba-addin-editor/`), Windows-only, offline,
 Tkinter/ttk GUI. Edits VBA source inside installed Excel `.xlam` /
 PowerPoint `.ppam` add-ins **in place** (same path) with mandatory backup,
 candidate verification, and `ReplaceFileW` commit. `.pptm` is a first-class
-document type. `.ppam`/`.pptm` also expose an **XML editor** for existing
+document type. `.xlam`/`.ppam`/`.pptm` expose an **XML editor** for existing
 package parts (`.xml`, `.rels`, `[Content_Types].xml`) flowing through the same
 safe-save transaction as VBA changes. Right-click Cut/Copy/Paste is shared
 text-widget behavior in both editors. No COM, no Python install needed at
@@ -35,7 +35,7 @@ runtime.
 | GUI (notebook: VBA + XML tabs) | `src/vba_addin_editor/ui/main_window.py`, `ui/code_editor.py` |
 | XML editor — **new** | `src/vba_addin_editor/ui/xml_editor.py` |
 | Shared right-click context menu — **new** | `src/vba_addin_editor/ui/text_context_menu.py` |
-| Tests (149: 144 green + 5 live-skips) | `tests/` (unit + integration; GUI drives real Text widgets) |
+| Tests (151: 146 green + 5 live-skips) | `tests/` (unit + integration; GUI drives real Text widgets) |
 | Live release gate (needs real fixtures) | `tests/integration/test_live_office_fixtures.py` |
 | Packaging | `packaging/VBAAddinEditor.spec`, `scripts/build.ps1`, `scripts/test.ps1` |
 
@@ -44,7 +44,7 @@ No new third-party dependency was added (zipfile/codecs/ElementTree only).
 
 ## Verified state
 
-- `python -m pytest tests -q` → 144 passed, 5 skips (live fixtures absent).
+- `python -m pytest tests -q` → 146 passed, 5 skips (live fixtures absent).
   Coverage includes: the full XLAM/PPAM regression matrix; PPTM VBA-only,
   XML-only, and combined saves with payload isolation; XML codec round-trips
   (UTF-8/UTF-16 BOMs, declarations, newlines); OOXML adapter discovery,
@@ -54,12 +54,15 @@ No new third-party dependency was added (zipfile/codecs/ElementTree only).
   Malformed-baseline regressions cover empty/malformed/undecodable parts,
   synthetic PPAM open/VBA-save/reopen, byte preservation, changed-XML
   validation, untouched-part tamper detection, XLAM tolerance, and the real Tk
-  XML read-only/VBA-save flow.
+  XML read-only/VBA-save flow. XLAM coverage now includes package discovery,
+  enabled XML-tab state, a real Text-widget XML edit, save, and reopen.
 - **Onefile release:**
   `dist\VBAAddinEditor.exe` + `dist\VBAAddinEditor.exe.sha256` (authoritative).
-  SHA-256: `840647C7464805322C918F08776CA031609F09D7B42B2235FA73AB7C9DC9C32A`.
-  Rebuilt after malformed-part commits. The scripted XLAM `--self-test` and
-  `--self-roundtrip` exit 0. Additional packaged smoke tests exit 0 for both
+  SHA-256: `63DC21B3F82628B7DFF4864B5B191B7F903B34756D484119086928F2AA5DD2FA`.
+  Rebuilt after enabling XML editing for XLAM. Against the user's exact
+  `dist\TestAddin.xlam`, packaged `--self-test` reports 75 modules and 10 XML
+  parts, and packaged `--self-roundtrip` exits 0. Additional packaged smoke
+  tests from the malformed-part release exited 0 for both
   modes on a synthetic PPTM and a synthetic PPAM with empty
   `ppt/presentation.xml`; the PPAM member remains byte-identical (`b""`).
 - **Onedir build** `dist\VBAAddinEditor\` predates the malformed-part rebuild.
@@ -126,13 +129,26 @@ records only current status. The optional exact-file gate is
 `test_exact_malformed_ppam_vba_save_preserves_baseline_part` in
 `tests/integration/test_live_office_fixtures.py`.
 
+## XLAM XML-tab fix state
+
+The XML editor was unintentionally gated to `.ppam`/`.pptm`, even though XLAM
+is an OOXML ZIP package and the save pipeline is host-neutral. This caused both
+the document service to skip XML snapshots and Tk to disable the whole XML tab.
+`XML_EDITABLE_EXTENSIONS` now includes `.xlam`; the UI, document service, save
+pipeline, and headless self-test all consume that shared gate. Regression tests
+cover XLAM package discovery and the complete GUI XML edit/save/reopen path.
+
+The original source-level repro against `dist\TestAddin.xlam` changed from
+`xml_tab_state=disabled xml_parts=0` to
+`xml_tab_state=normal xml_parts=10`. The rebuilt onefile executable confirms
+the same package discovery and completes a combined VBA+XML round-trip on a
+temporary copy, leaving the user's fixture unchanged.
+
 ## Release provenance
 
 Decoded-CMG protection-state handling is committed as `4fd9434`; malformed or
-unexpected CMG data fails closed. The onefile EXE above was rebuilt from the
-app source at that commit after the malformed-part commits. The subsequent
-handoff/specification commit changes documentation only, so the packaged app
-source is reproducible from Git.
+unexpected CMG data fails closed. The onefile EXE above includes that work, the
+malformed-part fix, and the XLAM XML-tab fix documented here.
 
 ## Remaining work
 

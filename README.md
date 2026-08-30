@@ -2,7 +2,7 @@
 
 Edit VBA source inside installed Excel `.xlam` and PowerPoint `.ppam` add-ins,
 and PowerPoint `.pptm` presentations — directly, in place, without the VBA
-IDE, and without reinstalling the add-in. For `.ppam`/`.pptm`, existing XML
+IDE, and without reinstalling the add-in. For `.xlam`/`.ppam`/`.pptm`, existing XML
 package parts (`.xml`, `.rels`, `[Content_Types].xml`) can be edited too.
 
 VBA Add-in Editor safely patches the VBA project inside the actual installed
@@ -14,8 +14,9 @@ updated code the next time it starts.
 
 1. Close Excel/PowerPoint.
 2. Open the installed `.xlam` / `.ppam` / `.pptm` in VBA Add-in Editor.
-3. Edit code; add/rename/delete standard and class modules. On `.ppam`/`.pptm`,
-   switch to the **XML** tab to edit existing package parts.
+3. Edit code; add/rename/delete standard and class modules. On
+   `.xlam`/`.ppam`/`.pptm`, switch to the **XML** tab to edit existing package
+   parts.
 4. **Save File** — the tool verifies the original has not changed, builds a
    verified candidate file, creates a backup, and atomically replaces the
    original using Windows `ReplaceFileW` (preserving ACLs and metadata).
@@ -31,7 +32,7 @@ updated code the next time it starts.
   untouched.
 - **No change means no write.** Saving without edits never rewrites the file.
 - **Password-protected projects are read-only.** No bypass exists. (XML-only
-  package edits on `.ppam`/`.pptm` remain possible; they never modify the
+  package edits on `.xlam`/`.ppam`/`.pptm` remain possible; they never modify the
   protected VBA project.)
 - **Strict encoding.** Characters that cannot be stored in the project's code
   page block the save instead of being silently replaced.
@@ -87,9 +88,9 @@ dialog and runs the updated macro from the same installed path) requires the
 live Office qualification matrix from the implementation plan
 (`VBA_Addin_Editor_Implementation_Plan.md`, sections 4 and 29) run against
 authentic Office-authored `.xlam`/`.ppam` fixtures. The XML feature adds the
-same requirement for authentic `.ppam`/`.pptm` fixtures: the automated live
-cycle edits a known XML marker and VBA code in one save, and the human gate
-verifies PowerPoint opens the saved file with **no repair dialog**.
+same requirement for authentic `.xlam`/`.ppam`/`.pptm` fixtures: the automated
+live cycle edits a known XML marker and VBA code in one save, and the human gate
+verifies Excel or PowerPoint opens the saved file with **no repair dialog**.
 
 ### Dependency pin
 

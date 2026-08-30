@@ -19,9 +19,12 @@ def self_test(path: Path) -> int:
         return 2
     adapter = PyOpenVBAAdapter()
     package = None
-    if path.suffix.lower() in {".ppam", ".pptm"}:
-        from vba_addin_editor.adapters.ooxml_package_adapter import OoxmlPackageAdapter
+    from vba_addin_editor.adapters.ooxml_package_adapter import (
+        XML_EDITABLE_EXTENSIONS,
+        OoxmlPackageAdapter,
+    )
 
+    if path.suffix.lower() in XML_EDITABLE_EXTENSIONS:
         package = OoxmlPackageAdapter()
     try:
         snapshot = adapter.open_snapshot(path, fp)

@@ -197,7 +197,7 @@ class MainWindow:
         if draft.baseline.safety.password_protected:
             self._set_banner(
                 "This VBA project is password-protected. VBA editing is disabled; "
-                "XML package editing remains available for .ppam/.pptm files."
+                "XML package editing remains available for .xlam/.ppam/.pptm files."
             )
         elif draft.baseline.safety.host_process_running:
             host = "Excel" if draft.baseline.host_kind == "excel" else "PowerPoint"

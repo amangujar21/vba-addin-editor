@@ -1,6 +1,6 @@
 """OOXML package adapter: XML part discovery, signature detection, ZIP rewrite.
 
-Owns all zipfile/XML byte manipulation for editable PowerPoint packages
+Owns all zipfile/XML byte manipulation for editable OOXML packages
 (plan sections 5.1, 9, 13). Must not understand VBA module semantics; GUI and
 services never touch ZIP entries directly.
 """
@@ -26,7 +26,7 @@ from vba_addin_editor.domain.document import (
 )
 from vba_addin_editor.domain.results import CandidateVerificationResult
 
-XML_EDITABLE_EXTENSIONS = {".ppam", ".pptm"}
+XML_EDITABLE_EXTENSIONS = {".xlam", ".ppam", ".pptm"}
 XML_PART_SUFFIXES = {".xml", ".rels"}
 CONTENT_TYPES_NAME = "[Content_Types].xml"
 
@@ -66,7 +66,7 @@ def _check_duplicates(zf: zipfile.ZipFile, path: Path) -> None:
         )
 
 class OoxmlPackageAdapter:
-    """Standard-library-only OOXML package operations for .ppam/.pptm."""
+    """Standard-library-only OOXML package operations for supported Office files."""
     # -- discovery ---------------------------------------------------------
 
     def snapshot_xml_parts(self, path: Path) -> tuple[XmlPartSnapshot, ...]:

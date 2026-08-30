@@ -75,6 +75,14 @@ def test_pptm_draft_has_xml_parts(work_pptm):
     assert any(p.path.endswith(".rels") for p in draft.xml_parts)
 
 
+def test_xlam_draft_has_xml_parts(work_xlam):
+    draft = DocumentService().open(work_xlam)
+    assert draft.xml_parts, "XLAM should expose its OOXML parts"
+    paths = {part.path for part in draft.xml_parts}
+    assert "xl/workbook.xml" in paths
+    assert "[Content_Types].xml" in paths
+
+
 def test_xml_text_change_makes_draft_dirty(work_pptm):
     draft = _xml_draft(work_pptm)
     part = draft.xml_parts[0]

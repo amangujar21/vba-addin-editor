@@ -98,7 +98,7 @@ class SaveService:
         if has_xml and draft.baseline.package_safety.opc_signature_present:
             return SaveResult.blocked(
                 "package_signed",
-                "This PowerPoint package contains an OPC digital signature.\n"
+                "This Office package contains an OPC digital signature.\n"
                 "Editing package XML would invalidate that signature.\n"
                 "XML editing of package-signed files is blocked in this version.",
             )

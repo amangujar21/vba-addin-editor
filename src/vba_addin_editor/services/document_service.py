@@ -56,7 +56,7 @@ class DocumentService:
             raise AdapterError(str(exc), exc.details) from exc
         except (OSError, zipfile.BadZipFile) as exc:
             raise AdapterError(
-                "This PowerPoint package could not be read; the file has not been changed.",
+                "This Office package could not be read; the file has not been changed.",
                 {"exception": repr(exc)},
             ) from exc
         return replace(snapshot, xml_parts=xml_parts, package_safety=package_safety)

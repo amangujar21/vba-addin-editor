@@ -50,6 +50,38 @@ def test_gui_edit_and_save_roundtrip(work_xlam: Path):
         root.destroy()
 
 
+def test_gui_xlam_xml_edit_roundtrip(work_xlam: Path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    try:
+        window = MainWindow(root)
+        window.load_path(work_xlam)
+
+        assert window.editor_notebook.tab(window.xml_tab, "state") == "normal"
+        assert window.draft is not None
+        assert window.draft.xml_parts, "XML tab should be populated for xlam"
+
+        window.editor_notebook.select(window.xml_tab)
+        window.xml_tree.selection_set("xml::docProps/core.xml")
+        root.update()
+        window.xml_editor.text.insert("end", "\n<!--VBAAE_XLAM_XML_EDITED-->")
+        window._flush_all_editors()
+        assert window.draft.xml_part_by_path("docProps/core.xml").is_dirty()
+
+        result = window.save_service.save_addin(window.draft)
+        assert result.kind == "success", result
+        reopened = DocumentService().open(work_xlam)
+        assert "<!--VBAAE_XLAM_XML_EDITED-->" in reopened.xml_part_by_path(
+            "docProps/core.xml"
+        ).text
+        assert not reopened.is_dirty()
+    finally:
+        root.destroy()
+
+
 def test_gui_xml_edit_roundtrip(work_pptm: Path):
     try:
         root = tk.Tk()
