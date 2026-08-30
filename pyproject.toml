@@ -1,0 +1,35 @@
+[project]
+name = "vba-addin-editor"
+version = "0.1.0"
+description = "Safely edit VBA source inside installed Excel .xlam and PowerPoint .ppam add-ins, in place, with backup and verification."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    # Exact pin: adapter relies on pyopenvba internals (_encoding_for_codepage,
+    # detect_signature, split_attribute_header). Change only with a test pass.
+    "pyopenvba==3.4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4", "pyright>=1.1.360"]
+build = ["pyinstaller>=6.6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "basic"
+pythonVersion = "3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
