@@ -2,9 +2,11 @@
 
 _Date: 2026-08-30. Implementation of
 `VBA_Addin_Editor_XML_and_Context_Menu_Implementation_Plan.md` (3169 lines) is
-complete (except the human live-Office gate); this document reflects the
-verified current state. The earlier `VBA_Addin_Editor_Implementation_Plan.md`
-(VBA core) remains the baseline reference._
+complete, including the source fix specified by
+`XML_MALFORMED_PART_FIX_HANDOFF.md`. Automated qualification is complete;
+the exact-customer-file and human live-Office gates remain. The earlier
+`VBA_Addin_Editor_Implementation_Plan.md` (VBA core) remains the baseline
+reference._
 
 ## What exists
 
@@ -33,7 +35,7 @@ runtime.
 | GUI (notebook: VBA + XML tabs) | `src/vba_addin_editor/ui/main_window.py`, `ui/code_editor.py` |
 | XML editor — **new** | `src/vba_addin_editor/ui/xml_editor.py` |
 | Shared right-click context menu — **new** | `src/vba_addin_editor/ui/text_context_menu.py` |
-| Tests (125: 121 green + 4 live-skips) | `tests/` (unit + integration; GUI drives real Text widgets) |
+| Tests (149: 144 green + 5 live-skips) | `tests/` (unit + integration; GUI drives real Text widgets) |
 | Live release gate (needs real fixtures) | `tests/integration/test_live_office_fixtures.py` |
 | Packaging | `packaging/VBAAddinEditor.spec`, `scripts/build.ps1`, `scripts/test.ps1` |
 
@@ -42,20 +44,26 @@ No new third-party dependency was added (zipfile/codecs/ElementTree only).
 
 ## Verified state
 
-- `python -m pytest tests -q` → 121 passed, 4 skips (live fixtures absent).
+- `python -m pytest tests -q` → 144 passed, 5 skips (live fixtures absent).
   Coverage includes: the full XLAM/PPAM regression matrix; PPTM VBA-only,
   XML-only, and combined saves with payload isolation; XML codec round-trips
   (UTF-8/UTF-16 BOMs, declarations, newlines); OOXML adapter discovery,
   duplicate rejection, signature detection, and limits; composite candidate
   verification; failure paths leaving the original byte-identical; GUI XML +
   combined round-trips; context-menu behavior on both editors (28 cases).
-- **Onefile release built and smoke-tested:**
+  Malformed-baseline regressions cover empty/malformed/undecodable parts,
+  synthetic PPAM open/VBA-save/reopen, byte preservation, changed-XML
+  validation, untouched-part tamper detection, XLAM tolerance, and the real Tk
+  XML read-only/VBA-save flow.
+- **Onefile release:**
   `dist\VBAAddinEditor.exe` + `dist\VBAAddinEditor.exe.sha256` (authoritative).
-  SHA-256: `892BCCFF558843E5EEF8D1E83D6F76E11B87DB572B313D8E665B789EE3352239`.
-  Packaged `--self-test` and `--self-roundtrip` exit 0 on `.xlam` and on a
-  synthetic `.pptm` (`modules=1 xml_parts=36`).
-- **Onedir build** `dist\VBAAddinEditor\` rebuilt fresh from final sources,
-  also smoke-tested. Debugging artifact only, gitignored.
+  SHA-256: `840647C7464805322C918F08776CA031609F09D7B42B2235FA73AB7C9DC9C32A`.
+  Rebuilt after malformed-part commits. The scripted XLAM `--self-test` and
+  `--self-roundtrip` exit 0. Additional packaged smoke tests exit 0 for both
+  modes on a synthetic PPTM and a synthetic PPAM with empty
+  `ppt/presentation.xml`; the PPAM member remains byte-identical (`b""`).
+- **Onedir build** `dist\VBAAddinEditor\` predates the malformed-part rebuild.
+  It is a debugging artifact only; rebuild it before using it for diagnosis.
 - `ruff check .` → clean.
 - CLI: `--self-test` reports `modules=N xml_parts=M` and works for
   `.xlam/.ppam/.pptm`; `--self-roundtrip` runs a combined VBA+XML candidate
@@ -77,6 +85,11 @@ No new third-party dependency was added (zipfile/codecs/ElementTree only).
 - **XML is written as user-typed bytes**: editor text (LF) is encoded with the
   part's original codec + BOM + dominant newline; ElementTree is used only for
   well-formedness/root-shape validation; DOCTYPE/ENTITY are rejected.
+- **Baseline XML tolerance:** an existing empty, malformed, or undecodable XML
+  member is per-part diagnostic state instead of a fatal Open error. It stays
+  visible but read-only and is never reconstructed. VBA editing/saving remains
+  available; every untouched malformed member must remain byte-identical, and
+  only XML in the explicit change set is parsed during candidate verification.
 - **Policy split by mutation type:** VBA signature confirmation only when VBA
   changes; password-protected VBA blocks only VBA mutations (XML-only saves
   are allowed and verified to keep `vbaProject.bin` byte-identical);
@@ -92,11 +105,34 @@ No new third-party dependency was added (zipfile/codecs/ElementTree only).
 ## Safety model (enforced, tested)
 
 No-change → no write. Office running / locked / external fingerprint → save
-blocked. Malformed or encoding-conflicting XML → `error`, original untouched.
-Candidate fully verified (VBA layer + XML layer) before anything is replaced.
-One save → one backup → one `ReplaceFileW`. Post-commit verification compares
-the saved original against the backup; failure → `recovery_required` with
-Restore Backup. Backup restore remains whole-file recovery.
+blocked. Pre-existing malformed XML is tolerated only while untouched and is
+preserved byte-for-byte; invalid or encoding-conflicting XML introduced by the
+editor → `error`, no candidate/backup/commit, original untouched. Candidate is
+fully verified (VBA + XML) before replacement. One save → one backup → one
+`ReplaceFileW`. Post-commit verification compares the saved original against
+the backup; failure → `recovery_required` with Restore Backup.
+
+## Malformed-part fix state
+
+Implemented and reviewed on `main`:
+
+- `5993412` — tolerate malformed baseline OOXML parts;
+- `167f2b7` — strengthen malformed OOXML regression coverage;
+- `63030fa` — finish malformed PPAM review refinements.
+
+The two-axis review found no remaining standards violation or automated spec
+gap. Requirements remain in `XML_MALFORMED_PART_FIX_HANDOFF.md`; this handoff
+records only current status. The optional exact-file gate is
+`test_exact_malformed_ppam_vba_save_preserves_baseline_part` in
+`tests/integration/test_live_office_fixtures.py`.
+
+## Release provenance
+
+Decoded-CMG protection-state handling is committed as `4fd9434`; malformed or
+unexpected CMG data fails closed. The onefile EXE above was rebuilt from the
+app source at that commit after the malformed-part commits. The subsequent
+handoff/specification commit changes documentation only, so the packaged app
+source is reproducible from Git.
 
 ## Remaining work
 
@@ -106,13 +142,16 @@ Restore Backup. Backup restore remains whole-file recovery.
      `tests/fixtures/xlam/RealAddin.xlam`,
      `tests/fixtures/ppam/RealAddin.ppam` (with a `customUI` part containing
      `VBAAE_XML_ORIGINAL`),
-     `tests/fixtures/pptm/RealPresentation.pptm` (same marker contract).
+     `tests/fixtures/pptm/RealPresentation.pptm` (same marker contract), and
+     the exact reproducer at
+     `tests/fixtures/live/ppam/ExistingMalformedPart.ppam`.
    - Run `pytest tests -m live -v` and complete the human PowerPoint gate:
-     open saved file with **no repair dialog**, edited macro runs, Ribbon/XML
-     marker reflects the edit, restore backup works.
-2. Rebuild onefile/onedir (`scripts/build.ps1 [-Onefile]`), re-run packaged
-   `--self-test`/`--self-roundtrip` on `.xlam`, `.ppam`, `.pptm`, record the
-   new SHA-256.
+     open the saved malformed-part PPAM in RibbonX Editor and PowerPoint with
+     **no repair dialog**, confirm the VBA edit, and confirm
+     `ppt/presentation.xml` is byte-identical. For generic fixtures, also
+     confirm the macro runs, Ribbon/XML marker changed, and backup restore works.
+2. Rebuild the debugging onedir artifact if needed, then repeat the exact
+   malformed-PPAM GUI workflow in the onefile EXE.
 3. Update README "Release gating" after the gate passes.
 
 ## Maintenance notes
@@ -132,3 +171,14 @@ Restore Backup. Backup restore remains whole-file recovery.
 - Synthetic fixtures (`tests/conftest.py` → `build_xlam`/`build_pptm`) are
   acceptable for parser/save-pipeline tests but are NOT a substitute for the
   live-Office gate.
+- Never reintroduce eager parse-all verification. Baseline parse failure is
+  per-part state; untouched bytes are the invariant, while changed XML remains
+  strict.
+
+## Suggested skills
+
+- Use `diagnose` if the exact customer PPAM still fails Open, Save, reload, or
+  packaged execution; reproduce against the untouched fixture first.
+- Use `code-review` for future changes to CMG protection-state handling.
+- Use `implement` for the remaining live qualification/reproducibility work,
+  and `handoff` again after the Office and packaged-EXE gates are recorded.
