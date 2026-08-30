@@ -26,6 +26,15 @@ class XmlEditor(CodeEditor):
         if part is None:
             self.header.config(text="")
             return
+        if not part.editable:
+            self.header.config(
+                text=(
+                    f"{part.path}  ·  READ-ONLY — This XML part was already malformed "
+                    "when the file was opened. It will be preserved exactly; VBA editing "
+                    f"and saving remain available.  {part.open_problem or ''}"
+                ).rstrip()
+            )
+            return
         newline = "CRLF" if part.newline == "\r\n" else "LF"
         warning = (
             "  — package-critical XML: invalid relationships/content types can "

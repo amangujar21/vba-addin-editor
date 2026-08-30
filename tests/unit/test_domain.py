@@ -86,6 +86,20 @@ def test_xml_text_change_makes_draft_dirty(work_pptm):
     assert [c.path for c in changes.xml_modified] == [part.path]
 
 
+def test_read_only_baseline_xml_cannot_become_dirty(work_pptm):
+    draft = _xml_draft(work_pptm)
+    part = draft.xml_parts[0]
+    part.editable = False
+    part.well_formed_on_open = False
+    part.open_problem = "pre-existing malformed XML"
+
+    part.text = (part.text or "") + "changed despite UI lock"
+
+    assert not part.is_dirty()
+    assert part not in draft.changed_xml_parts()
+    assert not draft.is_dirty()
+
+
 def test_xml_return_to_original_is_clean(work_pptm):
     draft = _xml_draft(work_pptm)
     part = draft.xml_parts[0]

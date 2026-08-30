@@ -94,11 +94,31 @@ def test_duplicate_member_names_rejected(tmp_path, adapter):
         adapter.snapshot_xml_parts(path)
 
 
-def test_invalid_existing_xml_part_blocks_open(tmp_path, adapter):
-    entries = base_entries() | {"ppt/slides/bad.xml": "<not-well-formed"}
+@pytest.mark.parametrize(
+    ("payload", "expected_text"),
+    [
+        (b"", ""),
+        (b"<not-well-formed", "<not-well-formed"),
+        (b"\xff\xfe\x00", None),
+    ],
+)
+def test_invalid_existing_xml_part_is_preserved_as_read_only_snapshot(
+    tmp_path, adapter, payload, expected_text
+):
+    entries = base_entries() | {"ppt/presentation.xml": payload}
     p = make_package(tmp_path / "a.pptm", entries)
-    with pytest.raises(PackageError):
-        adapter.snapshot_xml_parts(p)
+
+    parts = {part.path: part for part in adapter.snapshot_xml_parts(p)}
+
+    malformed = parts["ppt/presentation.xml"]
+    assert malformed.text == expected_text
+    assert not malformed.editable
+    assert not malformed.well_formed_on_open
+    assert malformed.open_problem
+    assert malformed.original_size == len(payload)
+    assert parts["ppt/slides/slide1.xml"].editable
+    assert parts["ppt/slides/slide1.xml"].well_formed_on_open
+    assert parts["ppt/slides/slide1.xml"].open_problem is None
 
 
 def test_oversized_part_blocked(tmp_path, adapter, monkeypatch):
@@ -226,6 +246,20 @@ def test_verifier_accepts_exact_change(tmp_path, adapter):
     draft = _draft_with_parts(src, [part])
     result = adapter.verify_candidate_xml(src, dest, draft)
     assert result.ok, result.problems
+
+
+def test_verifier_rejects_malformed_xml_in_declared_change_set(tmp_path, adapter):
+    src = make_package(tmp_path / "src.pptm", base_entries())
+    malformed = b"<broken"
+    candidate_entries = base_entries() | {"ppt/slides/slide1.xml": malformed}
+    dest = make_package(tmp_path / "cand.pptm", candidate_entries)
+    part = _draft_part("ppt/slides/slide1.xml", malformed.decode("utf-8"))
+    draft = _draft_with_parts(src, [part])
+
+    result = adapter.verify_candidate_xml(src, dest, draft)
+
+    assert not result.ok
+    assert any("not well-formed" in problem for problem in result.problems)
 
 
 def test_verifier_rejects_unexpected_xml_change(tmp_path, adapter):

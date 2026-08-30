@@ -246,7 +246,7 @@ class MainWindow:
         if draft is None or self.current_xml_part_path is None:
             return
         part = draft.xml_part_by_path(self.current_xml_part_path)
-        if part is not None:
+        if part is not None and part.editable:
             part.text = self.xml_editor.get_text()
 
     def _flush_all_editors(self) -> None:
@@ -283,8 +283,12 @@ class MainWindow:
         if part is None:
             return
         self.current_xml_part_path = path
-        self.xml_editor.set_text(part.text)
+        # Re-enable before replacing widget contents in case the previously
+        # selected baseline part was read-only.
         self.xml_editor.text.config(state="normal")
+        self.xml_editor.set_text(part.text or "")
+        if not part.editable:
+            self.xml_editor.text.config(state="disabled")
         self.xml_editor.set_part_info(part)
         self.validate_xml_btn.config(state="normal")
         self._refresh_state()
@@ -297,7 +301,8 @@ class MainWindow:
         for part in sorted(draft.xml_parts, key=lambda p: p.path.lower()):
             marker = " *" if part.is_dirty() else ""
             iid = "xml::" + part.path
-            self.xml_tree.insert("", "end", iid=iid, text=part.path + marker)
+            warning = "⚠ " if not part.editable else ""
+            self.xml_tree.insert("", "end", iid=iid, text=warning + part.path + marker)
 
     def _active_text_editor(self):
         if str(self.editor_notebook.select()) == str(self.xml_tab):
@@ -311,6 +316,9 @@ class MainWindow:
         self._flush_active_xml_editor()
         part = draft.xml_part_by_path(self.current_xml_part_path)
         if part is None:
+            return
+        if not part.editable:
+            messagebox.showerror(APP_NAME, part.open_problem or "This XML part is read-only.")
             return
         problems = self.doc_service.package_adapter.validate_draft_part(part)
         if problems:
@@ -342,6 +350,7 @@ class MainWindow:
         self.editor_notebook.tab(self.xml_tab, state="normal" if xml_supported else "disabled")
         if xml_supported:
             self.xml_editor.set_part_info(None)
+            self.xml_editor.text.config(state="normal")
             self.xml_editor.set_text("")
             self.validate_xml_btn.config(state="disabled")
         first = next((m.id for m in draft.modules if not m.is_deleted), None)

@@ -93,6 +93,32 @@ def test_undecodable_bytes_rejected():
 
 # -- validation ---------------------------------------------------------------
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        b"   \r\n",
+        b"\xef\xbb\xbf",
+        b"<root>",
+        b'<?xml version="1.0" encoding="NOT-A-CODEC"?><root/>',
+    ],
+)
+def test_invalid_baseline_bytes_report_problems_without_crashing(raw):
+    assert validate_xml_bytes(raw, part_path="ppt/presentation.xml")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"<root/>",
+        b'<?xml version="1.0" encoding="UTF-8"?><root/>',
+        b'<?xml version="1.0" encoding="ISO-8859-1"?><root a="\xe9"/>',
+    ],
+)
+def test_valid_baseline_bytes_remain_valid(raw):
+    assert validate_xml_bytes(raw, part_path="ppt/presentation.xml") == ()
+
+
 def test_malformed_xml_reports_line_column():
     problems = validate_xml_bytes(b"<root>\n  <bad\n</root>", part_path="x.xml")
     assert problems and "line 3" in problems[0]

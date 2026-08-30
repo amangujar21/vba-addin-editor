@@ -65,14 +65,17 @@ class XmlPartSnapshot:
     """Immutable open-time state of one editable XML package part."""
 
     path: str  # exact ZIP member name, no leading "/"
-    text: str  # LF-normalized for the editor
-    encoding: str  # canonical codec name for the payload (without BOM)
+    text: str | None  # LF-normalized; None when the baseline cannot be decoded
+    encoding: str | None  # canonical payload codec; None when decoding failed
     bom: bytes
     newline: str  # dominant original newline: "\n" or "\r\n"
     original_sha256: str
     original_size: int
     is_relationships_part: bool
     is_content_types_part: bool
+    editable: bool = True
+    well_formed_on_open: bool = True
+    open_problem: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,16 +111,19 @@ class XmlPartDraft:
     """Editable state of one XML package part."""
 
     path: str
-    text: str
-    original_text: str
-    encoding: str
+    text: str | None
+    original_text: str | None
+    encoding: str | None
     bom: bytes
     newline: str
     is_relationships_part: bool
     is_content_types_part: bool
+    editable: bool = True
+    well_formed_on_open: bool = True
+    open_problem: str | None = None
 
     def is_dirty(self) -> bool:
-        return self.text != self.original_text
+        return self.editable and self.text != self.original_text
 
 
 @dataclass
@@ -205,6 +211,9 @@ def draft_from_snapshot(snapshot: DocumentSnapshot) -> DocumentDraft:
             newline=p.newline,
             is_relationships_part=p.is_relationships_part,
             is_content_types_part=p.is_content_types_part,
+            editable=p.editable,
+            well_formed_on_open=p.well_formed_on_open,
+            open_problem=p.open_problem,
         )
         for p in snapshot.xml_parts
     ]

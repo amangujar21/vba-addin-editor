@@ -12,6 +12,7 @@ import zipfile
 from pathlib import Path
 
 from vba_addin_editor.adapters.xml_codec import (
+    XmlCodecError,
     decode_xml,
     encode_xml,
     validate_xml_bytes,
@@ -91,30 +92,31 @@ class OoxmlPackageAdapter:
                     )
                 try:
                     decoded = decode_xml(raw)
-                except Exception as exc:  # conservative open failure, translated below
-                    raise PackageError(
-                        f"Package XML part {info.filename!r} could not be decoded; "
-                        "the file has not been changed.",
-                        {"exception": repr(exc)},
-                    ) from exc
-                problems = validate_xml_bytes(raw, part_path=info.filename)
-                if problems:
-                    raise PackageError(
-                        f"Package XML part {info.filename!r} is not valid: "
-                        + "; ".join(problems),
-                    )
+                except XmlCodecError as exc:
+                    decoded = None
+                    problems = (f"{info.filename}: {exc}",)
+                else:
+                    problems = validate_xml_bytes(raw, part_path=info.filename)
+
+                # Existing OOXML packages can contain XML parts that our editor
+                # cannot parse even though Office/other tooling tolerates them.
+                # Baseline parse failure is per-part state, not an open failure;
+                # untouched members are copied and verified byte-for-byte.
                 lowered = info.filename.lower()
                 parts.append(
                     XmlPartSnapshot(
                         path=info.filename,
-                        text=decoded.text,
-                        encoding=decoded.encoding,
-                        bom=decoded.bom,
-                        newline=decoded.newline,
+                        text=decoded.text if decoded is not None else None,
+                        encoding=decoded.encoding if decoded is not None else None,
+                        bom=decoded.bom if decoded is not None else b"",
+                        newline=decoded.newline if decoded is not None else "\n",
                         original_sha256=hashlib.sha256(raw).hexdigest(),
                         original_size=len(raw),
                         is_relationships_part=lowered.endswith(".rels"),
                         is_content_types_part=lowered == CONTENT_TYPES_NAME.lower(),
+                        editable=not problems,
+                        well_formed_on_open=not problems,
+                        open_problem="; ".join(problems) if problems else None,
                     )
                 )
         parts.sort(key=lambda p: p.path.lower())
@@ -254,6 +256,11 @@ class OoxmlPackageAdapter:
                         problems.append(f"Changed XML part missing from candidate: {path!r}")
                         continue
                     part = draft.xml_part_by_path(path)
+                    if part is None or part.text is None or part.encoding is None:
+                        problems.append(
+                            f"Changed XML part {path!r} has no editable text metadata."
+                        )
+                        continue
                     expected = encode_xml(
                         part.text, encoding=part.encoding, bom=part.bom, newline=part.newline
                     )
@@ -262,6 +269,11 @@ class OoxmlPackageAdapter:
                         problems.append(
                             f"Changed XML part {path!r} does not match the edited draft bytes."
                         )
+                    problems.extend(validate_xml_bytes(actual, part_path=path))
+
+                # Do not parse untouched baseline XML here. A malformed
+                # pre-existing part is allowed, but it must remain byte-identical.
+                # Changed XML is validated separately above.
                 for path in sorted(ref_names - changed):
                     if _is_editable_xml_part(path) and ref.read(path) != cand.read(path):
                         problems.append(

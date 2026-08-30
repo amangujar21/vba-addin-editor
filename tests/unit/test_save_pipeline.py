@@ -228,6 +228,18 @@ def _payloads(path):
         return {i.filename: zf.read(i.filename) for i in zf.infolist()}
 
 
+def _replace_payload(path, member, replacement):
+    import zipfile
+
+    temp = path.with_suffix(".malformed" + path.suffix)
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(temp, "w") as dst:
+        for info in src.infolist():
+            data = replacement if info.filename == member else src.read(info.filename)
+            dst.writestr(info, data)
+        dst.comment = src.comment
+    temp.replace(path)
+
+
 def test_pptm_xml_only_save(work_pptm):
     draft = DocumentService().open(work_pptm)
     before = _payloads(work_pptm)
@@ -287,6 +299,53 @@ def test_pptm_vba_only_save_keeps_xml_payloads(work_pptm):
         if name == "ppt/vbaProject.bin":
             continue
         assert after[name] == data, name
+
+
+def test_pptm_vba_only_save_preserves_malformed_baseline_xml(work_pptm):
+    malformed_path = "ppt/presentation.xml"
+    _replace_payload(work_pptm, malformed_path, b"")
+
+    draft = DocumentService().open(work_pptm)
+    malformed = draft.xml_part_by_path(malformed_path)
+    assert malformed is not None
+    assert not malformed.editable
+    assert malformed.open_problem
+    assert not draft.is_dirty()
+    before = _payloads(work_pptm)
+
+    edit_module1(draft)
+    result = make_service().save_addin(draft)
+
+    assert result.kind == "success", result
+    assert result.backup_path is not None and result.backup_path.exists()
+    after = _payloads(work_pptm)
+    assert after[malformed_path] == before[malformed_path] == b""
+    for name, data in before.items():
+        if name != "ppt/vbaProject.bin":
+            assert after[name] == data, name
+
+    reopened = DocumentService().open(work_pptm)
+    module = next(m for m in reopened.modules if m.current_name == "Module1")
+    assert "V2" in module.body
+    assert not reopened.xml_part_by_path(malformed_path).editable
+    assert not reopened.is_dirty()
+
+
+def test_xlam_vba_only_save_tolerates_malformed_outer_xml(work_xlam):
+    malformed_path = "xl/workbook.xml"
+    _replace_payload(work_xlam, malformed_path, b"")
+    before = _payloads(work_xlam)
+
+    draft = DocumentService().open(work_xlam)
+    edit_module1(draft)
+    result = make_service().save_addin(draft)
+
+    assert result.kind == "success", result
+    after = _payloads(work_xlam)
+    assert after[malformed_path] == before[malformed_path] == b""
+    reopened = DocumentService().open(work_xlam)
+    module = next(m for m in reopened.modules if m.current_name == "Module1")
+    assert "V2" in module.body
 
 
 def test_pptm_malformed_xml_leaves_original_untouched(work_pptm):
