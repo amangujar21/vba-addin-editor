@@ -228,18 +228,6 @@ def _payloads(path):
         return {i.filename: zf.read(i.filename) for i in zf.infolist()}
 
 
-def _replace_payload(path, member, replacement):
-    import zipfile
-
-    temp = path.with_suffix(".malformed" + path.suffix)
-    with zipfile.ZipFile(path) as src, zipfile.ZipFile(temp, "w") as dst:
-        for info in src.infolist():
-            data = replacement if info.filename == member else src.read(info.filename)
-            dst.writestr(info, data)
-        dst.comment = src.comment
-    temp.replace(path)
-
-
 def test_pptm_xml_only_save(work_pptm):
     draft = DocumentService().open(work_pptm)
     before = _payloads(work_pptm)
@@ -301,9 +289,11 @@ def test_pptm_vba_only_save_keeps_xml_payloads(work_pptm):
         assert after[name] == data, name
 
 
-def test_pptm_vba_only_save_preserves_malformed_baseline_xml(work_pptm):
+def test_pptm_vba_only_save_preserves_malformed_baseline_xml(
+    work_pptm, replace_package_payload
+):
     malformed_path = "ppt/presentation.xml"
-    _replace_payload(work_pptm, malformed_path, b"")
+    replace_package_payload(work_pptm, malformed_path, b"")
 
     draft = DocumentService().open(work_pptm)
     malformed = draft.xml_part_by_path(malformed_path)
@@ -331,9 +321,36 @@ def test_pptm_vba_only_save_preserves_malformed_baseline_xml(work_pptm):
     assert not reopened.is_dirty()
 
 
-def test_xlam_vba_only_save_tolerates_malformed_outer_xml(work_xlam):
+def test_ppam_vba_only_save_preserves_malformed_baseline_xml(
+    work_ppam, replace_package_payload
+):
+    malformed_path = "ppt/presentation.xml"
+    replace_package_payload(work_ppam, malformed_path, b"")
+    before = _payloads(work_ppam)
+
+    draft = DocumentService().open(work_ppam)
+    assert draft.baseline.extension == ".ppam"
+    assert draft.modules
+    assert not draft.xml_part_by_path(malformed_path).editable
+    edit_module1(draft)
+
+    result = make_service().save_addin(draft)
+
+    assert result.kind == "success", result
+    assert result.backup_path is not None and result.backup_path.exists()
+    after = _payloads(work_ppam)
+    assert after[malformed_path] == before[malformed_path] == b""
+    reopened = DocumentService().open(work_ppam)
+    module = next(m for m in reopened.modules if m.current_name == "Module1")
+    assert "V2" in module.body
+    assert not reopened.xml_part_by_path(malformed_path).editable
+
+
+def test_xlam_vba_only_save_tolerates_malformed_outer_xml(
+    work_xlam, replace_package_payload
+):
     malformed_path = "xl/workbook.xml"
-    _replace_payload(work_xlam, malformed_path, b"")
+    replace_package_payload(work_xlam, malformed_path, b"")
     before = _payloads(work_xlam)
 
     draft = DocumentService().open(work_xlam)
@@ -357,6 +374,10 @@ def test_pptm_malformed_xml_leaves_original_untouched(work_pptm):
     assert result.kind == "error"
     assert result.reason == "invalid_xml"
     assert work_pptm.read_bytes() == before
+    assert not list(work_pptm.parent.glob(".*vbaae-candidate-*"))
+    assert not list(
+        work_pptm.parent.glob(f"{work_pptm.stem} - backup *{work_pptm.suffix}")
+    )
 
 
 def test_pptm_xml_encoding_conflict_blocked(work_pptm):

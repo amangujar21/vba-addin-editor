@@ -73,9 +73,15 @@ class XmlPartSnapshot:
     original_size: int
     is_relationships_part: bool
     is_content_types_part: bool
-    editable: bool = True
-    well_formed_on_open: bool = True
     open_problem: str | None = None
+
+    @property
+    def editable(self) -> bool:
+        return self.open_problem is None
+
+    @property
+    def well_formed_on_open(self) -> bool:
+        return self.open_problem is None
 
 
 @dataclass(frozen=True)
@@ -118,9 +124,15 @@ class XmlPartDraft:
     newline: str
     is_relationships_part: bool
     is_content_types_part: bool
-    editable: bool = True
-    well_formed_on_open: bool = True
     open_problem: str | None = None
+
+    @property
+    def editable(self) -> bool:
+        return self.open_problem is None
+
+    @property
+    def well_formed_on_open(self) -> bool:
+        return self.open_problem is None
 
     def is_dirty(self) -> bool:
         return self.editable and self.text != self.original_text
@@ -211,8 +223,6 @@ def draft_from_snapshot(snapshot: DocumentSnapshot) -> DocumentDraft:
             newline=p.newline,
             is_relationships_part=p.is_relationships_part,
             is_content_types_part=p.is_content_types_part,
-            editable=p.editable,
-            well_formed_on_open=p.well_formed_on_open,
             open_problem=p.open_problem,
         )
         for p in snapshot.xml_parts

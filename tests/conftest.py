@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -59,3 +60,28 @@ def work_pptm(tmp_path: Path, pptm_path: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(pptm_path, dest)
     return dest
+
+
+@pytest.fixture()
+def work_ppam(tmp_path: Path, pptm_path: Path) -> Path:
+    """A disposable PPAM-compatible copy with a real parseable VBA project."""
+    dest = tmp_path / "work" / "TestAddin.ppam"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(pptm_path, dest)
+    return dest
+
+
+@pytest.fixture()
+def replace_package_payload():
+    """Return a helper that replaces one ZIP member while preserving metadata."""
+
+    def replace(path: Path, member: str, replacement: bytes) -> None:
+        temp = path.with_suffix(".malformed" + path.suffix)
+        with zipfile.ZipFile(path) as src, zipfile.ZipFile(temp, "w") as dst:
+            for info in src.infolist():
+                data = replacement if info.filename == member else src.read(info.filename)
+                dst.writestr(info, data)
+            dst.comment = src.comment
+        temp.replace(path)
+
+    return replace

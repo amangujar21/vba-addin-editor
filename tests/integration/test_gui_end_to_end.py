@@ -15,16 +15,6 @@ from vba_addin_editor.services.document_service import DocumentService
 from vba_addin_editor.ui.main_window import MainWindow
 
 
-def _replace_payload(path: Path, member: str, replacement: bytes) -> None:
-    temp = path.with_suffix(".malformed" + path.suffix)
-    with zipfile.ZipFile(path) as src, zipfile.ZipFile(temp, "w") as dst:
-        for info in src.infolist():
-            data = replacement if info.filename == member else src.read(info.filename)
-            dst.writestr(info, data)
-        dst.comment = src.comment
-    temp.replace(path)
-
-
 def test_gui_edit_and_save_roundtrip(work_xlam: Path):
     try:
         root = tk.Tk()
@@ -118,9 +108,11 @@ def test_gui_combined_vba_and_xml_roundtrip(work_pptm: Path):
         root.destroy()
 
 
-def test_gui_shows_malformed_baseline_xml_read_only(work_pptm: Path, monkeypatch):
+def test_gui_shows_malformed_baseline_xml_read_only(
+    work_pptm: Path, replace_package_payload, monkeypatch
+):
     malformed_path = "ppt/presentation.xml"
-    _replace_payload(work_pptm, malformed_path, b"")
+    replace_package_payload(work_pptm, malformed_path, b"")
     try:
         root = tk.Tk()
     except tk.TclError:
@@ -149,5 +141,27 @@ def test_gui_shows_malformed_baseline_xml_read_only(work_pptm: Path, monkeypatch
         window._validate_selected_xml()
         assert shown == [part.open_problem]
         assert not part.is_dirty()
+
+        module_id = next(
+            module.id for module in window.draft.modules if module.current_name == "Module1"
+        )
+        window.editor_notebook.select(0)
+        window.tree.selection_set(module_id)
+        root.update()
+        window.editor.text.insert(
+            "end", "\r\nPublic Sub AddedBesideMalformedXml()\r\nEnd Sub\r\n"
+        )
+        window._flush_all_editors()
+
+        result = window.save_service.save_addin(window.draft)
+
+        assert result.kind == "success", result
+        assert result.backup_path is not None and result.backup_path.exists()
+        with zipfile.ZipFile(work_pptm) as package:
+            assert package.read(malformed_path) == b""
+        reopened = DocumentService().open(work_pptm)
+        module = next(m for m in reopened.modules if m.current_name == "Module1")
+        assert "AddedBesideMalformedXml" in module.body
+        assert not reopened.xml_part_by_path(malformed_path).editable
     finally:
         root.destroy()

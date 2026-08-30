@@ -280,6 +280,20 @@ def test_verifier_rejects_unexpected_xml_change(tmp_path, adapter):
     assert any("_rels/.rels" in p for p in result.problems)
 
 
+def test_verifier_rejects_mutation_of_untouched_malformed_xml(tmp_path, adapter):
+    malformed_path = "ppt/presentation.xml"
+    src_entries = base_entries() | {malformed_path: b""}
+    candidate_entries = base_entries() | {malformed_path: b"x"}
+    src = make_package(tmp_path / "src.pptm", src_entries)
+    dest = make_package(tmp_path / "cand.pptm", candidate_entries)
+    draft = _draft_with_parts(src, [])
+
+    result = adapter.verify_candidate_xml(src, dest, draft)
+
+    assert not result.ok
+    assert any(malformed_path in problem for problem in result.problems)
+
+
 def test_xml_verifier_scope_excludes_binary_parts(tmp_path, adapter):
     """Binary isolation is the pyOpenVBA verifier's job (plan 12.9); the XML
     verifier covers editable XML parts and vbaProject.bin only. The composite

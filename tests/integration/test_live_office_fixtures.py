@@ -21,6 +21,7 @@ Fixture content contract (plan §4.1):
 from __future__ import annotations
 
 import shutil
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ from vba_addin_editor.services.document_service import DocumentService
 from vba_addin_editor.services.save_service import SaveService
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+EXACT_MALFORMED_PPAM = FIXTURES / "live" / "ppam" / "ExistingMalformedPart.ppam"
 
 LIVE_PARAMS = [
     pytest.param(
@@ -151,3 +153,36 @@ def test_no_change_save_writes_nothing(fixture_path: Path, host_kind: str, tmp_p
     result = _live_service().save_addin(draft)
     assert result.kind == "no_changes", result
     assert work.read_bytes() == before
+
+
+@pytest.mark.live
+def test_exact_malformed_ppam_vba_save_preserves_baseline_part(tmp_path: Path):
+    """Automated half of the customer-file gate; Office/RibbonX checks stay manual."""
+    _require_fixture(EXACT_MALFORMED_PPAM)
+    work = tmp_path / "ExistingMalformedPart.ppam"
+    shutil.copy2(EXACT_MALFORMED_PPAM, work)
+    malformed_path = "ppt/presentation.xml"
+    with zipfile.ZipFile(work) as package:
+        before = package.read(malformed_path)
+
+    service = DocumentService()
+    draft = service.open(work)
+    malformed = draft.xml_part_by_path(malformed_path)
+    assert malformed is not None and not malformed.editable
+    module = next((m for m in draft.modules if m.destructive_ops_safe), None)
+    assert module is not None, "fixture needs an editable standard VBA module"
+    marker = "VBAAE_MALFORMED_LIVE_EDIT"
+    module.body += f"\r\n' {marker}\r\n"
+
+    result = SaveService(
+        adapter=service.adapter,
+        package_adapter=service.package_adapter,
+    ).save_addin(draft)
+
+    assert result.kind == "success", result
+    assert result.backup_path is not None and result.backup_path.exists()
+    with zipfile.ZipFile(work) as package:
+        assert package.read(malformed_path) == before
+    reopened = service.open(work)
+    assert any(marker in item.body for item in reopened.modules)
+    assert not reopened.xml_part_by_path(malformed_path).editable

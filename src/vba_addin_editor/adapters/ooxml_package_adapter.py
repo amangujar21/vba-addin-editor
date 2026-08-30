@@ -114,8 +114,6 @@ class OoxmlPackageAdapter:
                         original_size=len(raw),
                         is_relationships_part=lowered.endswith(".rels"),
                         is_content_types_part=lowered == CONTENT_TYPES_NAME.lower(),
-                        editable=not problems,
-                        well_formed_on_open=not problems,
                         open_problem="; ".join(problems) if problems else None,
                     )
                 )
