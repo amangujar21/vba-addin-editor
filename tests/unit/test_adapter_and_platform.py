@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from types import SimpleNamespace
 
 import pytest
 from pyopenvba import PowerPointFile
@@ -8,6 +9,8 @@ from pyopenvba import PowerPointFile
 from vba_addin_editor.adapters.pyopenvba_adapter import (
     AdapterError,
     PyOpenVBAAdapter,
+    _decrypt_project_data,
+    _has_active_project_protection,
     host_kind_for,
     host_process_for,
     vba_entry_for,
@@ -16,6 +19,7 @@ from vba_addin_editor.platform import paths
 from vba_addin_editor.platform import windows_file_ops as wfo
 
 # -- host selection -------------------------------------------------------
+
 
 def test_xlam_host_selection():
 
@@ -105,6 +109,7 @@ def test_pptm_vba_candidate_roundtrip(work_pptm):
 
 # -- windows file ops ------------------------------------------------------
 
+
 def test_replace_file_creates_backup(tmp_path):
     orig = tmp_path / "a.xlam"
     orig.write_bytes(b"OLD-BYTES")
@@ -137,6 +142,7 @@ def test_candidate_and_backup_naming(tmp_path):
 
 # -- GUI construction smoke ---------------------------------------------------
 
+
 def test_main_window_constructs():
     import tkinter as tk
 
@@ -151,3 +157,39 @@ def test_main_window_constructs():
     root.update()
     assert window.draft is None
     root.destroy()
+
+
+def test_unlocked_cmg_wins_over_stale_password_material():
+    protection = SimpleNamespace(
+        cmg="BAB8F3DCD4E0D4E0D4E0D4E0",
+        dpb="AA" * 40,
+        has_password=True,
+    )
+
+    assert _decrypt_project_data(protection.cmg) == b"\x00\x00\x00\x00"
+    assert not _has_active_project_protection(protection)
+
+
+@pytest.mark.parametrize(
+    "cmg",
+    [
+        "BAB8F3DCD4E0D4E0D5E1D5E1",  # fUserProtected
+        "BAB8F3DCD4E0D4E0D6E2D6E2",  # fHostProtected
+        "BAB8F3DCD4E0D4E0D0E4D0E4",  # fVBEProtected
+    ],
+)
+def test_active_cmg_protection_flags_are_blocked(cmg):
+    protection = SimpleNamespace(cmg=cmg, dpb="", has_password=False)
+
+    assert _has_active_project_protection(protection)
+
+
+@pytest.mark.parametrize("has_password", [False, True])
+def test_malformed_cmg_fails_closed(has_password):
+    protection = SimpleNamespace(
+        cmg="NOT-HEX",
+        dpb="AA" * 40 if has_password else "",
+        has_password=has_password,
+    )
+
+    assert _has_active_project_protection(protection)
