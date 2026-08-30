@@ -1,7 +1,7 @@
 # HANDOFF — VBA Add-in Editor project state
 
-_Date: 2026-08-30. Source: working session that implemented
-`..\VBA_Addin_Editor_Implementation_Plan.md` (3977 lines) end-to-end._
+_Date: 2026-08-30. Implementation of `..\VBA_Addin_Editor_Implementation_Plan.md`
+(3977 lines) is complete; this document reflects the verified current state._
 
 ## What exists
 
@@ -21,14 +21,15 @@ install needed at runtime.
 | Import/export (.bas/.cls) + backup restore | `src/vba_addin_editor/services/import_export_service.py` |
 | ReplaceFileW / lock probe / process detect | `src/vba_addin_editor/platform/` |
 | GUI | `src/vba_addin_editor/ui/main_window.py`, `ui/code_editor.py` |
-| Tests (33, all green) | `tests/` (unit + integration; GUI drives real Text widget) |
+| Tests (35: 31 green + 4 live-skips) | `tests/` (unit + integration; GUI drives real Text widget) |
+| Live release gate (needs real fixtures) | `tests/integration/test_live_office_fixtures.py` |
 | Packaging | `packaging/VBAAddinEditor.spec`, `scripts/build.ps1`, `scripts/test.ps1` |
 
 Dependency pin: `pyopenvba==3.4.0` exact. Python 3.10.10 used for dev/build.
 
 ## Verified state
 
-- `python -m pytest tests -q` → 35 passed (4 skips: live fixtures absent).
+- `python -m pytest tests -q` → 35 passed, 4 skips (live fixtures absent).
   Unit/integration coverage includes: full save→backup→in-place-replace
   round trip on an Excel-authored template; rename chains; combined
   add+rename+delete; blocked saves (Office running / locked / external
@@ -41,12 +42,25 @@ Dependency pin: `pyopenvba==3.4.0` exact. Python 3.10.10 used for dev/build.
   `tests/fixtures/xlam/RealAddin.xlam` / `tests/fixtures/ppam/RealAddin.ppam`.
   They skip with fixture-creation instructions until a human drops real
   Office-authored add-ins in (fixtures dir is gitignored).
-- `ruff check .` → clean (all 7 prior findings resolved).
-- Onefile release built and smoke-tested:
-  `dist\VBAAddinEditor.exe` + `dist\VBAAddinEditor.exe.sha256`
-  (SHA-256 9883B694…4528BA from the pre-lint-fix build was refreshed by the
-  final rebuild; the `.sha256` file is authoritative).
-- Repo is under git; two commits on `main`.
+- `ruff check .` → clean (all 7 prior findings resolved; DTZ005 suppressed
+  with rationale: user-facing backup filenames intentionally use local time).
+- **Onefile release built and smoke-tested:**
+  `dist\VBAAddinEditor.exe` + `dist\VBAAddinEditor.exe.sha256` (authoritative).
+  SHA-256: `B46B0B9346717FF950F0D70200C759F8D2B3DDF9FB8CA6AED793CD9877F02990`.
+  Packaged `--self-test` and `--self-roundtrip` exit 0.
+- **Onedir build** `dist\VBAAddinEditor\` (exe + `_internal`) rebuilt fresh
+  from final sources, also smoke-tested. Debugging artifact only, gitignored.
+- Repo under git, 3 commits on `main`, latest `c6ed0fa`.
+
+## Build & test commands
+
+```powershell
+python -m pytest tests -q              # full suite (live tests skip)
+python -m pytest tests -m live -v      # release gate (needs real fixtures)
+python -m ruff check .                 # lint
+powershell -File scripts\build.ps1             # onedir (debug)
+powershell -File scripts\build.ps1 -Onefile    # release exe + sha256
+```
 
 ## Key decisions (why the code looks like this)
 
