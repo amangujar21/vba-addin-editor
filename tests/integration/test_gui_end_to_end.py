@@ -109,10 +109,10 @@ def test_gui_combined_vba_and_xml_roundtrip(work_pptm: Path):
 
 
 def test_gui_shows_malformed_baseline_xml_read_only(
-    work_pptm: Path, replace_package_payload, monkeypatch
+    work_ppam: Path, replace_package_payload, monkeypatch
 ):
     malformed_path = "ppt/presentation.xml"
-    replace_package_payload(work_pptm, malformed_path, b"")
+    replace_package_payload(work_ppam, malformed_path, b"")
     try:
         root = tk.Tk()
     except tk.TclError:
@@ -120,7 +120,7 @@ def test_gui_shows_malformed_baseline_xml_read_only(
     root.withdraw()
     try:
         window = MainWindow(root)
-        window.load_path(work_pptm)
+        window.load_path(work_ppam)
         window.editor_notebook.select(window.xml_tab)
         item = "xml::" + malformed_path
         assert window.xml_tree.item(item, "text").startswith("⚠ ")
@@ -157,9 +157,9 @@ def test_gui_shows_malformed_baseline_xml_read_only(
 
         assert result.kind == "success", result
         assert result.backup_path is not None and result.backup_path.exists()
-        with zipfile.ZipFile(work_pptm) as package:
+        with zipfile.ZipFile(work_ppam) as package:
             assert package.read(malformed_path) == b""
-        reopened = DocumentService().open(work_pptm)
+        reopened = DocumentService().open(work_ppam)
         module = next(m for m in reopened.modules if m.current_name == "Module1")
         assert "AddedBesideMalformedXml" in module.body
         assert not reopened.xml_part_by_path(malformed_path).editable

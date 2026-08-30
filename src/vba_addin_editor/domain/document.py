@@ -60,8 +60,22 @@ class ModuleSnapshot:
     ends_with_newline: bool
 
 
+class _XmlPartHealth:
+    """Health derived from the single baseline diagnostic source of truth."""
+
+    open_problem: str | None
+
+    @property
+    def editable(self) -> bool:
+        return self.open_problem is None
+
+    @property
+    def well_formed_on_open(self) -> bool:
+        return self.open_problem is None
+
+
 @dataclass(frozen=True)
-class XmlPartSnapshot:
+class XmlPartSnapshot(_XmlPartHealth):
     """Immutable open-time state of one editable XML package part."""
 
     path: str  # exact ZIP member name, no leading "/"
@@ -74,15 +88,6 @@ class XmlPartSnapshot:
     is_relationships_part: bool
     is_content_types_part: bool
     open_problem: str | None = None
-
-    @property
-    def editable(self) -> bool:
-        return self.open_problem is None
-
-    @property
-    def well_formed_on_open(self) -> bool:
-        return self.open_problem is None
-
 
 @dataclass(frozen=True)
 class DocumentSnapshot:
@@ -113,7 +118,7 @@ class ModuleDraft:
 
 
 @dataclass
-class XmlPartDraft:
+class XmlPartDraft(_XmlPartHealth):
     """Editable state of one XML package part."""
 
     path: str
@@ -125,14 +130,6 @@ class XmlPartDraft:
     is_relationships_part: bool
     is_content_types_part: bool
     open_problem: str | None = None
-
-    @property
-    def editable(self) -> bool:
-        return self.open_problem is None
-
-    @property
-    def well_formed_on_open(self) -> bool:
-        return self.open_problem is None
 
     def is_dirty(self) -> bool:
         return self.editable and self.text != self.original_text
