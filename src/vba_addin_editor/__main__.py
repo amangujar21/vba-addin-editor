@@ -9,7 +9,7 @@ from pathlib import Path
 
 def self_test(path: Path) -> int:
     """Open, parse, list, validate an add-in without any GUI. Exit 0 on success."""
-    from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError, PyOpenVBAAdapter
+    from vba_addin_editor.adapters.pyopenvba_adapter import PyOpenVBAAdapter
     from vba_addin_editor.platform import paths
 
     try:
@@ -18,33 +18,52 @@ def self_test(path: Path) -> int:
         print(f"FAIL: cannot read {path}: {exc}", file=sys.stderr)
         return 2
     adapter = PyOpenVBAAdapter()
+    package = None
+    if path.suffix.lower() in {".ppam", ".pptm"}:
+        from vba_addin_editor.adapters.ooxml_package_adapter import OoxmlPackageAdapter
+
+        package = OoxmlPackageAdapter()
     try:
         snapshot = adapter.open_snapshot(path, fp)
-    except AdapterError as exc:
-        print(f"FAIL: {exc}", file=sys.stderr)
+        if package is not None:
+            from dataclasses import replace
+
+            snapshot = replace(
+                snapshot,
+                xml_parts=package.snapshot_xml_parts(path),
+                package_safety=package.inspect_package_signature(path),
+            )
+    except Exception as exc:  # noqa: BLE001 - single CLI failure boundary
+        from vba_addin_editor.adapters.ooxml_package_adapter import PackageError
+
+        msg = str(exc) if isinstance(exc, PackageError) else f"unexpected failure: {exc!r}"
+        print(f"FAIL: {msg}", file=sys.stderr)
         return 2
     print(f"OK {path.name}: project={snapshot.project_name!r} "
-          f"code_page={snapshot.code_page} modules={len(snapshot.modules)}")
+          f"code_page={snapshot.code_page} modules={len(snapshot.modules)} "
+          f"xml_parts={len(snapshot.xml_parts)}")
     for m in snapshot.modules:
         print(f"  {m.pyopenvba_kind:9} {m.original_name}")
     return 0
-
 
 def self_roundtrip(path: Path) -> int:
     """Developer-only candidate round-trip on a COPY of the fixture (plan 36)."""
     import shutil
     import tempfile
 
-    from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError, PyOpenVBAAdapter
-    from vba_addin_editor.domain.document import draft_from_snapshot
-    from vba_addin_editor.platform import paths
+    from vba_addin_editor.adapters.pyopenvba_adapter import (
+        AdapterError,
+        PyOpenVBAAdapter,
+    )
+    from vba_addin_editor.domain.changes import compute_changes
+    from vba_addin_editor.services.document_service import DocumentService
+    from vba_addin_editor.services.save_service import SaveService
 
-    adapter = PyOpenVBAAdapter()
     with tempfile.TemporaryDirectory() as td:
         work = Path(td) / path.name
         shutil.copy2(path, work)
         try:
-            draft = draft_from_snapshot(adapter.open_snapshot(work, paths.fingerprint(work)))
+            draft = DocumentService().open(work)
         except AdapterError as exc:
             print(f"FAIL: {exc}", file=sys.stderr)
             return 2
@@ -53,23 +72,43 @@ def self_roundtrip(path: Path) -> int:
             print("FAIL: no standard module to edit", file=sys.stderr)
             return 2
         target.body = target.body + "\r\n' vbaae round-trip marker\r\n"
-        candidate = Path(td) / f"cand{path.suffix}"
-        try:
-            adapter.build_candidate(work, draft, candidate, allow_signature_removal=False)
-        except AdapterError as exc:
-            print(f"FAIL: build: {exc}", file=sys.stderr)
+        if draft.xml_parts:
+            part = next(
+                (p for p in draft.xml_parts if p.path == "docProps/core.xml"),
+                draft.xml_parts[0],
+            )
+            part.text = part.text + "\n<!-- vbaae round-trip marker -->"
+        changes = compute_changes(draft)
+        if changes.is_empty:
+            print("FAIL: no changes staged", file=sys.stderr)
             return 2
-        verification = adapter.verify_candidate(work, candidate, draft)
-        if not verification.ok:
-            print(f"FAIL: verify: {verification.problems}", file=sys.stderr)
+        dest = Path(td) / f"copy{path.suffix}"
+        result = SaveService(adapter=PyOpenVBAAdapter()).save_copy(draft, dest)
+        if result.kind != "success":
+            print(
+                f"FAIL: save_copy: kind={result.kind} reason={result.reason} "
+                f"problems={result.problems}",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            reopened = DocumentService().open(dest)
+        except AdapterError as exc:
+            print(f"FAIL: reopen: {exc}", file=sys.stderr)
+            return 2
+        if reopened.is_dirty():
+            print("FAIL: reopened draft unexpectedly dirty", file=sys.stderr)
             return 2
     print(f"OK round-trip {path.name}")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="VBAAddinEditor")
-    parser.add_argument("file", nargs="?", help="add-in (.xlam/.ppam) to open")
+    parser = argparse.ArgumentParser(
+        prog="VBAAddinEditor",
+        description="Edit VBA source inside Office VBA files (.xlam/.ppam/.pptm).",
+    )
+    parser.add_argument("file", nargs="?", help="Office VBA file (.xlam/.ppam/.pptm) to open")
     parser.add_argument("--self-test", metavar="ADDIN", help="headless open+parse+validate")
     parser.add_argument("--self-roundtrip", metavar="ADDIN", help="headless edit-candidate round-trip on a copy")
     args = parser.parse_args(argv)

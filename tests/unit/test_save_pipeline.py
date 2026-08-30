@@ -207,3 +207,231 @@ def test_save_copy_does_not_touch_original(work_xlam, tmp_path):
     reopened = DocumentService().open(dest)
     m1 = next(m for m in reopened.modules if m.current_name == "Module1")
     assert "V2" in m1.body
+
+
+# -- PPTM composite pipeline (XML plan 12, 23.5) -----------------------------
+
+XML_MARKER = "<!--VBAAE_XML_EDITED-->"
+
+
+def _edit_core_xml(draft) -> str:
+    part = draft.xml_part_by_path("docProps/core.xml")
+    assert part is not None
+    part.text = part.text + "\n" + XML_MARKER
+    return part.path
+
+
+def _payloads(path):
+    import zipfile
+
+    with zipfile.ZipFile(path) as zf:
+        return {i.filename: zf.read(i.filename) for i in zf.infolist()}
+
+
+def test_pptm_xml_only_save(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    before = _payloads(work_pptm)
+    changed = _edit_core_xml(draft)
+    result = make_service().save_addin(draft)
+    assert result.kind == "success", result
+    backup = result.backup_path
+    assert backup is not None and backup.exists()
+    # Backup holds the pre-save bytes.
+    assert _payloads(backup) == before
+    after = _payloads(work_pptm)
+    # VBA project payload is byte-identical on an XML-only save.
+    assert after["ppt/vbaProject.bin"] == before["ppt/vbaProject.bin"]
+    # All non-changed payloads identical; changed part differs.
+    for name, data in before.items():
+        if name == changed:
+            assert after[name] != data
+        else:
+            assert after[name] == data, name
+    # Reopen shows the XML change and a clean draft.
+    reopened = DocumentService().open(work_pptm)
+    assert XML_MARKER in reopened.xml_part_by_path(changed).text
+    assert not reopened.is_dirty()
+
+
+def test_pptm_combined_vba_and_xml_save(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    before = _payloads(work_pptm)
+    edit_module1(draft)
+    changed = _edit_core_xml(draft)
+    result = make_service().save_addin(draft)
+    assert result.kind == "success", result
+    assert result.backup_path.exists()
+    after = _payloads(work_pptm)
+    assert after["ppt/vbaProject.bin"] != before["ppt/vbaProject.bin"]
+    assert after[changed] != before[changed]
+    for name, data in before.items():
+        if name in ("ppt/vbaProject.bin", changed):
+            continue
+        assert after[name] == data, name
+    reopened = DocumentService().open(work_pptm)
+    m1 = next(m for m in reopened.modules if m.current_name == "Module1")
+    assert "V2" in m1.body
+    assert XML_MARKER in reopened.xml_part_by_path(changed).text
+    assert not reopened.is_dirty()
+
+
+def test_pptm_vba_only_save_keeps_xml_payloads(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    before = _payloads(work_pptm)
+    edit_module1(draft)
+    result = make_service().save_addin(draft)
+    assert result.kind == "success", result
+    after = _payloads(work_pptm)
+    assert after["ppt/vbaProject.bin"] != before["ppt/vbaProject.bin"]
+    for name, data in before.items():
+        if name == "ppt/vbaProject.bin":
+            continue
+        assert after[name] == data, name
+
+
+def test_pptm_malformed_xml_leaves_original_untouched(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    before = work_pptm.read_bytes()
+    part = draft.xml_part_by_path("docProps/core.xml")
+    part.text = part.text + "\n<unclosed"
+    result = make_service().save_addin(draft)
+    assert result.kind == "error"
+    assert result.reason == "invalid_xml"
+    assert work_pptm.read_bytes() == before
+
+
+def test_pptm_xml_encoding_conflict_blocked(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    before = work_pptm.read_bytes()
+    part = draft.xml_part_by_path("docProps/core.xml")
+    part.text = part.text.replace(
+        'encoding="UTF-8"', 'encoding="UTF-16"', 1
+    ) if 'encoding="UTF-8"' in part.text else part.text + '<?xml encoding="UTF-16"?>'
+    result = make_service().save_addin(draft)
+    assert result.kind == "error"
+    assert work_pptm.read_bytes() == before
+
+
+def test_pptm_external_change_blocks_xml_save(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    before = work_pptm.read_bytes()
+    _edit_core_xml(draft)
+    work_pptm.write_bytes(before + b"tampered")
+    result = make_service().save_addin(draft)
+    assert result.kind == "blocked" and result.reason == "external_change"
+
+
+def test_pptm_office_running_blocks_xml_save(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    before = work_pptm.read_bytes()
+    _edit_core_xml(draft)
+    result = make_service(process_probe=lambda p: True).save_addin(draft)
+    assert result.kind == "blocked" and result.reason == "office_running"
+    assert work_pptm.read_bytes() == before
+
+
+def test_pptm_package_rewrite_failure_leaves_original(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    before = work_pptm.read_bytes()
+    _edit_core_xml(draft)
+
+    class ExplodingAdapter:
+        def validate_draft_part(self, part):
+            return ()
+
+        def write_xml_candidate(self, *a, **k):
+            raise OSError("disk exploded")
+
+    svc = make_service()
+    svc.package_adapter = ExplodingAdapter()
+    result = svc.save_addin(draft)
+    assert result.kind == "error"
+    assert work_pptm.read_bytes() == before
+
+
+def test_package_signed_xml_edit_blocked(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    from dataclasses import replace
+
+    from vba_addin_editor.domain.document import PackageSafetyInfo
+
+    draft.baseline = replace(
+        draft.baseline,
+        package_safety=PackageSafetyInfo(
+            opc_signature_present=True,
+            signature_part_names=("_xmlsignatures/sig1.xml",),
+        ),
+    )
+    before = work_pptm.read_bytes()
+    _edit_core_xml(draft)
+    result = make_service().save_addin(draft)
+    assert result.kind == "blocked" and result.reason == "package_signed"
+    assert work_pptm.read_bytes() == before
+
+
+def test_xml_only_save_allowed_on_password_protected_vba(work_pptm):
+    """XML-only save must not rewrite the protected VBA project (plan 12.4)."""
+    draft = DocumentService().open(work_pptm)
+    from dataclasses import replace
+
+
+    draft.baseline = replace(
+        draft.baseline,
+        safety=replace(draft.baseline.safety, password_protected=True),
+    )
+    before = _payloads(work_pptm)
+    _edit_core_xml(draft)
+    result = make_service().save_addin(draft)
+    assert result.kind == "success", result
+    assert _payloads(work_pptm)["ppt/vbaProject.bin"] == before["ppt/vbaProject.bin"]
+
+
+def test_vba_change_on_password_protected_project_blocked(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    from dataclasses import replace
+
+
+    draft.baseline = replace(
+        draft.baseline,
+        safety=replace(draft.baseline.safety, password_protected=True),
+    )
+    edit_module1(draft)
+    result = make_service().save_addin(draft)
+    assert result.kind == "blocked" and result.reason == "password_protected"
+
+
+def test_pptm_post_commit_xml_verification_failure_triggers_recovery(work_pptm):
+    draft = DocumentService().open(work_pptm)
+    _edit_core_xml(draft)
+
+    calls = {"n": 0}
+    real_verify = SaveService._verify_candidate
+
+    def flaky(self, reference, candidate, d, changes):
+        calls["n"] += 1
+        if calls["n"] == 2:  # post-commit check
+            return False, ("injected post-commit XML mismatch",)
+        return real_verify(self, reference, candidate, d, changes)
+
+    svc = make_service()
+    svc._verify_candidate = flaky.__get__(svc)  # type: ignore[method-assign]
+    result = svc.save_addin(draft)
+    assert result.kind == "recovery_required"
+    assert result.backup_path.exists()
+
+
+def test_pptm_save_copy_extension_mismatch_rejected(work_pptm, tmp_path):
+    draft = DocumentService().open(work_pptm)
+    _edit_core_xml(draft)
+    result = make_service().save_copy(draft, tmp_path / "out.ppam")
+    assert result.kind == "error" and result.reason == "unsupported_extension"
+
+
+def test_pptm_save_copy_success(work_pptm, tmp_path):
+    draft = DocumentService().open(work_pptm)
+    _edit_core_xml(draft)
+    dest = tmp_path / "copy.pptm"
+    result = make_service().save_copy(draft, dest)
+    assert result.kind == "success", result
+    reopened = DocumentService().open(dest)
+    assert XML_MARKER in reopened.xml_part_by_path("docProps/core.xml").text

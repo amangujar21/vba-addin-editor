@@ -6,6 +6,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from vba_addin_editor.adapters.ooxml_package_adapter import XML_EDITABLE_EXTENSIONS
 from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError
 from vba_addin_editor.domain.changes import compute_changes, dirty_count
 from vba_addin_editor.domain.document import (
@@ -19,12 +20,14 @@ from vba_addin_editor.services.import_export_service import BackupService, Impor
 from vba_addin_editor.services.save_service import SaveService
 from vba_addin_editor.services.validation_service import validate_module_name
 from vba_addin_editor.ui.code_editor import CodeEditor
+from vba_addin_editor.ui.xml_editor import XmlEditor
 from vba_addin_editor.version import APP_NAME, VERSION
 
 _FILETYPES = [
-    ("Office VBA Add-ins", "*.xlam;*.ppam"),
+    ("Supported Office VBA files", "*.xlam;*.ppam;*.pptm"),
     ("Excel Add-ins", "*.xlam"),
     ("PowerPoint Add-ins", "*.ppam"),
+    ("PowerPoint Macro-Enabled Presentations", "*.pptm"),
 ]
 
 
@@ -54,8 +57,8 @@ class MainWindow:
     def _build_menu(self) -> None:
         bar = tk.Menu(self.root)
         file_menu = tk.Menu(bar, tearoff=0)
-        file_menu.add_command(label="Open Add-in…", accelerator="Ctrl+O", command=self.open_file)
-        file_menu.add_command(label="Save Add-in", accelerator="Ctrl+S", command=self.save)
+        file_menu.add_command(label="Open Office VBA File…", accelerator="Ctrl+O", command=self.open_file)
+        file_menu.add_command(label="Save File", accelerator="Ctrl+S", command=self.save)
         file_menu.add_command(label="Save a Copy…", accelerator="Ctrl+Shift+S", command=self.save_copy)
         file_menu.add_separator()
         file_menu.add_command(label="Restore Backup…", command=self.restore_backup)
@@ -84,7 +87,7 @@ class MainWindow:
         bar = ttk.Frame(self.root, padding=4)
         bar.pack(fill="x")
         ttk.Button(bar, text="Open", command=self.open_file).pack(side="left", padx=2)
-        self.save_btn = ttk.Button(bar, text="Save Add-in", command=self.save, state="disabled")
+        self.save_btn = ttk.Button(bar, text="Save File", command=self.save, state="disabled")
         self.save_btn.pack(side="left", padx=2)
         self.review_btn = ttk.Button(bar, text="Review Changes", command=self.review_changes, state="disabled")
         self.review_btn.pack(side="left", padx=2)
@@ -94,7 +97,20 @@ class MainWindow:
         self.file_label.pack(side="right", padx=8)
 
     def _build_panes(self) -> None:
-        panes = ttk.Panedwindow(self.root, orient="horizontal")
+        self.editor_notebook = ttk.Notebook(self.root)
+        vba_tab = ttk.Frame(self.editor_notebook)
+        self._build_vba_tab(vba_tab)
+        self.xml_tab = ttk.Frame(self.editor_notebook)
+        self._build_xml_tab(self.xml_tab)
+        self.editor_notebook.add(vba_tab, text="VBA")
+        self.editor_notebook.add(self.xml_tab, text="XML")
+        self.editor_notebook.pack(fill="both", expand=True)
+        self.banner = ttk.Label(self.root, text="", background="#fff3cd", padding=4)
+        self.banner.pack(fill="x", before=self.editor_notebook)
+        self.banner.pack_forget()
+
+    def _build_vba_tab(self, parent) -> None:
+        panes = ttk.Panedwindow(parent, orient="horizontal")
         panes.pack(fill="both", expand=True)
 
         left = ttk.Frame(panes, padding=4)
@@ -111,9 +127,32 @@ class MainWindow:
         self.editor.pack(fill="both", expand=True)
         panes.add(right, weight=4)
 
-        self.banner = ttk.Label(self.root, text="", background="#fff3cd", padding=4)
-        self.banner.pack(fill="x", before=panes)
-        self.banner.pack_forget()
+    def _build_xml_tab(self, parent) -> None:
+        panes = ttk.Panedwindow(parent, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+
+        left = ttk.Frame(panes, padding=4)
+        bar = ttk.Frame(left)
+        bar.pack(fill="x")
+        self.validate_xml_btn = ttk.Button(
+            bar, text="Validate XML", command=self._validate_selected_xml, state="disabled"
+        )
+        self.validate_xml_btn.pack(side="left", padx=2)
+        self.xml_tree = ttk.Treeview(left, show="tree", selectmode="browse")
+        tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.xml_tree.yview)
+        self.xml_tree.configure(yscrollcommand=tree_sb.set)
+        self.xml_tree.pack(side="left", fill="both", expand=True)
+        tree_sb.pack(side="right", fill="y")
+        self.xml_tree.bind("<<TreeviewSelect>>", self.on_xml_part_selected)
+        panes.add(left, weight=1)
+
+        right = ttk.Frame(panes)
+        self.xml_editor = XmlEditor(right)
+        self.xml_editor.pack(fill="both", expand=True)
+        self.xml_editor.set_validate_action(self._validate_selected_xml)
+        panes.add(right, weight=4)
+
+        self.current_xml_part_path: str | None = None
 
     def _build_statusbar(self) -> None:
         self.status = ttk.Label(self.root, text="Ready", padding=3, anchor="w")
@@ -123,8 +162,8 @@ class MainWindow:
         self.root.bind("<Control-o>", lambda _e: self.open_file())
         self.root.bind("<Control-s>", lambda _e: self.save())
         self.root.bind("<Control-S>", lambda _e: self.save_copy())
-        self.root.bind("<Control-f>", lambda _e: self.editor.find_dialog())
-        self.root.bind("<Control-h>", lambda _e: self.editor.replace_dialog())
+        self.root.bind("<Control-f>", lambda _e: self._active_text_editor().find_dialog())
+        self.root.bind("<Control-h>", lambda _e: self._active_text_editor().replace_dialog())
 
     # -- banners / status ----------------------------------------------------
 
@@ -151,22 +190,19 @@ class MainWindow:
         name = draft.baseline.path.name
         n = dirty_count(draft)
         self.file_label.config(text=f"{name} — unsaved changes: {n}")
-        can_save = (
-            not draft.baseline.safety.password_protected
-            and not draft.baseline.safety.host_process_running
-            and not self._saving
-        )
+        can_save = not draft.baseline.safety.host_process_running and not self._saving
         self.save_btn.config(state="normal" if can_save else "disabled")
         self.review_btn.config(state="normal" if n else "disabled")
         self.revert_btn.config(state="normal" if n else "disabled")
         if draft.baseline.safety.password_protected:
             self._set_banner(
-                "This VBA project is password-protected. VBA Add-in Editor will not modify protected projects."
+                "This VBA project is password-protected. VBA editing is disabled; "
+                "XML package editing remains available for .ppam/.pptm files."
             )
         elif draft.baseline.safety.host_process_running:
             host = "Excel" if draft.baseline.host_kind == "excel" else "PowerPoint"
             self._set_banner(
-                f"{host} is currently running. Close {host} before saving this add-in."
+                f"{host} is currently running. Close {host} before saving."
             )
         else:
             self._set_banner("")
@@ -197,13 +233,25 @@ class MainWindow:
 
     # -- editor plumbing ------------------------------------------------------
 
-    def _flush_active_editor(self) -> None:
+    def _flush_active_vba_editor(self) -> None:
         draft = self.draft
         if draft is None or self.current_module_id is None:
             return
         mod = draft.module_by_id(self.current_module_id)
         if mod is not None:
             mod.body = self.editor.get_text()
+
+    def _flush_active_xml_editor(self) -> None:
+        draft = self.draft
+        if draft is None or self.current_xml_part_path is None:
+            return
+        part = draft.xml_part_by_path(self.current_xml_part_path)
+        if part is not None:
+            part.text = self.xml_editor.get_text()
+
+    def _flush_all_editors(self) -> None:
+        self._flush_active_vba_editor()
+        self._flush_active_xml_editor()
 
     def on_module_selected(self, _event=None) -> None:
         draft = self.draft
@@ -212,7 +260,7 @@ class MainWindow:
         selection = self.tree.selection()
         if not selection:
             return
-        self._flush_active_editor()
+        self._flush_all_editors()
         mid = selection[0]
         self.current_module_id = mid
         mod = draft.module_by_id(mid)
@@ -222,24 +270,80 @@ class MainWindow:
         self.editor.text.config(state="normal")  # body editing allowed; deletion is gated
         self._refresh_state()
 
+    def on_xml_part_selected(self, _event=None) -> None:
+        draft = self.draft
+        if draft is None:
+            return
+        selection = self.xml_tree.selection()
+        if not selection:
+            return
+        self._flush_all_editors()
+        path = selection[0][len("xml::"):]
+        part = draft.xml_part_by_path(path)
+        if part is None:
+            return
+        self.current_xml_part_path = path
+        self.xml_editor.set_text(part.text)
+        self.xml_editor.text.config(state="normal")
+        self.xml_editor.set_part_info(part)
+        self.validate_xml_btn.config(state="normal")
+        self._refresh_state()
+
+    def _refresh_xml_tree(self) -> None:
+        draft = self.draft
+        self.xml_tree.delete(*self.xml_tree.get_children())
+        if draft is None:
+            return
+        for part in sorted(draft.xml_parts, key=lambda p: p.path.lower()):
+            marker = " *" if part.is_dirty() else ""
+            iid = "xml::" + part.path
+            self.xml_tree.insert("", "end", iid=iid, text=part.path + marker)
+
+    def _active_text_editor(self):
+        if str(self.editor_notebook.select()) == str(self.xml_tab):
+            return self.xml_editor
+        return self.editor
+
+    def _validate_selected_xml(self) -> None:
+        draft = self.draft
+        if draft is None or self.current_xml_part_path is None:
+            return
+        self._flush_active_xml_editor()
+        part = draft.xml_part_by_path(self.current_xml_part_path)
+        if part is None:
+            return
+        problems = self.doc_service.package_adapter.validate_draft_part(part)
+        if problems:
+            messagebox.showerror(APP_NAME, "\n".join(problems))
+        else:
+            messagebox.showinfo(APP_NAME, "XML is well-formed.")
+
     # -- file ops --------------------------------------------------------------
 
     def open_file(self) -> None:
-        path = filedialog.askopenfilename(title="Open Add-in", filetypes=_FILETYPES)
+        path = filedialog.askopenfilename(title="Open Office VBA File", filetypes=_FILETYPES)
         if not path:
             return
         self.load_path(Path(path))
 
     def load_path(self, path: Path) -> None:
         try:
-            self._flush_active_editor()
+            self._flush_all_editors()
             draft = self.doc_service.open(path)
         except AdapterError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
         self.draft = draft
         self.current_module_id = None
+        self.current_xml_part_path = None
         self._refresh_tree()
+        self._refresh_xml_tree()
+        xml_supported = path.suffix.lower() in XML_EDITABLE_EXTENSIONS
+        self.editor_notebook.tab(self.xml_tab, state="normal" if xml_supported else "disabled")
+        if xml_supported:
+            self.xml_editor.set_part_info(None)
+            self.xml_editor.set_text("")
+            self.validate_xml_btn.config(state="disabled")
         first = next((m.id for m in draft.modules if not m.is_deleted), None)
         if first:
             self.tree.selection_set(first)
@@ -249,7 +353,7 @@ class MainWindow:
     def save(self) -> None:
         if self.draft is None or self._saving:
             return
-        self._flush_active_editor()
+        self._flush_all_editors()
         changes = compute_changes(self.draft)
         if changes.is_empty:
             messagebox.showinfo(APP_NAME, "No changes to save.")
@@ -268,10 +372,16 @@ class MainWindow:
         kind = result.kind
         if kind == "success":
             self._refresh_tree()
-            if self.current_module_id:
-                mod = self.draft.module_by_id(self.current_module_id) if self.draft else None
-                if mod is not None:
+            self._refresh_xml_tree()
+            if self.current_module_id and self.draft:
+                mod = self.draft.module_by_id(self.current_module_id)
+                if mod is not None and not mod.is_deleted:
                     self.editor.set_text(mod.body)
+            if self.current_xml_part_path and self.draft:
+                part = self.draft.xml_part_by_path(self.current_xml_part_path)
+                if part is not None:
+                    self.xml_editor.set_text(part.text)
+                    self.xml_editor.set_part_info(part)
             self._refresh_state()
             msg = "Saved successfully."
             if result.backup_path:
@@ -304,26 +414,30 @@ class MainWindow:
 
     def _preflight_dialog(self, changes) -> bool:
         draft = self.draft
+        has_vba = changes.has_vba_changes
         lines = [f"Review changes to {draft.baseline.path.name}", ""]
         lines.extend(changes.summary_lines())
         lines += ["", "Safety"]
         lines.append("  ✓ File has not changed on disk")
-        lines.append(
-            "  ✓ Project is not password-protected"
-            if not draft.baseline.safety.password_protected
-            else "  ! Project is password-protected"
-        )
-        if draft.baseline.safety.signature_present:
+        if draft.baseline.safety.password_protected:
+            lines.append("  ! VBA project is password-protected")
+        elif has_vba:
+            lines.append("  ✓ VBA project is not password-protected")
+        if draft.baseline.package_safety.opc_signature_present:
+            lines.append("  ! OPC package signature detected")
+        else:
+            lines.append("  ✓ No OPC package signature detected")
+        if has_vba and draft.baseline.safety.signature_present:
             lines.append("  ! VBA digital signature will be removed")
         lines += ["", "A backup will be created before the original is replaced."]
         confirm_label = (
             "Save and Remove Signature"
-            if draft.baseline.safety.signature_present
-            else "Save Add-in"
+            if has_vba and draft.baseline.safety.signature_present
+            else "Save File"
         )
         if not messagebox.askokcancel(APP_NAME, "\n".join(lines)):
             return False
-        if draft.baseline.safety.signature_present:
+        if has_vba and draft.baseline.safety.signature_present:
             draft.signed_save_confirmed = True
         self.status.config(text=f"Saving with: {confirm_label}")
         return True
@@ -343,7 +457,7 @@ class MainWindow:
     def save_copy(self) -> None:
         if self.draft is None:
             return
-        self._flush_active_editor()
+        self._flush_all_editors()
         path = filedialog.asksaveasfilename(
             title="Save a Copy",
             defaultextension=self.draft.baseline.extension,
@@ -366,10 +480,16 @@ class MainWindow:
             return
         from vba_addin_editor.domain.document import revert_all
 
+        self._flush_all_editors()
         self.draft = revert_all(self.draft)
         self.current_module_id = None
+        self.current_xml_part_path = None
         self._refresh_tree()
+        self._refresh_xml_tree()
         self.editor.set_text("")
+        self.xml_editor.set_text("")
+        self.xml_editor.set_part_info(None)
+        self.validate_xml_btn.config(state="disabled")
         first = next((m.id for m in self.draft.modules if not m.is_deleted), None)
         if first:
             self.tree.selection_set(first)
@@ -433,7 +553,7 @@ class MainWindow:
             name = self._prompt_name("Rename Module", mod.current_name)
             if name:
                 mod.current_name = name
-        self._flush_active_editor()
+        self._flush_all_editors()
         self._refresh_tree()
         self._refresh_state()
 
@@ -451,7 +571,7 @@ class MainWindow:
         if not messagebox.askyesno(
             APP_NAME,
             f'Delete module "{mod.current_name}"?\n\nThis removes the module from the '
-            "VBA project when you save. It is not written to the add-in until Save Add-in.",
+            "VBA project when you save. It is not written to the file until Save File.",
         ):
             return
         if mod.is_new:
@@ -601,15 +721,15 @@ class MainWindow:
         messagebox.showinfo(
             APP_NAME,
             f"{APP_NAME} {VERSION}\n\n"
-            "Edits VBA source inside installed .xlam / .ppam add-ins, in place,\n"
-            "with automatic backup and verification.\n\n"
+            "Edits VBA source inside installed .xlam / .ppam add-ins and .pptm\n"
+            "presentations, in place, with automatic backup and verification.\n\n"
             "Limitations: no VBA compile validation; password-protected projects "
             "are read-only; UserForm layout cannot be created or edited.\n\n"
             "Uses pyOpenVBA (MIT) — see Help → Third-party notices.",
         )
 
     def on_close(self) -> None:
-        self._flush_active_editor()
+        self._flush_all_editors()
         if self.draft is not None and self.draft.is_dirty():
             host = "Excel" if self.draft.baseline.host_kind == "excel" else "PowerPoint"
             if self.draft.baseline.safety.host_process_running:

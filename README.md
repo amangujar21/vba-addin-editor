@@ -1,8 +1,9 @@
 # VBA Add-in Editor
 
-Edit VBA source inside installed Excel `.xlam` and PowerPoint `.ppam` add-ins —
-directly, in place, without converting through `.xlsm`/`.pptm`, without the VBA
-IDE, and without reinstalling the add-in.
+Edit VBA source inside installed Excel `.xlam` and PowerPoint `.ppam` add-ins,
+and PowerPoint `.pptm` presentations — directly, in place, without the VBA
+IDE, and without reinstalling the add-in. For `.ppam`/`.pptm`, existing XML
+package parts (`.xml`, `.rels`, `[Content_Types].xml`) can be edited too.
 
 VBA Add-in Editor safely patches the VBA project inside the actual installed
 add-in file while Office is closed, verifies the edited add-in before replacing
@@ -12,12 +13,13 @@ updated code the next time it starts.
 ## What it does
 
 1. Close Excel/PowerPoint.
-2. Open the installed `.xlam` / `.ppam` in VBA Add-in Editor.
-3. Edit code; add/rename/delete standard and class modules.
-4. **Save Add-in** — the tool verifies the original has not changed, builds a
+2. Open the installed `.xlam` / `.ppam` / `.pptm` in VBA Add-in Editor.
+3. Edit code; add/rename/delete standard and class modules. On `.ppam`/`.pptm`,
+   switch to the **XML** tab to edit existing package parts.
+4. **Save File** — the tool verifies the original has not changed, builds a
    verified candidate file, creates a backup, and atomically replaces the
    original using Windows `ReplaceFileW` (preserving ACLs and metadata).
-5. Reopen Office — the same installed add-in path now contains the new code.
+5. Reopen Office — the same installed file path now contains the new content.
 
 ## Safety model
 
@@ -28,12 +30,17 @@ updated code the next time it starts.
   bodies) *before* the original is touched. Any failure leaves the original
   untouched.
 - **No change means no write.** Saving without edits never rewrites the file.
-- **Office running → save blocked.** Excel/PowerPoint must be closed.
-- **Password-protected projects are read-only.** No bypass exists.
-- **Digitally signed projects** require explicit confirmation; saving removes
-  the (now invalid) VBA signature.
+- **Password-protected projects are read-only.** No bypass exists. (XML-only
+  package edits on `.ppam`/`.pptm` remain possible; they never modify the
+  protected VBA project.)
 - **Strict encoding.** Characters that cannot be stored in the project's code
   page block the save instead of being silently replaced.
+- **XML edits stay inside their package.** Only the exact XML parts you edited
+  may differ; every other payload is verified byte-identical. An XML-only save
+  never touches `vbaProject.bin`.
+- **Digitally signed projects** require explicit confirmation; saving removes
+  the (now invalid) VBA signature. Files with an **OPC package digital
+  signature** block XML editing entirely.
 - The tool never executes VBA, never changes Trust Center settings, never
   installs/uninstalls add-ins, and makes no network calls.
 
@@ -41,12 +48,17 @@ updated code the next time it starts.
 
 - The tool validates structure, not VBA compilation. A syntax error you type
   will surface when Office runs the macro. Use the automatic backup to roll back.
+- **XML editing** covers existing parts only: no add/delete/rename of package
+  parts, no schema validation against the full OOXML schemas (syntax and
+  package integrity are validated; PowerPoint remains the final format
+  validator), no re-signing, and no editing of binary parts such as
+  `vbaProject.bin`, images, or ActiveX `.bin`.
 - Existing document/designer modules (`ThisWorkbook`, `Sheet1`, UserForm
   code-behind) can be viewed and their body edited, but renaming/deleting them
   is disabled because their subtype cannot be verified safely yet.
 - UserForm layout cannot be created or edited; `.frm/.frx` import is not
   supported (`.bas`/`.cls` only).
-- The add-in must be closed in Office. The tool does not manage add-in
+- The file must be closed in Office. The tool does not manage add-in
   registration or file locations — the edited file keeps the same path, so
   existing registration stays valid.
 
@@ -64,6 +76,7 @@ Headless verification (also runs inside the packaged exe):
 ```text
 VBAAddinEditor.exe --self-test path\to\addin.xlam
 VBAAddinEditor.exe --self-roundtrip path\to\addin.ppam
+VBAAddinEditor.exe --self-roundtrip path\to\RealPresentation.pptm
 ```
 
 ### Release gating
@@ -73,7 +86,10 @@ template. The release promise (Office opens the edited add-in with no repair
 dialog and runs the updated macro from the same installed path) requires the
 live Office qualification matrix from the implementation plan
 (`VBA_Addin_Editor_Implementation_Plan.md`, sections 4 and 29) run against
-authentic Office-authored `.xlam`/`.ppam` fixtures.
+authentic Office-authored `.xlam`/`.ppam` fixtures. The XML feature adds the
+same requirement for authentic `.ppam`/`.pptm` fixtures: the automated live
+cycle edits a known XML marker and VBA code in one save, and the human gate
+verifies PowerPoint opens the saved file with **no repair dialog**.
 
 ### Dependency pin
 

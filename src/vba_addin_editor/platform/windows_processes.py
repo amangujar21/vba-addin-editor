@@ -55,7 +55,14 @@ def running_process_names() -> set[str]:
     return names
 
 
+_HOST_PROCESS = {
+    ".xlam": "EXCEL.EXE",
+    ".ppam": "POWERPNT.EXE",
+    ".pptm": "POWERPNT.EXE",
+}
+
+
 def host_process_running(path: Path) -> bool:
-    """True when the corresponding Office host for this add-in is running."""
-    target = "EXCEL.EXE" if path.suffix.lower() == ".xlam" else "POWERPNT.EXE"
-    return target in running_process_names()
+    """True when the corresponding Office host for this file is running."""
+    target = _HOST_PROCESS.get(path.suffix.lower())
+    return target in running_process_names() if target else False

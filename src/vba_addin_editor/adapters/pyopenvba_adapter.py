@@ -42,9 +42,17 @@ from vba_addin_editor.domain.document import (
 )
 from vba_addin_editor.domain.results import CandidateVerificationResult
 
-SUPPORTED_EXTENSIONS = (".xlam", ".ppam")
-_VBA_ENTRY = {".xlam": "xl/vbaProject.bin", ".ppam": "ppt/vbaProject.bin"}
-_HOST_PROCESS = {".xlam": "EXCEL.EXE", ".ppam": "POWERPNT.EXE"}
+SUPPORTED_EXTENSIONS = (".xlam", ".ppam", ".pptm")
+_VBA_ENTRY = {
+    ".xlam": "xl/vbaProject.bin",
+    ".ppam": "ppt/vbaProject.bin",
+    ".pptm": "ppt/vbaProject.bin",
+}
+_HOST_PROCESS = {
+    ".xlam": "EXCEL.EXE",
+    ".ppam": "POWERPNT.EXE",
+    ".pptm": "POWERPNT.EXE",
+}
 
 
 class AdapterError(Exception):
@@ -73,7 +81,9 @@ def _host_class(path: Path) -> type[VBAHostFile]:
         return ExcelFile
     if suffix == ".ppam":
         return PPAMPowerPointFile
-    raise AdapterError("Only .xlam and .ppam add-ins are supported.")
+    if suffix == ".pptm":
+        return PowerPointFile
+    raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
 
 
 def vba_entry_for(path: Path) -> str:
@@ -85,7 +95,12 @@ def host_process_for(path: Path) -> str:
 
 
 def host_kind_for(path: Path) -> HostKind:
-    return "excel" if path.suffix.lower() == ".xlam" else "powerpoint"
+    suffix = path.suffix.lower()
+    if suffix == ".xlam":
+        return "excel"
+    if suffix in {".ppam", ".pptm"}:
+        return "powerpoint"
+    raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
 
 
 def make_display_kind(pyopenvba_kind: str, *, is_new_app_class: bool = False) -> str:
@@ -113,12 +128,12 @@ class PyOpenVBAAdapter:
         path = Path(path)
         suffix = path.suffix.lower()
         if suffix not in SUPPORTED_EXTENSIONS:
-            raise AdapterError("Only .xlam and .ppam add-ins are supported.")
+            raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
         try:
             host = _host_class(path)(path)
         except UnsupportedFormatError as exc:
             raise AdapterError(
-                "Only .xlam and .ppam add-ins are supported.", {"exception": repr(exc)}
+                "Only .xlam, .ppam, and .pptm files are supported.", {"exception": repr(exc)}
             ) from exc
         except VBAProjectError as exc:
             raise AdapterError(
@@ -243,36 +258,43 @@ class PyOpenVBAAdapter:
 
     def verify_candidate(
         self,
-        original_path: Path,
+        reference_path: Path,
         candidate_path: Path,
         expected: DocumentDraft,
+        *,
+        allowed_non_vba_changes: frozenset[str] = frozenset(),
     ) -> CandidateVerificationResult:
+        """Verify the candidate against a reference package.
+
+        `reference_path` is the original for pre-commit verification and the
+        backup for post-commit verification (plan 12.12).
+        """
         problems: list[str] = []
         details: dict[str, Any] = {}
-        entry = vba_entry_for(original_path)
+        entry = vba_entry_for(reference_path)
 
         import hashlib
         import zipfile
         if not candidate_path.exists() or candidate_path.stat().st_size == 0:
             return CandidateVerificationResult(False, ("Candidate file missing or empty.",))
-        if candidate_path.suffix.lower() != original_path.suffix.lower():
+        if candidate_path.suffix.lower() != reference_path.suffix.lower():
             problems.append("Candidate extension does not match original.")
         try:
-            with zipfile.ZipFile(candidate_path) as cand, zipfile.ZipFile(original_path) as orig:
+            with zipfile.ZipFile(candidate_path) as cand, zipfile.ZipFile(reference_path) as ref:
                 if cand.testzip() is not None:
                     problems.append("Candidate ZIP has a corrupt entry.")
                 cand_names = set(cand.namelist())
-                orig_names = set(orig.namelist())
-                if cand_names != orig_names:
+                ref_names = set(ref.namelist())
+                if cand_names != ref_names:
                     problems.append(
-                        f"ZIP entry set changed: only-in-original={sorted(orig_names - cand_names)} "
-                        f"only-in-candidate={sorted(cand_names - orig_names)}"
+                        f"ZIP entry set changed: only-in-original={sorted(ref_names - cand_names)} "
+                        f"only-in-candidate={sorted(cand_names - ref_names)}"
                     )
                 differing: list[str] = []
-                for name in sorted(orig_names & cand_names):
-                    if name == entry:
+                for name in sorted(ref_names & cand_names):
+                    if name == entry or name in allowed_non_vba_changes:
                         continue
-                    if hashlib.sha256(orig.read(name)).digest() != hashlib.sha256(
+                    if hashlib.sha256(ref.read(name)).digest() != hashlib.sha256(
                         cand.read(name)
                     ).digest():
                         differing.append(name)

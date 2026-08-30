@@ -8,7 +8,9 @@ from pyopenvba import PowerPointFile
 from vba_addin_editor.adapters.pyopenvba_adapter import (
     AdapterError,
     PyOpenVBAAdapter,
+    host_kind_for,
     host_process_for,
+    vba_entry_for,
 )
 from vba_addin_editor.platform import paths
 from vba_addin_editor.platform import windows_file_ops as wfo
@@ -46,6 +48,59 @@ def test_ppam_subclass_accepts_only_intended(tmp_path):
         adapter.open_snapshot(bad, paths.fingerprint(bad))
 
     assert host_process_for(ppam) == "POWERPNT.EXE"
+
+
+def test_pptm_host_dispatch_and_mappings(work_pptm):
+    from pyopenvba import PowerPointFile as _PF
+
+    from vba_addin_editor.adapters.pyopenvba_adapter import _host_class
+
+    assert _host_class(work_pptm) is _PF
+    assert host_kind_for(work_pptm) == "powerpoint"
+    assert vba_entry_for(work_pptm) == "ppt/vbaProject.bin"
+    assert host_process_for(work_pptm) == "POWERPNT.EXE"
+
+
+def test_pptm_open_snapshot(work_pptm):
+    snap = PyOpenVBAAdapter().open_snapshot(work_pptm, paths.fingerprint(work_pptm))
+    assert snap.host_kind == "powerpoint"
+    assert snap.extension == ".pptm"
+    assert any(m.original_name == "Module1" for m in snap.modules)
+
+
+def test_pptm_vba_candidate_roundtrip(work_pptm):
+    """VBA-only save on synthetic PPTM: XML parts must remain payload-identical."""
+    import hashlib
+    import zipfile
+
+    adapter = PyOpenVBAAdapter()
+    snap = adapter.open_snapshot(work_pptm, paths.fingerprint(work_pptm))
+    from vba_addin_editor.domain.document import draft_from_snapshot
+
+    draft = draft_from_snapshot(snap)
+    mod = draft.modules[0]
+    mod.body = mod.body.replace("ORIGINAL", "EDITED")
+    from vba_addin_editor.domain.changes import compute_changes
+
+    assert not compute_changes(draft).is_empty
+    cand = paths.candidate_path_for(work_pptm)
+    try:
+        adapter.build_candidate(work_pptm, draft, cand, allow_signature_removal=False)
+        result = adapter.verify_candidate(work_pptm, cand, draft)
+        assert result.ok, result.problems
+        with zipfile.ZipFile(work_pptm) as orig, zipfile.ZipFile(cand) as c:
+            assert hashlib.sha256(orig.read("ppt/vbaProject.bin")).digest() != (
+                hashlib.sha256(c.read("ppt/vbaProject.bin")).digest()
+            )
+            for name in orig.namelist():
+                if name == "ppt/vbaProject.bin":
+                    continue
+                assert orig.read(name) == c.read(name), name
+    finally:
+        import contextlib
+
+        with contextlib.suppress(OSError):
+            cand.unlink(missing_ok=True)
 
 
 # -- windows file ops ------------------------------------------------------

@@ -5,6 +5,8 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from vba_addin_editor.ui.text_context_menu import install_text_context_menu
+
 
 class CodeEditor(ttk.Frame):
     def __init__(self, master, on_change=None) -> None:
@@ -38,6 +40,9 @@ class CodeEditor(ttk.Frame):
         self.text.event_add("<<Replace>>", "<Control-h>")
         self.text.bind("<<Replace>>", lambda _e: self.replace_dialog())
         self.text.bind("<Control-y>", lambda _e: (self.text.event_generate("<<Redo>>"), "break")[1])
+        install_text_context_menu(self.text)
+
+        self.header = None  # optional metadata label set by subclasses (XmlEditor)
 
     # -- content ---------------------------------------------------------
 

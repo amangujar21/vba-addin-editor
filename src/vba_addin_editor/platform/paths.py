@@ -36,6 +36,11 @@ def candidate_path_for(original: Path) -> Path:
     )
 
 
+def xml_patch_path_for(candidate: Path) -> Path:
+    """Sibling temp name for the XML-patched copy of a disposable candidate."""
+    return candidate.with_name(candidate.stem + ".xmlpatch" + candidate.suffix)
+
+
 def backup_path_for(original: Path, label: str = "backup") -> Path:
     """Visible same-extension backup name: 'Name - backup 2026-08-30 180212.ppam'."""
     stamp = datetime.now().strftime("%Y-%m-%d %H%M%S")  # noqa: DTZ005 -- local time is intentional: user-facing backup filename

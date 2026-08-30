@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 HostKind = Literal["excel", "powerpoint"]
-Extension = Literal[".xlam", ".ppam"]
+Extension = Literal[".xlam", ".ppam", ".pptm"]
 
 
 class ModuleDisplayKind:
@@ -38,6 +38,14 @@ class ProjectSafetyInfo:
 
 
 @dataclass(frozen=True)
+class PackageSafetyInfo:
+    """OPC/package-level signature state (separate from the VBA signature)."""
+
+    opc_signature_present: bool = False
+    signature_part_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ModuleSnapshot:
     id: str
     original_name: str
@@ -53,6 +61,21 @@ class ModuleSnapshot:
 
 
 @dataclass(frozen=True)
+class XmlPartSnapshot:
+    """Immutable open-time state of one editable XML package part."""
+
+    path: str  # exact ZIP member name, no leading "/"
+    text: str  # LF-normalized for the editor
+    encoding: str  # canonical codec name for the payload (without BOM)
+    bom: bytes
+    newline: str  # dominant original newline: "\n" or "\r\n"
+    original_sha256: str
+    original_size: int
+    is_relationships_part: bool
+    is_content_types_part: bool
+
+
+@dataclass(frozen=True)
 class DocumentSnapshot:
     path: Path
     host_kind: HostKind
@@ -62,6 +85,8 @@ class DocumentSnapshot:
     code_page: int
     safety: ProjectSafetyInfo
     modules: tuple[ModuleSnapshot, ...]
+    xml_parts: tuple[XmlPartSnapshot, ...] = ()
+    package_safety: PackageSafetyInfo = PackageSafetyInfo()
 
 
 @dataclass
@@ -79,9 +104,27 @@ class ModuleDraft:
 
 
 @dataclass
+class XmlPartDraft:
+    """Editable state of one XML package part."""
+
+    path: str
+    text: str
+    original_text: str
+    encoding: str
+    bom: bytes
+    newline: str
+    is_relationships_part: bool
+    is_content_types_part: bool
+
+    def is_dirty(self) -> bool:
+        return self.text != self.original_text
+
+
+@dataclass
 class DocumentDraft:
     baseline: DocumentSnapshot
     modules: list[ModuleDraft] = field(default_factory=list)
+    xml_parts: list[XmlPartDraft] = field(default_factory=list)
     signed_save_confirmed: bool = False
 
     # -- queries -------------------------------------------------------
@@ -115,6 +158,12 @@ class DocumentDraft:
     def changed_existing_modules(self) -> list[ModuleDraft]:
         return [m for m in self.surviving_originals() if m.body != m.original_body]
 
+    def xml_part_by_path(self, path: str) -> XmlPartDraft | None:
+        return next((p for p in self.xml_parts if p.path == path), None)
+
+    def changed_xml_parts(self) -> list[XmlPartDraft]:
+        return [p for p in self.xml_parts if p.is_dirty()]
+
     def final_module_state(self) -> list[ModuleDraft]:
         return [
             m for m in self.modules if not m.is_deleted
@@ -126,6 +175,7 @@ class DocumentDraft:
             or self.changed_names()
             or self.new_modules()
             or self.changed_existing_modules()
+            or self.changed_xml_parts()
         )
 
 
@@ -145,7 +195,20 @@ def draft_from_snapshot(snapshot: DocumentSnapshot) -> DocumentDraft:
         )
         for m in snapshot.modules
     ]
-    return DocumentDraft(baseline=snapshot, modules=modules)
+    xml_parts = [
+        XmlPartDraft(
+            path=p.path,
+            text=p.text,
+            original_text=p.text,
+            encoding=p.encoding,
+            bom=p.bom,
+            newline=p.newline,
+            is_relationships_part=p.is_relationships_part,
+            is_content_types_part=p.is_content_types_part,
+        )
+        for p in snapshot.xml_parts
+    ]
+    return DocumentDraft(baseline=snapshot, modules=modules, xml_parts=xml_parts)
 
 
 def new_module_id() -> str:
