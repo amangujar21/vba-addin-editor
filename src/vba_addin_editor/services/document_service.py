@@ -37,10 +37,18 @@ class DocumentService:
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
         fp = paths.fingerprint(path)
+        host_probe = wp.probe_host_process(path)
         snapshot = self.adapter.open_snapshot(
             path,
             fp,
-            host_process_running=wp.host_process_running(path),
+            host_process_running=host_probe.corresponding_host_running,
+        )
+        snapshot = replace(
+            snapshot,
+            safety=replace(
+                snapshot.safety,
+                host_process_probe_failed=host_probe.enumeration_failed,
+            ),
         )
         snapshot = self._with_package_state(path, snapshot)
         return draft_from_snapshot(snapshot)
@@ -78,6 +86,8 @@ def snapshot_report(snapshot: DocumentSnapshot) -> str:
         flags.append("digitally signed")
     if snapshot.package_safety.opc_signature_present:
         flags.append("package digitally signed")
-    if snapshot.safety.host_process_running:
-        flags.append("Office is running")
+    if snapshot.safety.host_process_probe_failed:
+        flags.append("Office process list unavailable")
+    elif snapshot.safety.host_process_running:
+        flags.append("Office was running at open (live status is checked on save)")
     return "".join(bits) + (" — " + ", ".join(flags) if flags else "")

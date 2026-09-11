@@ -12,15 +12,24 @@ updated code the next time it starts.
 
 ## What it does
 
-1. Close Excel/PowerPoint.
-2. Open the installed `.xlam` / `.ppam` / `.pptm` in VBA Add-in Editor.
-3. Edit code; add/rename/delete standard and class modules. On
-   `.xlam`/`.ppam`/`.pptm`, switch to the **XML** tab to edit existing package
-   parts.
-4. **Save File** — the tool verifies the original has not changed, builds a
-   verified candidate file, creates a backup, and atomically replaces the
-   original using Windows `ReplaceFileW` (preserving ACLs and metadata).
+1. You can open the add-in while Excel or PowerPoint is running. Edits are kept
+   in the editor; the corresponding host must still be closed before a successful
+   in-place save. Close Excel for `.xlam`, or PowerPoint for `.ppam`/`.pptm`.
+   The unrelated host does not block saving. If Save is blocked, keep the window
+   open, close the host, and click **Save File** again — do not reload.
+2. Edit code; add/rename/delete standard modules and ordinary class modules.
+   Host document modules and designer/UserForm components stay locked for
+   rename/delete. On `.xlam`/`.ppam`/`.pptm`, switch to the **XML** tab to edit
+   existing package parts.
+3. **Save File** reviews the current draft, verifies the original has not
+   changed, builds a verified candidate, creates a backup, and atomically
+   replaces the original using Windows `ReplaceFileW`. **Save a Copy** writes a
+   separate file and does not clear the original dirty state.
+4. Closing the window with unsaved changes asks Save / Discard / Cancel.
+   Cancel keeps the draft. A blocked save keeps the window open.
 5. Reopen Office — the same installed file path now contains the new content.
+   Draft recovery is written separately from add-in saves; a crash may lose
+   only changes since the last recovery checkpoint.
 
 ## Safety model
 
@@ -56,12 +65,15 @@ updated code the next time it starts.
   `vbaProject.bin`, images, or ActiveX `.bin`.
 - Existing document/designer modules (`ThisWorkbook`, `Sheet1`, UserForm
   code-behind) can be viewed and their body edited, but renaming/deleting them
-  is disabled because their subtype cannot be verified safely yet.
+  is disabled. Ordinary class modules are classified from the VBA PROJECT
+  stream plus dir records and can be deleted or renamed when that metadata
+  agrees. Unknown or conflicting components stay locked.
 - UserForm layout cannot be created or edited; `.frm/.frx` import is not
   supported (`.bas`/`.cls` only).
-- The file must be closed in Office. The tool does not manage add-in
-  registration or file locations — the edited file keeps the same path, so
-  existing registration stays valid.
+- The corresponding Office host must be closed to save in place. The tool does
+  not hot-patch a loaded add-in, manage add-in registration, or change file
+  locations — the edited file keeps the same path, so existing registration
+  stays valid.
 
 ## Development
 
@@ -78,6 +90,7 @@ Headless verification (also runs inside the packaged exe):
 VBAAddinEditor.exe --self-test path\to\addin.xlam
 VBAAddinEditor.exe --self-roundtrip path\to\addin.ppam
 VBAAddinEditor.exe --self-roundtrip path\to\RealPresentation.pptm
+VBAAddinEditor.exe --version-json
 ```
 
 ### Release gating

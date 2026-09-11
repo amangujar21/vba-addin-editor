@@ -18,7 +18,7 @@ class CodeEditor(ttk.Frame):
             self,
             wrap="none",
             font=("Consolas", 11),
-            undo=True,
+            undo=False,
             tabs=("4c",),
             blockcursor=False,
         )
@@ -39,7 +39,10 @@ class CodeEditor(ttk.Frame):
         self.text.bind("<<Find>>", lambda _e: self.find_dialog())
         self.text.event_add("<<Replace>>", "<Control-h>")
         self.text.bind("<<Replace>>", lambda _e: self.replace_dialog())
-        self.text.bind("<Control-y>", lambda _e: (self.text.event_generate("<<Redo>>"), "break")[1])
+        self.text.bind("<Control-z>", self._on_undo, add=True)
+        self.text.bind("<Control-y>", self._on_redo, add=True)
+        self.on_undo = None
+        self.on_redo = None
         install_text_context_menu(self.text)
 
         self.header = None  # optional metadata label set by subclasses (XmlEditor)
@@ -66,6 +69,18 @@ class CodeEditor(ttk.Frame):
         self._redraw_line_numbers()
         if self.on_change is not None:
             self.on_change()
+
+    def _on_undo(self, _event=None):
+        if self.on_undo is not None:
+            self.on_undo()
+            return "break"
+        return None
+
+    def _on_redo(self, _event=None):
+        if self.on_redo is not None:
+            self.on_redo()
+            return "break"
+        return None
 
     def _redraw_line_numbers(self) -> None:
         self.linenumbers.delete("all")

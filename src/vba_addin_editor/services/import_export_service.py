@@ -12,8 +12,6 @@ from vba_addin_editor.domain.document import (
     ModuleDraft,
     new_module_id,
 )
-from vba_addin_editor.platform import paths
-from vba_addin_editor.platform import windows_file_ops as wfo
 
 _IMPORT_EXTS = {".bas": "standard", ".cls": "other"}
 _MAX_IMPORT_BYTES = 8 * 1024 * 1024
@@ -29,19 +27,18 @@ class ImportExportService:
         mod = draft.module_by_id(module_id)
         if mod is None:
             raise KeyError(module_id)
-        if mod.pyopenvba_kind == "standard" and not mod.is_new:
-            text = mod.body
-            ext = ".bas"
-        else:
-            baseline = next(
-                (m for m in draft.baseline.modules if m.id == module_id), None
-            )
-            text = (
-                baseline.full_source
-                if baseline is not None and not mod.is_new
-                else mod.body
-            )
-            ext = ".cls"
+        baseline = next((m for m in draft.baseline.modules if m.id == module_id), None)
+        header = mod.hidden_header or (baseline.hidden_header if baseline is not None else "")
+        from vba_addin_editor.adapters.source_codec import compose_module_source
+
+        text = compose_module_source(
+            body=mod.body,
+            hidden_header=header,
+            current_name=mod.current_name,
+            kind=mod.kind,
+            pyopenvba_kind=mod.pyopenvba_kind,
+        )
+        ext = ".bas" if mod.pyopenvba_kind == "standard" else ".cls"
         dest = dest.with_suffix(ext) if dest.suffix.lower() not in (".bas", ".cls") else dest
         dest.write_bytes(
             to_crlf_bytes(text)
@@ -94,53 +91,10 @@ class ImportExportService:
         mod.body = text
 
 
-class BackupService:
-    """Restore backup flow (plan 16.3, 78): verify, back up current, ReplaceFileW, verify."""
-
-    def __init__(self, adapter: PyOpenVBAAdapter | None = None) -> None:
-        self.adapter = adapter or PyOpenVBAAdapter()
-
-    def restore(
-        self,
-        current_path: Path,
-        backup_path: Path,
-        *,
-        process_probe=None,
-    ) -> Path:
-        from vba_addin_editor.platform import windows_processes as wp
-
-        if process_probe is None:
-            process_probe = wp.host_process_running
-        if process_probe(current_path):
-            raise AdapterError("Close Excel/PowerPoint before restoring a backup.")
-        # Verify the backup opens as a supported add-in.
-        self.adapter.open_snapshot(backup_path, paths.fingerprint(backup_path))
-        # ReplaceFileW moves the backup; work on a verified copy so the
-        # user's chosen backup file is never consumed.
-        pre_restore = paths.backup_path_for(current_path, label="pre-restore")
-        pre_restore.write_bytes(backup_path.read_bytes())
-        recovery_backup = paths.backup_path_for(current_path, label="pre-restore-safety")
-        wfo.replace_file(current_path, pre_restore, recovery_backup)
-        verified = self.adapter.open_snapshot(
-            current_path, paths.fingerprint(current_path)
-        )
-        if not verified.modules:
-            raise AdapterError("Restored file did not verify; use the safety backup.")
-        _discard(pre_restore)
-        return recovery_backup
-
-
 def to_crlf_bytes(text: str) -> bytes:
     return (
         text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n").encode("utf-8")
     )
-
-
-def _discard(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def has_changes(draft: DocumentDraft) -> bool:

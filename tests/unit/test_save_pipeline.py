@@ -69,7 +69,7 @@ def test_save_blocked_when_locked(work_xlam):
     draft = DocumentService().open(work_xlam)
     edit_module1(draft)
     result = make_service(exclusive_probe=lambda p: "in use").save_addin(draft)
-    assert result.kind == "blocked" and result.reason == "locked"
+    assert result.kind == "blocked" and result.reason == "file_in_use"
 
 
 def test_save_blocked_on_external_change(work_xlam):
@@ -132,14 +132,13 @@ def test_add_rename_delete_replay(work_xlam):
         destructive_ops_safe=True,
     )
     draft.modules.append(new)
-    tw = next(m for m in draft.modules if m.current_name == "Sheet1")
-    tw.is_deleted = True
     result = make_service().save_addin(draft)
     assert result.kind == "success", result
     reopened = DocumentService().open(work_xlam)
     names = {m.current_name for m in reopened.modules}
-    assert "Renamed1" in names and "AddedModule" in names and "Sheet1" not in names
+    assert "Renamed1" in names and "AddedModule" in names
     assert "Module1" not in names
+    assert "Sheet1" in names
     m = next(m for m in reopened.modules if m.current_name == "Renamed1")
     assert "V2" in m.body
 

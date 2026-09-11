@@ -18,6 +18,92 @@ def to_editor_text(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+_CLASS_PREAMBLE = (
+    "VERSION 1.0 CLASS\n"
+    "BEGIN\n"
+    "  MultiUse = -1  'True\n"
+    "END\n"
+)
+
+
+def replace_vb_name(header: str, current_name: str) -> str:
+    """Rewrite Attribute VB_Name in a hidden header; keep other attributes."""
+    lines = header.split("\n")
+    found = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith("attribute vb_name"):
+            out.append(f'Attribute VB_Name = "{current_name}"')
+            found = True
+        else:
+            out.append(line)
+    if not found and header.strip():
+        out.append(f'Attribute VB_Name = "{current_name}"')
+    return "\n".join(out)
+
+
+def synthesize_class_header(current_name: str) -> str:
+    return (
+        f"{_CLASS_PREAMBLE}"
+        f'Attribute VB_Name = "{current_name}"\n'
+        "Attribute VB_GlobalNameSpace = False\n"
+        "Attribute VB_Creatable = False\n"
+        "Attribute VB_PredeclaredId = False\n"
+        "Attribute VB_Exposed = False"
+    )
+
+
+def synthesize_standard_header(current_name: str) -> str:
+    return f'Attribute VB_Name = "{current_name}"'
+
+
+def join_header_body(header: str, body: str) -> str:
+    header = header.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    if not header:
+        return body
+    if not body:
+        return header + "\n"
+    return header + "\n" + body
+
+
+def compose_module_source(
+    *,
+    body: str,
+    hidden_header: str,
+    current_name: str,
+    kind: str,
+    pyopenvba_kind: str = "standard",
+) -> str:
+    """Compose exportable source from current body and effective attributes.
+
+    Hidden attributes stay separate from the visible body. Procedure-level
+    Attribute lines that belong in the body are not moved into the header.
+    """
+    header = hidden_header or ""
+    is_class = kind == "class" or pyopenvba_kind == "other" or "VERSION 1.0 CLASS" in header
+    if is_class:
+        header = replace_vb_name(header, current_name) if header.strip() else synthesize_class_header(current_name)
+        if "VERSION 1.0 CLASS" not in header:
+            header = synthesize_class_header(current_name)
+            if hidden_header.strip():
+                extra = "\n".join(
+                    line
+                    for line in hidden_header.split("\n")
+                    if line.strip()
+                    and not line.strip().lower().startswith("attribute vb_name")
+                    and not line.strip().startswith("VERSION ")
+                )
+                if extra:
+                    header = header + "\n" + extra
+    elif header.strip():
+        header = replace_vb_name(header, current_name)
+    else:
+        header = synthesize_standard_header(current_name)
+    return join_header_body(header, body)
+
+
 def split_attribute_header(source: str) -> tuple[str, str]:
     """Split leading ``Attribute VB_*`` lines (and a class ``VERSION`` preamble)
     from the visible body. Mirrors pyopenvba.vba.split_attribute_header without

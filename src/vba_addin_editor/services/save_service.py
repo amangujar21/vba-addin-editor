@@ -22,7 +22,6 @@ from vba_addin_editor.adapters.ooxml_package_adapter import (
 from vba_addin_editor.adapters.pyopenvba_adapter import (
     AdapterError,
     PyOpenVBAAdapter,
-    host_process_for,
 )
 from vba_addin_editor.adapters.source_codec import CodePageError, validate_code_page
 from vba_addin_editor.domain.changes import ChangeSet, compute_changes
@@ -31,6 +30,7 @@ from vba_addin_editor.domain.results import SaveResult
 from vba_addin_editor.platform import paths
 from vba_addin_editor.platform import windows_file_ops as wfo
 from vba_addin_editor.platform import windows_processes as wp
+from vba_addin_editor.platform.session_store import sessions_root
 
 CommitFn = Callable[[Path, Path, Path | None], None]
 
@@ -51,12 +51,46 @@ class SaveService:
     def _probe_process(self, path: Path) -> bool:
         if self.process_probe is not None:
             return self.process_probe(path)
-        return wp.host_process_running(path)
+        probe = wp.probe_host_process(path)
+        return probe.corresponding_host_running or probe.enumeration_failed
+
+    def _host_probe(self, path: Path) -> wp.HostProcessProbe:
+        if self.process_probe is not None:
+            running = bool(self.process_probe(path))
+            return wp.HostProcessProbe(
+                corresponding_host_running=running,
+                enumeration_failed=False,
+                label=wp.corresponding_host_label(path),
+            )
+        return wp.probe_host_process(path)
 
     def _probe_exclusive(self, path: Path) -> str | None:
+        result = self._exclusive_probe(path)
+        if result is None or result.ok:
+            return None
+        return result.message
+
+    def _exclusive_probe(self, path: Path) -> wfo.AccessProbe | None:
         if self.exclusive_probe is not None:
-            return self.exclusive_probe(path)
-        return wfo.exclusive_access_error(path)
+            message = self.exclusive_probe(path)
+            if message:
+                return wfo.AccessProbe(ok=False, reason="file_in_use", message=message)
+            return wfo.AccessProbe(ok=True)
+        return wfo.probe_exclusive_access(path)
+
+    def _fingerprint_block(self, original: Path, draft: DocumentDraft, *, stage: str) -> SaveResult | None:
+        status = paths.fingerprint_status(original, draft.baseline.file_fingerprint)
+        if status == "match":
+            return None
+        messages = {
+            "external_change": (
+                "The file changed on disk after you opened it. The draft was not overwritten."
+            ),
+            "source_missing": "The original add-in file could not be found.",
+            "source_unstable": "The original add-in file changed while it was being read.",
+            "access_denied": "Windows denied access to the original add-in file.",
+        }
+        return SaveResult.blocked(status, messages.get(status), stage=stage)
 
     def _commit(self, replaced: Path, replacement: Path, backup: Path | None) -> None:
         if self.commit is not None:
@@ -111,7 +145,15 @@ class SaveService:
 
             draft_problems = validate_draft(draft)
             if draft_problems:
-                return SaveResult.error("; ".join(draft_problems), reason="invalid_draft")
+                reason = (
+                    "unsupported_component_operation"
+                    if any(
+                        item.startswith(("Cannot delete", "Cannot rename"))
+                        for item in draft_problems
+                    )
+                    else "invalid_draft"
+                )
+                return SaveResult.error("; ".join(draft_problems), reason=reason)
             self._report("Validating text encoding")
             encoding = self.adapter.codepage_encoding(draft.baseline.code_page)
             changed = {m.current_name: m.body for m in draft.changed_existing_modules()}
@@ -172,7 +214,12 @@ class SaveService:
                 )
         except AdapterError as exc:
             _discard(candidate)
-            return SaveResult.error(str(exc), reason="build")
+            reason = (
+                "unsupported_component_operation"
+                if "is not permitted" in str(exc)
+                else "candidate_failed"
+            )
+            return SaveResult.error(str(exc), reason=reason)
         except PackageError as exc:
             _discard(candidate)
             return SaveResult.error(str(exc), reason="invalid_xml")
@@ -209,47 +256,66 @@ class SaveService:
             problems.extend(xml_verification.problems)
         return not problems, tuple(problems)
 
+    def _office_block(self, original: Path, *, stage: str) -> SaveResult | None:
+        probe = self._host_probe(original)
+        if probe.enumeration_failed:
+            return SaveResult.blocked(
+                "process_probe_failed",
+                "Windows could not list running programs, so the editor cannot "
+                f"confirm {probe.label or 'Office'} is closed.",
+                stage=stage,
+                win32_error=probe.win32_error,
+            )
+        if probe.corresponding_host_running:
+            label = probe.label or wp.corresponding_host_label(original)
+            return SaveResult.blocked(
+                "office_running",
+                f"Close {label} before saving this add-in.",
+                stage=stage,
+            )
+        return None
+
+    def _lock_block(self, original: Path, *, stage: str) -> SaveResult | None:
+        probe = self._exclusive_probe(original)
+        if probe is None or probe.ok:
+            return None
+        return SaveResult.blocked(
+            probe.reason or "file_in_use",
+            probe.message,
+            stage=stage,
+            win32_error=probe.win32_error,
+            win32_name=probe.win32_name,
+        )
+
     def _race_narrowing(self, original: Path, draft: DocumentDraft, candidate: Path) -> SaveResult | None:
         self._report("Final pre-commit checks")
-        if self._probe_process(original):
+        blocked = self._office_block(original, stage="pre_commit")
+        if blocked is not None:
             _discard(candidate)
-            return SaveResult.blocked(
-                "office_running", "Excel/PowerPoint started again before the save."
-            )
-        if not paths.fingerprint_matches(original, draft.baseline.file_fingerprint):
+            return blocked
+        blocked = self._fingerprint_block(original, draft, stage="pre_commit")
+        if blocked is not None:
             _discard(candidate)
-            return SaveResult.blocked(
-                "external_change",
-                "The file changed on disk while the edit was being prepared. "
-                "Nothing was overwritten.",
-            )
-        lock_err = self._probe_exclusive(original)
-        if lock_err:
+            return blocked
+        blocked = self._lock_block(original, stage="pre_commit")
+        if blocked is not None:
             _discard(candidate)
-            return SaveResult.blocked("locked", lock_err)
+            return blocked
         return None
 
     def _initial_race_narrowing(self, draft: DocumentDraft) -> SaveResult | None:
         """Stage B/C preflight before any candidate work."""
         original = draft.baseline.path
         self._report("Checking Office is closed")
-        if self._probe_process(original):
-            return SaveResult.blocked(
-                "office_running",
-                f"Close {host_process_for(original)}'s application (Excel/PowerPoint) "
-                "before saving this file.",
-            )
+        blocked = self._office_block(original, stage="preflight")
+        if blocked is not None:
+            return blocked
         self._report("Checking the file is not in use")
-        lock_err = self._probe_exclusive(original)
-        if lock_err:
-            return SaveResult.blocked("locked", lock_err)
+        blocked = self._lock_block(original, stage="preflight")
+        if blocked is not None:
+            return blocked
         self._report("Checking the original file")
-        if not paths.fingerprint_matches(original, draft.baseline.file_fingerprint):
-            return SaveResult.blocked(
-                "external_change",
-                "The file changed on disk after you opened it. Reload it before saving.",
-            )
-        return None
+        return self._fingerprint_block(original, draft, stage="preflight")
 
     def save_addin(self, draft: DocumentDraft) -> SaveResult:
         original = draft.baseline.path
@@ -299,11 +365,21 @@ class SaveService:
         self._report("Creating backup and replacing original")
         try:
             self._commit(original, candidate, backup)
-        except wfo.FileOpsError:
+        except wfo.FileOpsError as exc:
             return SaveResult.error(
                 "Windows could not safely replace the file. Your files have been "
                 "preserved for recovery.",
                 reason="commit_failed",
+                stage="commit",
+                win32_error=exc.win32_error,
+                win32_name=(
+                    wfo.describe_win32_error(exc.win32_error)
+                    if exc.win32_error is not None
+                    else None
+                ),
+                details=dict(exc.details),
+                candidate_path=candidate if candidate.exists() else None,
+                backup_path=backup if backup.exists() else None,
             )
 
         # Stage N — post-commit verification: the saved ORIGINAL path compared
@@ -326,33 +402,185 @@ class SaveService:
 
     # -- Save a Copy (original plan 47; XML plan 12.14) -------------------
 
-    def save_copy(self, draft: DocumentDraft, dest: Path) -> SaveResult:
-        changes = compute_changes(draft)
-        if changes.is_empty:
-            return SaveResult.no_changes()
+    def save_copy(
+        self,
+        draft: DocumentDraft,
+        dest: Path,
+        *,
+        source_path: Path | None = None,
+        allow_overwrite: bool = False,
+        recovered_copy: bool = False,
+        reviewed_dest_hash: str | None = None,
+        session_dir: Path | None = None,
+    ) -> SaveResult:
+        dest = Path(dest)
         source_ext = draft.baseline.extension
+        original = draft.baseline.path
+        build_from = Path(source_path) if source_path is not None else original
         if dest.suffix.lower() != source_ext.lower():
             return SaveResult.error(
                 f"The copy must keep the same file type ({source_ext}); format "
                 "conversion is not supported in this version.",
                 reason="unsupported_extension",
+                operation_type="save_copy",
             )
-        policy = self._composite_preflight(draft, changes)
-        if policy is not None:
-            return policy
-        validation = self._validate_draft_parts(draft, changes.has_vba_changes)
-        if validation is not None:
-            return validation
-        build_error = self._build_candidate(
-            draft.baseline.path, draft, changes, dest
-        )
-        if build_error is not None:
-            return build_error
-        ok, problems = self._verify_candidate(draft.baseline.path, dest, draft, changes)
-        if not ok:
-            _discard(dest)
-            return SaveResult.candidate_failed(problems, None)
-        return SaveResult.success(None, dest)
+        if paths.paths_are_same_file(original, dest):
+            return SaveResult.blocked(
+                "same_path",
+                "The copy destination is the same file as the original.",
+                operation_type="save_copy",
+            )
+        if session_dir is not None and paths.is_inside(dest, session_dir):
+            return SaveResult.blocked(
+                "same_path",
+                "The copy destination cannot be inside the editor's session folder.",
+                operation_type="save_copy",
+            )
+        try:
+            if paths.is_inside(dest, sessions_root()):
+                return SaveResult.blocked(
+                    "same_path",
+                    "The copy destination cannot be inside the editor's session folder.",
+                    operation_type="save_copy",
+                )
+        except OSError:
+            pass
+        if paths.path_or_ancestor_is_reparse_point(dest):
+            return SaveResult.blocked(
+                "reparse_point",
+                "Choose a regular folder. This version does not write through links.",
+                operation_type="save_copy",
+            )
+        dest_exists = dest.exists()
+        if dest_exists and not allow_overwrite:
+            return SaveResult.blocked(
+                "destination_exists",
+                "The destination already exists. Confirm overwrite to replace it.",
+                operation_type="save_copy",
+            )
+        source_status = paths.fingerprint_status(original, draft.baseline.file_fingerprint)
+        if source_status != "match" and not recovered_copy:
+            return SaveResult.blocked(
+                source_status if source_status != "match" else "external_change",
+                "The original file is missing or has changed. Use Save recovered "
+                "draft as a separate copy; newer disk changes will not be included.",
+                operation_type="save_copy",
+            )
+        if recovered_copy and paths.paths_are_same_file(original, dest):
+            return SaveResult.blocked(
+                "same_path",
+                "A recovered copy must be saved to a different path.",
+                operation_type="save_copy",
+            )
+        changes = compute_changes(draft)
+        if dest_exists:
+            blocked = self._office_block(dest, stage="preflight")
+            if blocked is not None:
+                blocked.operation_type = "save_copy"
+                return blocked
+            blocked = self._lock_block(dest, stage="preflight")
+            if blocked is not None:
+                blocked.operation_type = "save_copy"
+                return blocked
+            if reviewed_dest_hash is not None:
+                current = paths.fingerprint(dest)
+                if current.sha256 != reviewed_dest_hash:
+                    return SaveResult.blocked(
+                        "destination_changed",
+                        "The destination file changed after it was reviewed.",
+                        operation_type="save_copy",
+                    )
+        elif dest.parent.exists() and paths.path_or_ancestor_is_reparse_point(dest.parent):
+            return SaveResult.blocked(
+                "reparse_point",
+                "Choose a regular folder. This version does not write through links.",
+                operation_type="save_copy",
+            )
+        if not changes.is_empty:
+            policy = self._composite_preflight(draft, changes)
+            if policy is not None:
+                policy.operation_type = "save_copy"
+                return policy
+            validation = self._validate_draft_parts(draft, changes.has_vba_changes)
+            if validation is not None:
+                validation.operation_type = "save_copy"
+                return validation
+        temp = paths.sibling_temp_path(dest, kind="copy")
+        dest_backup = None
+        try:
+            if changes.is_empty:
+                temp.write_bytes(build_from.read_bytes())
+                if paths.sha256_bytes(temp.read_bytes()) != draft.baseline.file_fingerprint.sha256:
+                    _discard(temp)
+                    return SaveResult.error(
+                        "The copy source no longer matches the captured baseline.",
+                        reason="source_unstable",
+                        operation_type="save_copy",
+                    )
+            else:
+                build_error = self._build_candidate(build_from, draft, changes, temp)
+                if build_error is not None:
+                    build_error.operation_type = "save_copy"
+                    return build_error
+                ok, problems = self._verify_candidate(build_from, temp, draft, changes)
+                if not ok:
+                    keep = temp.with_suffix(temp.suffix + ".failed")
+                    _rename_or_discard(temp, keep)
+                    result = SaveResult.candidate_failed(problems, keep)
+                    result.operation_type = "save_copy"
+                    return result
+            committed_hash = paths.sha256_bytes(temp.read_bytes())
+            if dest_exists:
+                dest_backup = paths.backup_path_for(dest, label="copy-backup")
+                try:
+                    self._commit(dest, temp, dest_backup)
+                except wfo.FileOpsError as exc:
+                    return SaveResult.error(
+                        "Windows could not safely replace the destination file.",
+                        reason="commit_failed",
+                        stage="commit",
+                        win32_error=exc.win32_error,
+                        win32_name=(
+                            wfo.describe_win32_error(exc.win32_error)
+                            if exc.win32_error is not None
+                            else None
+                        ),
+                        details=dict(exc.details),
+                        candidate_path=temp if temp.exists() else None,
+                        backup_path=dest_backup if dest_backup.exists() else None,
+                        operation_type="save_copy",
+                    )
+            else:
+                if dest.exists():
+                    _discard(temp)
+                    return SaveResult.blocked(
+                        "destination_exists",
+                        "Another file appeared at the destination before the copy was committed.",
+                        operation_type="save_copy",
+                        candidate_path=None,
+                    )
+                try:
+                    wfo.move_new_file(temp, dest)
+                except wfo.FileOpsError as exc:
+                    return SaveResult.error(
+                        "Windows could not move the copy into place.",
+                        reason="commit_failed",
+                        stage="commit",
+                        win32_error=exc.win32_error,
+                        details=dict(exc.details),
+                        candidate_path=temp if temp.exists() else None,
+                        operation_type="save_copy",
+                    )
+            if paths.sha256_bytes(dest.read_bytes()) != committed_hash:
+                return SaveResult.recovery_required(
+                    dest_backup,
+                    ("Committed copy does not match the verified candidate hash.",),
+                )
+        finally:
+            _discard(temp)
+        result = SaveResult.success(dest_backup, dest, operation_type="save_copy")
+        result.details["hash_candidate"] = committed_hash
+        return result
 
 def _discard(path: Path) -> None:
     try:

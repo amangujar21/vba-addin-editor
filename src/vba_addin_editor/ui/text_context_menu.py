@@ -29,6 +29,9 @@ class TextContextMenu:
         self.menu.add_command(label="Cut", command=self._cut)
         self.menu.add_command(label="Copy", command=self._copy)
         self.menu.add_command(label="Paste", command=self._paste)
+        self.menu.add_separator()
+        self.menu.add_command(label="Undo", command=self._undo)
+        self.menu.add_command(label="Redo", command=self._redo)
         text.bind("<Button-3>", self._show_menu, add=True)
 
     # -- menu state -------------------------------------------------------
@@ -96,6 +99,12 @@ class TextContextMenu:
             except tk.TclError:
                 pass
         text.event_generate("<<Paste>>")
+
+    def _undo(self) -> None:
+        self.text.event_generate("<Control-z>")
+
+    def _redo(self) -> None:
+        self.text.event_generate("<Control-y>")
 
 
 def install_text_context_menu(text: tk.Text) -> TextContextMenu:

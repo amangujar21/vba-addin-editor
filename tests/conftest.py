@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from pyopenvba import ExcelFile, PowerPointFile
+from pyopenvba.vba import VBAModuleKind
 
 
 def build_xlam(path: Path) -> Path:
@@ -17,6 +18,41 @@ def build_xlam(path: Path) -> Path:
             "Module1",
             'Public Const TEST_BUILD As String = "ORIGINAL"\r\n'
             "Public Sub Hello()\r\n    MsgBox TEST_BUILD\r\nEnd Sub\r\n",
+        )
+        host.save()
+    return path
+
+
+def build_xlam_with_class(path: Path, *, stream_name: str | None = None) -> Path:
+    """Synthetic XLAM with Module1 plus an ordinary class OrdinaryClass."""
+    with ExcelFile.create_new(path) as host:
+        host.set_module(
+            "Module1",
+            'Public Const TEST_BUILD As String = "ORIGINAL"\r\n'
+            "Public Sub Hello()\r\n    MsgBox TEST_BUILD\r\nEnd Sub\r\n",
+        )
+        project = host.vba_project()
+        project.add_module(
+            "OrdinaryClass",
+            "Public X As Long\r\nPublic Sub Ping()\r\nEnd Sub\r\n",
+            kind=VBAModuleKind.other,
+            stream_name=stream_name,
+        )
+        host.save()
+    return path
+
+
+def build_pptm_with_class(path: Path) -> Path:
+    with PowerPointFile.create_new(path) as host:
+        host.set_module(
+            "Module1",
+            'Public Const TEST_BUILD As String = "ORIGINAL"\r\n'
+            "Public Sub Hello()\r\n    MsgBox TEST_BUILD\r\nEnd Sub\r\n",
+        )
+        host.vba_project().add_module(
+            "OrdinaryClass",
+            "Public X As Long\r\n",
+            kind=VBAModuleKind.other,
         )
         host.save()
     return path
@@ -59,6 +95,29 @@ def work_pptm(tmp_path: Path, pptm_path: Path) -> Path:
     dest = tmp_path / "work" / "TestPresentation.pptm"
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(pptm_path, dest)
+    return dest
+
+
+@pytest.fixture()
+def work_xlam_with_class(tmp_path: Path) -> Path:
+    dest = tmp_path / "work" / "ClassAddin.xlam"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    return build_xlam_with_class(dest)
+
+
+@pytest.fixture()
+def work_pptm_with_class(tmp_path: Path) -> Path:
+    dest = tmp_path / "work" / "ClassDeck.pptm"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    return build_pptm_with_class(dest)
+
+
+@pytest.fixture()
+def work_ppam_with_class(tmp_path: Path) -> Path:
+    dest = tmp_path / "work" / "ClassAddin.ppam"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    build_pptm_with_class(dest.with_suffix(".pptm"))
+    shutil.copy2(dest.with_suffix(".pptm"), dest)
     return dest
 
 

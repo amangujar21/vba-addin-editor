@@ -12,7 +12,9 @@ Internals used and why (pinned pyopenvba==3.4.0):
 
 from __future__ import annotations
 
+import hashlib
 import warnings
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +26,21 @@ from pyopenvba.vba import (
     VBAModuleKind,
     _encoding_for_codepage,
     detect_signature,
+    parse_project_stream,
+    parse_projectwm,
+    serialize_project_stream,
 )
 
 from vba_addin_editor.adapters.source_codec import (
     split_attribute_header,
     to_editor_text,
     to_vba_crlf,
+)
+from vba_addin_editor.domain.capabilities import (
+    ComponentCapabilities,
+    build_project_index,
+    classify_component,
+    empty_project_index,
 )
 from vba_addin_editor.domain.document import (
     DocumentDraft,
@@ -173,6 +184,59 @@ def make_display_kind(pyopenvba_kind: str, *, is_new_app_class: bool = False) ->
     return ModuleDisplayKind.CLASS if is_new_app_class else ModuleDisplayKind.AMBIGUOUS
 
 
+def _project_bytes_lossy(raw: bytes, code_page: int) -> tuple[object | None, bool]:
+    """Parse PROJECT and report whether decoding required replacement characters."""
+    encoding = _encoding_for_codepage(code_page)
+    lossy = False
+    try:
+        raw.decode(encoding, errors="strict")
+    except UnicodeDecodeError:
+        lossy = True
+    try:
+        parsed = parse_project_stream(raw, code_page=code_page)
+    except Exception:  # noqa: BLE001 - fail closed at the classifier
+        return None, True
+    return parsed, lossy
+
+
+def _designer_storage_names(cfb: CFB) -> frozenset[str]:
+    try:
+        storages = cfb.list_storages()
+    except Exception:  # noqa: BLE001
+        return frozenset()
+    return frozenset(name.casefold() for name in storages if name.upper() != "VBA")
+
+
+def _index_from_project(parsed: object | None, *, lossy: bool, missing: bool) -> object:
+    if parsed is None:
+        return empty_project_index(missing=missing, lossy=lossy)
+    documents = [name for name, _hid in getattr(parsed, "document_modules", [])]
+    return build_project_index(
+        standard_modules=list(getattr(parsed, "standard_modules", [])),
+        class_modules=list(getattr(parsed, "class_modules", [])),
+        document_modules=documents,
+        base_classes=list(getattr(parsed, "base_classes", [])),
+        lossy=lossy,
+        missing=missing,
+    )
+
+
+def classify_host_module(
+    module: object,
+    *,
+    index,
+    designer_storages: frozenset[str],
+) -> ComponentCapabilities:
+    return classify_component(
+        logical_name=module.name,
+        stream_name=module.stream_name or module.name,
+        dir_kind=module.kind.name,
+        is_read_only=bool(module.is_read_only),
+        index=index,
+        designer_storages=designer_storages,
+    )
+
+
 class PyOpenVBAAdapter:
     # -- safety inspection ------------------------------------------------
 
@@ -218,6 +282,17 @@ class PyOpenVBAAdapter:
                     {"exception": repr(exc)},
                 ) from exc
             sig_present, sig_kinds = self.inspect_signature(host)
+            cfb = CFB.from_bytes(host.vba_project_bytes())
+            try:
+                project_raw = cfb.get_stream("PROJECT")
+                parsed_project, lossy = _project_bytes_lossy(project_raw, project.code_page)
+                missing_project = parsed_project is None
+            except KeyError:
+                parsed_project, lossy, missing_project = None, False, True
+            type_index = _index_from_project(
+                parsed_project, lossy=lossy, missing=missing_project
+            )
+            designer_storages = _designer_storage_names(cfb)
             safety = ProjectSafetyInfo(
                 password_protected=_has_active_project_protection(project.protection),
                 signature_present=sig_present,
@@ -229,22 +304,27 @@ class PyOpenVBAAdapter:
             for m in project.modules:
                 source = to_editor_text(m.source)
                 header, body = split_attribute_header(source)
-                kind = make_display_kind(m.kind.name)
+                caps = classify_host_module(
+                    m, index=type_index, designer_storages=designer_storages
+                )
                 modules.append(
                     ModuleSnapshot(
                         id=f"{m.stream_name}:{len(modules)}",
                         original_name=m.name,
-                        kind=kind,
+                        kind=caps.display_kind,
                         pyopenvba_kind=m.kind.name,
                         full_source=source,
                         hidden_header=header,
                         body=body,
                         is_read_only=m.is_read_only,
                         is_private=m.is_private,
-                        destructive_ops_safe=(
-                            m.kind == VBAModuleKind.standard and not m.is_read_only
-                        ),
+                        destructive_ops_safe=caps.destructive_ops_safe,
                         ends_with_newline=body.endswith("\n"),
+                        can_delete=caps.can_delete,
+                        can_rename=caps.can_rename,
+                        restriction_reason=caps.restriction_reason,
+                        stream_name=m.stream_name or m.name,
+                        project_item_kind=caps.project_item_kind,
                     )
                 )
             return DocumentSnapshot(
@@ -272,6 +352,7 @@ class PyOpenVBAAdapter:
         allow_signature_removal: bool,
     ) -> None:
         """Open the ORIGINAL fresh, replay the draft onto it, serialize to candidate."""
+        _assert_destructive_ops_against_snapshot(draft)
         host = _host_class(original_path)(original_path)
         with host:
             project = host.vba_project()
@@ -322,6 +403,16 @@ class PyOpenVBAAdapter:
                     )
             except ValueError as exc:
                 raise AdapterError(str(exc)) from exc
+        surviving = {mod.current_name.casefold() for mod in draft.final_module_state()}
+        logical_deletes = [
+            mod.origin_name or mod.current_name
+            for mod in draft.deleted_original_modules()
+            if (mod.origin_name or mod.current_name).casefold() not in surviving
+        ]
+        if logical_deletes:
+            _scrub_project_declarations(
+                candidate_path, logical_deletes, draft.baseline.code_page
+            )
 
     # -- candidate verification (plan 14 Stage J, 77) ----------------------
 
@@ -341,9 +432,6 @@ class PyOpenVBAAdapter:
         problems: list[str] = []
         details: dict[str, Any] = {}
         entry = vba_entry_for(reference_path)
-
-        import hashlib
-        import zipfile
 
         if not candidate_path.exists() or candidate_path.stat().st_size == 0:
             return CandidateVerificationResult(False, ("Candidate file missing or empty.",))
@@ -404,6 +492,15 @@ class PyOpenVBAAdapter:
                 want = to_vba_crlf(mod.body)
                 if got_body != want:
                     problems.append(f"Body mismatch for module {mod.current_name!r}.")
+                expected_kind = (
+                    "standard" if mod.pyopenvba_kind == "standard" else "other"
+                )
+                if actual[name].kind.name != expected_kind:
+                    problems.append(
+                        f"Module kind mismatch for {mod.current_name!r}: "
+                        f"{actual[name].kind.name} != {expected_kind}."
+                    )
+            problems.extend(_verify_project_cleanup(cand_host, expected))
             sig_present, kinds = self.inspect_signature(cand_host)
             if expected.baseline.safety.signature_present:
                 if sig_present and allow_removal_expected(expected):
@@ -439,6 +536,118 @@ class PyOpenVBAAdapter:
 
 def allow_removal_expected(draft: DocumentDraft) -> bool:
     return draft.signed_save_confirmed
+
+
+def _assert_destructive_ops_against_snapshot(draft: DocumentDraft) -> None:
+    trusted = {module.id: module for module in draft.baseline.modules}
+    for mod in draft.deleted_original_modules():
+        snap = trusted.get(mod.id)
+        if snap is None or not snap.can_delete:
+            reason = getattr(snap, "restriction_reason", None) if snap is not None else "unknown"
+            raise AdapterError(
+                f"Deleting {mod.origin_name or mod.current_name!r} is not permitted "
+                f"({reason or 'unverified component'}).",
+                {"module_id": mod.id, "reason": reason},
+            )
+    for mod in draft.changed_names():
+        snap = trusted.get(mod.id)
+        if snap is None or not snap.can_rename:
+            reason = getattr(snap, "restriction_reason", None) if snap is not None else "unknown"
+            raise AdapterError(
+                f"Renaming {mod.origin_name or mod.current_name!r} is not permitted "
+                f"({reason or 'unverified component'}).",
+                {"module_id": mod.id, "reason": reason},
+            )
+
+
+def _scrub_project_declarations(candidate_path: Path, logical_names: list[str], code_page: int) -> None:
+    """Shim pyOpenVBA 3.4.0: save() deletes PROJECT lines by stream name.
+
+    serialize_project_stream expects logical names. When they differ, Class=
+    declarations leak. Rewrite PROJECT with the logical names after save.
+    """
+    entry = vba_entry_for(candidate_path)
+    with zipfile.ZipFile(candidate_path) as package:
+        raw = package.read(entry)
+    cfb = CFB.from_bytes(raw)
+    try:
+        project_raw = cfb.get_stream("PROJECT")
+    except KeyError:
+        return
+    rewritten = serialize_project_stream(
+        project_raw,
+        {},
+        delete_names=set(logical_names),
+        code_page=code_page,
+    )
+    cfb.write_stream("PROJECT", rewritten)
+    _rewrite_zip_member(candidate_path, entry, cfb.to_bytes())
+
+
+def _rewrite_zip_member(path: Path, member: str, data: bytes) -> None:
+    temp = path.with_name(path.stem + ".vbaae-proj" + path.suffix)
+    with zipfile.ZipFile(path) as src, zipfile.ZipFile(temp, "w") as dst:
+        dst.comment = src.comment
+        for info in src.infolist():
+            payload = data if info.filename == member else src.read(info.filename)
+            dst.writestr(info, payload)
+    temp.replace(path)
+
+
+def _verify_project_cleanup(host: VBAHostFile, expected: DocumentDraft) -> list[str]:
+    problems: list[str] = []
+    cfb = CFB.from_bytes(host.vba_project_bytes())
+    expected_names = {
+        module.current_name.casefold() for module in expected.final_module_state()
+    }
+    surviving_streams = set(expected_names)
+    for module in expected.final_module_state():
+        if module.stream_name:
+            surviving_streams.add(module.stream_name.casefold())
+    deleted_names = {
+        (module.origin_name or module.current_name).casefold()
+        for module in expected.deleted_original_modules()
+        if (module.origin_name or module.current_name).casefold() not in expected_names
+    }
+    deleted_streams = {
+        (module.stream_name or module.origin_name or module.current_name)
+        for module in expected.deleted_original_modules()
+        if (module.stream_name or module.origin_name or module.current_name).casefold()
+        not in surviving_streams
+    }
+    try:
+        parsed, lossy = _project_bytes_lossy(cfb.get_stream("PROJECT"), expected.baseline.code_page)
+    except KeyError:
+        problems.append("Candidate PROJECT stream is missing.")
+        return problems
+    if parsed is None:
+        problems.append("Candidate PROJECT stream could not be parsed.")
+        return problems
+    if lossy:
+        problems.append("Candidate PROJECT stream decoded with replacement characters.")
+    declared = {name.casefold() for name in parsed.standard_modules}
+    declared.update(name.casefold() for name in parsed.class_modules)
+    declared.update(name.casefold() for name, _hid in parsed.document_modules)
+    declared.update(name.casefold() for name in parsed.base_classes)
+    for name in sorted(deleted_names):
+        if name in declared:
+            problems.append(f"Deleted module still declared in PROJECT: {name!r}")
+    try:
+        vba_streams = {item.casefold() for item in cfb.list_streams_in_storage("VBA")}
+    except Exception:  # noqa: BLE001
+        vba_streams = set()
+    for stream in deleted_streams:
+        if stream and stream.casefold() in vba_streams:
+            problems.append(f"Deleted module stream still present: {stream!r}")
+    try:
+        wm = parse_projectwm(cfb.get_stream("PROJECTwm"), code_page=expected.baseline.code_page)
+        wm_names = {item[0].casefold() for item in wm} if wm else set()
+        for name in sorted(deleted_names):
+            if name in wm_names:
+                problems.append(f"Deleted module still listed in PROJECTwm: {name!r}")
+    except (KeyError, OSError, UnicodeError, ValueError):
+        pass
+    return problems
 
 
 def _make_unique_temp_name(project: Any) -> str:

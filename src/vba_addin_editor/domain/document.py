@@ -21,11 +21,14 @@ class ModuleDisplayKind:
 
 @dataclass(frozen=True)
 class FileFingerprint:
-    """SHA-256 is the authority; size/mtime are fast pre-checks."""
+    """SHA-256 plus size are the authority; mtime is diagnostic only."""
 
     sha256: str
     size: int
     mtime_ns: int
+
+    def content_equal(self, other: FileFingerprint) -> bool:
+        return self.sha256 == other.sha256 and self.size == other.size
 
 
 @dataclass(frozen=True)
@@ -34,7 +37,9 @@ class ProjectSafetyInfo:
     signature_present: bool
     signature_kinds: tuple[str, ...]
     writable: bool
+    # Open-time advisory only. Never use as a live Save/close gate.
     host_process_running: bool
+    host_process_probe_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,11 @@ class ModuleSnapshot:
     is_private: bool
     destructive_ops_safe: bool
     ends_with_newline: bool
+    can_delete: bool = False
+    can_rename: bool = False
+    restriction_reason: str | None = None
+    stream_name: str = ""
+    project_item_kind: str = "unknown"
 
 
 class _XmlPartHealth:
@@ -115,6 +125,12 @@ class ModuleDraft:
     is_deleted: bool
     destructive_ops_safe: bool
     original_body: str | None = None  # for revert of existing modules
+    can_delete: bool = False
+    can_rename: bool = False
+    restriction_reason: str | None = None
+    stream_name: str = ""
+    hidden_header: str = ""
+    project_item_kind: str = "unknown"
 
 
 @dataclass
@@ -207,6 +223,12 @@ def draft_from_snapshot(snapshot: DocumentSnapshot) -> DocumentDraft:
             is_deleted=False,
             destructive_ops_safe=m.destructive_ops_safe,
             original_body=m.body,
+            can_delete=m.can_delete,
+            can_rename=m.can_rename,
+            restriction_reason=m.restriction_reason,
+            stream_name=m.stream_name,
+            hidden_header=m.hidden_header,
+            project_item_kind=m.project_item_kind,
         )
         for m in snapshot.modules
     ]

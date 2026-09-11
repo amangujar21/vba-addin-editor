@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from vba_addin_editor.domain.capabilities import RESTRICTION_MESSAGES
 from vba_addin_editor.domain.document import DocumentDraft
 
 # Conservative VBA component identifier rules (plan 42): ASCII, letter or
@@ -68,4 +69,40 @@ def validate_draft(draft: DocumentDraft) -> list[str]:
         seen[key] = m.id
     if draft.baseline.safety.password_protected:
         problems.append("The VBA project is password-protected.")
+    problems.extend(validate_destructive_ops(draft))
+    return problems
+
+
+def validate_destructive_ops(draft: DocumentDraft) -> list[str]:
+    """Resolve delete/rename against trusted snapshot metadata, not draft flags."""
+    trusted = {module.id: module for module in draft.baseline.modules}
+    problems: list[str] = []
+    for mod in draft.deleted_original_modules():
+        snap = trusted.get(mod.id)
+        if snap is None:
+            problems.append(
+                f"Cannot delete {mod.origin_name or mod.current_name!r}: "
+                "it is not in the trusted snapshot."
+            )
+            continue
+        if not snap.can_delete:
+            message = RESTRICTION_MESSAGES.get(
+                snap.restriction_reason or "",
+                snap.restriction_reason or "this component type cannot be deleted",
+            )
+            problems.append(f"Cannot delete {snap.original_name!r}: {message}")
+    for mod in draft.changed_names():
+        snap = trusted.get(mod.id)
+        if snap is None:
+            problems.append(
+                f"Cannot rename {mod.origin_name or mod.current_name!r}: "
+                "it is not in the trusted snapshot."
+            )
+            continue
+        if not snap.can_rename:
+            message = RESTRICTION_MESSAGES.get(
+                snap.restriction_reason or "",
+                snap.restriction_reason or "this component type cannot be renamed",
+            )
+            problems.append(f"Cannot rename {snap.original_name!r}: {message}")
     return problems

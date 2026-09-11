@@ -114,8 +114,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("file", nargs="?", help="Office VBA file (.xlam/.ppam/.pptm) to open")
     parser.add_argument("--self-test", metavar="ADDIN", help="headless open+parse+validate")
     parser.add_argument("--self-roundtrip", metavar="ADDIN", help="headless edit-candidate round-trip on a copy")
+    parser.add_argument("--version-json", action="store_true", help="print machine-readable build identity")
     args = parser.parse_args(argv)
 
+    if args.version_json:
+        import json
+
+        from vba_addin_editor.version import build_identity
+
+        print(json.dumps(build_identity(), indent=2, sort_keys=True))
+        return 0
     if args.self_test:
         return self_test(Path(args.self_test))
     if args.self_roundtrip:
