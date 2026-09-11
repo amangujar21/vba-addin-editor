@@ -29,7 +29,14 @@ updated code the next time it starts.
    Cancel keeps the draft. A blocked save keeps the window open.
 5. Reopen Office — the same installed file path now contains the new content.
    Draft recovery is written separately from add-in saves; a crash may lose
-   only changes since the last recovery checkpoint.
+   only changes since the last recovery checkpoint. If the original file is
+   missing, in-place Save stays disabled and **Save a Copy** writes the
+   recovered draft to a new path. If the original changed, compare and resolve
+   external changes before saving in place.
+6. **Find in Project** (Ctrl+Shift+F) searches the current draft, not disk.
+   Replace applies one undoable batch. **Restore Backup** is a verified
+   replace with a pre-restore safety copy; it does not run automatically after
+   a failed final verification.
 
 ## Safety model
 
@@ -80,8 +87,9 @@ updated code the next time it starts.
 ```powershell
 pip install -e .[dev]
 scripts/test.ps1          # pytest
-scripts/build.ps1         # onedir build + packaged smoke test
-scripts/build.ps1 -Onefile   # release exe + SHA-256
+scripts/build.ps1         # development onedir package (not a qualified release)
+scripts/build.ps1 -Onefile   # development onefile package
+scripts/build.ps1 -Release   # strict gate: tests, lint, fixtures, onedir+onefile
 ```
 
 Headless verification (also runs inside the packaged exe):

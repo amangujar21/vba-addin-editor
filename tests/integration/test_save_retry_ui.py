@@ -126,6 +126,38 @@ def test_close_cancel_keeps_dirty_draft(work_xlam: Path, monkeypatch):
             root.destroy()
 
 
+def test_gui_save_publishes_session_baseline(work_xlam: Path, monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    try:
+        window = _window(root)
+        window.load_path(work_xlam)
+        assert window.session is not None
+        old_hash = window.session.baseline_sha256
+        module_id = next(m.id for m in window.draft.modules if m.current_name == "Module1")
+        window.tree.selection_set(module_id)
+        root.update()
+        window.editor.text.insert("end", "\n' session-pub\n")
+        window._flush_all_editors()
+        monkeypatch.setattr(
+            "vba_addin_editor.ui.main_window.messagebox.askokcancel",
+            lambda *_a, **_k: True,
+        )
+        monkeypatch.setattr(
+            "vba_addin_editor.ui.main_window.messagebox.showinfo",
+            lambda *_a, **_k: None,
+        )
+        window.save_btn.invoke()
+        root.update()
+        assert window.session.baseline_sha256 != old_hash
+        assert window.session.captured_path.read_bytes() == work_xlam.read_bytes()
+        assert (window.session.session_dir / "complete.marker").exists()
+    finally:
+        root.destroy()
+
+
 def _probe(running: bool):
     from vba_addin_editor.platform.windows_processes import HostProcessProbe
 

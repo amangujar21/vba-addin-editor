@@ -160,6 +160,49 @@ class OoxmlPackageAdapter:
 
         return validate_xml_draft(part)
 
+    def replace_members(self, path: Path, replacements: dict[str, bytes]) -> None:
+        """Rewrite selected ZIP members in place, preserving other entries and metadata."""
+        path = Path(path)
+        if not replacements:
+            raise PackageError("No package members to replace.")
+        temp = path.with_name(path.stem + ".vbaae-member" + path.suffix)
+        try:
+            with zipfile.ZipFile(path) as src:
+                _check_duplicates(src, path)
+                missing = sorted(set(replacements) - set(src.namelist()))
+                if missing:
+                    raise PackageError(f"Package members missing from the file: {missing}")
+                with zipfile.ZipFile(temp, "w") as dst:
+                    if src.comment:
+                        dst.comment = src.comment
+                    for info in src.infolist():
+                        data = replacements.get(info.filename)
+                        if data is None:
+                            data = src.read(info.filename)
+                        new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                        new_info.compress_type = info.compress_type
+                        new_info.comment = info.comment
+                        new_info.extra = info.extra
+                        new_info.internal_attr = info.internal_attr
+                        new_info.external_attr = info.external_attr
+                        new_info.create_system = info.create_system
+                        new_info.create_version = info.create_version
+                        dst.writestr(new_info, data)
+            with zipfile.ZipFile(temp) as check:
+                bad = check.testzip()
+                if bad is not None:
+                    raise PackageError(
+                        f"The edited package failed its integrity check at entry {bad!r}."
+                    )
+            temp.replace(path)
+        except Exception:
+            if temp.exists():
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+            raise
+
     # -- candidate rewrite (plan 9.6, 12.8) -----------------------------------
 
     def write_xml_candidate(

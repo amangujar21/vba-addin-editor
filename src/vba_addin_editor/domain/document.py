@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -251,6 +252,11 @@ def draft_from_snapshot(snapshot: DocumentSnapshot) -> DocumentDraft:
 
 def new_module_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def clone_draft(draft: DocumentDraft) -> DocumentDraft:
+    """Deep copy of draft state for atomic batch mutation."""
+    return copy.deepcopy(draft)
 
 
 def revert_all(draft: DocumentDraft) -> DocumentDraft:

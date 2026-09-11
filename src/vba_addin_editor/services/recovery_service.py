@@ -8,6 +8,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 from vba_addin_editor.domain.document import (
     DocumentDraft,
@@ -16,8 +17,10 @@ from vba_addin_editor.domain.document import (
 )
 from vba_addin_editor.domain.results import SaveResult
 from vba_addin_editor.domain.session import DocumentSession
+from vba_addin_editor.platform import paths
 from vba_addin_editor.platform.paths import sessions_root
 from vba_addin_editor.platform.session_store import (
+    baseline_package_path,
     is_owned,
     read_json,
     write_json_atomic,
@@ -29,6 +32,12 @@ STORAGE_WARN_BYTES = 500 * 1024 * 1024
 IDLE_MS = 1000
 MAX_INTERVAL_MS = 10000
 GENERATIONS = ("gen_a", "gen_b")
+KNOWN_XML_ENCODINGS = {"utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "utf-16le", "utf-16be"}
+ALLOWED_NEWLINES = {"\n", "\r\n"}
+
+
+def _invalid(message: str) -> NoReturn:
+    raise ValueError(message)
 
 
 class Clock:
@@ -52,6 +61,18 @@ class RecoveryListing:
     reason: str | None = None
 
 
+@dataclass
+class RecoveryOpenResult:
+    status: str  # clean | needs_conflict | missing_source | invalid
+    session: DocumentSession | None
+    checkpoint: dict | None
+    listing: RecoveryListing | None
+    reason: str | None = None
+    external: object | None = None
+    problems: tuple[str, ...] = ()
+    used_fallback: bool = False
+
+
 class RecoveryService:
     def __init__(self, *, session_root: Path | None = None, clock: Clock | None = None) -> None:
         self.session_root = session_root or sessions_root()
@@ -60,6 +81,8 @@ class RecoveryService:
     def checkpoint(self, session: DocumentSession, *, cursor: dict | None = None) -> SaveResult | None:
         """Write a new generation then atomically publish the pointer."""
         try:
+            if session.draft.is_dirty():
+                self.clear_completion_marker(session)
             payload = self._serialize(session, cursor=cursor)
             encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
             if len(encoded) > METADATA_LIMIT:
@@ -93,6 +116,25 @@ class RecoveryService:
             )
         return None
 
+    def clear_completion_marker(self, session: DocumentSession) -> None:
+        marker = session.session_dir / "complete.marker"
+        if marker.exists():
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+
+    def retain_named_checkpoint(self, session: DocumentSession, name: str = "pre_resolution") -> None:
+        gen = self._current_generation(session.session_dir)
+        if gen is None:
+            return
+        dest = session.session_dir / name
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        src = session.session_dir / gen
+        if src.exists():
+            shutil.copytree(src, dest)
+
     def mark_complete(self, session: DocumentSession) -> None:
         write_json_atomic(
             session.session_dir / "complete.marker",
@@ -123,13 +165,35 @@ class RecoveryService:
         return listings
 
     def load_checkpoint(self, directory: Path) -> dict:
-        gen = self._current_generation(directory)
-        if gen is None:
-            raise ValueError("No recovery generation is published.")
-        path = directory / gen / "checkpoint.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
-        self._validate_checkpoint(data, directory)
+        data, _fallback = self.load_checkpoint_with_fallback(directory)
         return data
+
+    def load_checkpoint_with_fallback(self, directory: Path) -> tuple[dict, bool]:
+        pointer_gen = self._current_generation(directory)
+        order: list[str] = []
+        if pointer_gen:
+            order.append(pointer_gen)
+        for gen in GENERATIONS:
+            if gen not in order:
+                order.append(gen)
+        last_error: Exception | None = None
+        for index, gen in enumerate(order):
+            path = directory / gen / "checkpoint.json"
+            if not path.exists():
+                continue
+            try:
+                raw = path.read_bytes()
+                if len(raw) > METADATA_LIMIT:
+                    raise ValueError("oversized metadata")
+                data = json.loads(raw.decode("utf-8"))
+                self._validate_checkpoint(data, directory)
+                return data, index > 0
+            except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError, UnicodeError) as exc:
+                last_error = exc
+                continue
+        raise ValueError(
+            f"No valid recovery generation is published ({type(last_error).__name__ if last_error else 'missing'})."
+        )
 
     def apply_checkpoint(self, session: DocumentSession, data: dict) -> None:
         draft = session.draft
@@ -146,13 +210,10 @@ class RecoveryService:
         source = Path(data["source_locator"]["path"])
         if not source.exists():
             return "missing_source"
-        from vba_addin_editor.platform.paths import fingerprint
-
-        current = fingerprint(source)
-        if current.sha256 == data["baseline_sha256"]:
-            self.apply_checkpoint(session, data)
-            return "clean_reconstruct"
+        current = paths.fingerprint(source)
         self.apply_checkpoint(session, data)
+        if current.sha256 == data["baseline_sha256"]:
+            return "clean_reconstruct"
         return "needs_conflict"
 
     def total_storage_bytes(self) -> int:
@@ -241,12 +302,13 @@ class RecoveryService:
         )
 
     def _xml_from_json(self, item: dict) -> XmlPartDraft:
+        bom_hex = item.get("bom") or ""
         return XmlPartDraft(
             path=item["path"],
             text=item.get("text"),
             original_text=item.get("original_text"),
             encoding=item.get("encoding"),
-            bom=bytes.fromhex(item["bom"]) if item.get("bom") else b"",
+            bom=bytes.fromhex(bom_hex) if bom_hex else b"",
             newline=item.get("newline") or "\n",
             is_relationships_part=bool(item.get("is_relationships_part")),
             is_content_types_part=bool(item.get("is_content_types_part")),
@@ -255,8 +317,14 @@ class RecoveryService:
 
     def revalidate_capabilities(self, draft: DocumentDraft) -> None:
         trusted = {module.id: module for module in draft.baseline.modules}
+        trusted_stream = {
+            (module.stream_name or module.original_name).casefold(): module
+            for module in draft.baseline.modules
+        }
         for module in draft.modules:
             snap = trusted.get(module.id)
+            if snap is None and module.stream_name:
+                snap = trusted_stream.get(module.stream_name.casefold())
             if snap is None:
                 if module.is_new:
                     module.can_delete = True
@@ -271,20 +339,120 @@ class RecoveryService:
             module.can_rename = snap.can_rename
             module.destructive_ops_safe = snap.destructive_ops_safe
             module.restriction_reason = snap.restriction_reason
-            module.stream_name = snap.stream_name
-            module.hidden_header = snap.hidden_header
-            module.project_item_kind = snap.project_item_kind
+            if not module.stream_name:
+                module.stream_name = snap.stream_name
+            if not module.hidden_header:
+                module.hidden_header = snap.hidden_header
+            if module.project_item_kind == "unknown":
+                module.project_item_kind = snap.project_item_kind
+
+    def _validate_session_meta(self, meta: dict, directory: Path) -> None:
+        if not isinstance(meta, dict):
+            _invalid("session metadata is not an object")
+        if meta.get("schema_version") not in (None, SCHEMA_VERSION, 1):
+            _invalid("unknown schema")
+        session_id = meta.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            _invalid("missing ids")
+        for key in ("baseline_sha256", "source_path"):
+            if key in meta and not isinstance(meta[key], str):
+                _invalid(f"malformed {key}")
+        if "baseline_size" in meta and not isinstance(meta["baseline_size"], int):
+            _invalid("malformed baseline_size")
+        if "baseline_sha256" in meta and (
+            len(meta["baseline_sha256"]) != 64
+            or any(c not in "0123456789abcdefABCDEF" for c in meta["baseline_sha256"])
+        ):
+            _invalid("wrong hashes")
 
     def _validate_checkpoint(self, data: dict, directory: Path) -> None:
+        if not isinstance(data, dict):
+            _invalid("checkpoint is not an object")
         if data.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError("unknown schema")
+            _invalid("unknown schema")
         if "session_id" not in data or "revision" not in data:
-            raise ValueError("missing ids")
-        if "draft" not in data or "modules" not in data["draft"]:
-            raise ValueError("missing draft")
-        ids = [item["id"] for item in data["draft"]["modules"]]
+            _invalid("missing ids")
+        if not isinstance(data["session_id"], str) or not isinstance(data["revision"], int):
+            _invalid("missing ids")
+        if data["revision"] < 0:
+            _invalid("missing ids")
+        if "draft" not in data or not isinstance(data["draft"], dict) or "modules" not in data["draft"]:
+            _invalid("missing draft")
+        modules = data["draft"]["modules"]
+        if not isinstance(modules, list):
+            _invalid("missing draft")
+        ids = []
+        for item in modules:
+            if not isinstance(item, dict) or "id" not in item or "current_name" not in item:
+                _invalid("missing ids")
+            if not isinstance(item["id"], str):
+                _invalid("missing ids")
+            ids.append(item["id"])
+            body = item.get("body")
+            if body is not None and not isinstance(body, str):
+                _invalid("invalid encoding")
         if len(ids) != len(set(ids)):
-            raise ValueError("duplicate ids")
+            _invalid("duplicate ids")
+        xml_parts = data["draft"].get("xml_parts", [])
+        if xml_parts is None:
+            xml_parts = []
+        if not isinstance(xml_parts, list):
+            _invalid("missing draft")
+        xml_paths = []
+        for item in xml_parts:
+            if not isinstance(item, dict) or "path" not in item:
+                _invalid("missing draft")
+            path = item["path"]
+            if not isinstance(path, str) or not path or path.startswith("/") or ".." in Path(path).parts:
+                _invalid("path traversal")
+            xml_paths.append(path)
+            encoding = item.get("encoding")
+            if encoding is not None and not isinstance(encoding, str):
+                _invalid("invalid BOM/encoding metadata")
+            if encoding and encoding.lower() not in KNOWN_XML_ENCODINGS:
+                _invalid("invalid BOM/encoding metadata")
+            newline = item.get("newline")
+            if newline is not None and newline not in ALLOWED_NEWLINES:
+                _invalid("invalid BOM/encoding metadata")
+            bom = item.get("bom") or ""
+            if bom and (not isinstance(bom, str) or len(bom) % 2 or any(c not in "0123456789abcdefABCDEF" for c in bom)):
+                _invalid("invalid BOM/encoding metadata")
+        if len(xml_paths) != len(set(xml_paths)):
+            _invalid("duplicate ids")
+        sha = data.get("baseline_sha256")
+        if not isinstance(sha, str) or len(sha) != 64:
+            _invalid("wrong hashes")
+        size = data.get("baseline_size")
+        if not isinstance(size, int) or size < 0:
+            _invalid("wrong lengths")
+        locator = data.get("source_locator")
+        if locator is not None and (
+            not isinstance(locator, dict) or not isinstance(locator.get("path", ""), str)
+        ):
+            _invalid("path traversal")
+        for payload_key in ("payloads", "files", "binaries"):
+            refs = data.get(payload_key) or data.get("draft", {}).get(payload_key)
+            if not refs:
+                continue
+            if not isinstance(refs, list):
+                _invalid("path traversal")
+            for ref in refs:
+                rel = ref.get("path") if isinstance(ref, dict) else ref
+                if not isinstance(rel, str):
+                    _invalid("path traversal")
+                resolved = (directory / rel).resolve()
+                if not paths.is_inside(resolved, directory.resolve()):
+                    _invalid("path traversal")
+
+    def validate_captured_package(self, directory: Path, data: dict, extension: str) -> None:
+        captured = baseline_package_path(directory, extension)
+        if not captured.exists():
+            raise ValueError("mismatched captured package")
+        fp = paths.fingerprint(captured)
+        if fp.sha256 != data["baseline_sha256"]:
+            raise ValueError("mismatched captured package")
+        if fp.size != int(data["baseline_size"]):
+            raise ValueError("wrong lengths")
 
     def _current_generation(self, directory: Path) -> str | None:
         pointer = directory / "current.json"
@@ -317,7 +485,7 @@ class RecoveryService:
                 reason="invalid metadata",
             )
         try:
-            data = self.load_checkpoint(directory)
+            data, _fallback = self.load_checkpoint_with_fallback(directory)
             source = data.get("source_locator", {}).get("path") or meta.get("source_path", "")
             return RecoveryListing(
                 session_id=meta.get("session_id", directory.name),
@@ -329,7 +497,7 @@ class RecoveryService:
                 dirty=True,
                 invalid=False,
             )
-        except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+        except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
             return RecoveryListing(
                 session_id=meta.get("session_id", directory.name),
                 directory=directory,
@@ -340,4 +508,82 @@ class RecoveryService:
                 dirty=True,
                 invalid=True,
                 reason=str(type(exc).__name__),
+            )
+
+
+class RecoveryOpenService:
+    """Reconstruct a draft from the checkpoint's captured baseline (IMP-01 / repair §2)."""
+
+    def __init__(self, recovery: RecoveryService, sessions) -> None:
+        self.recovery = recovery
+        self.sessions = sessions
+
+    def open_recoverable(self, directory: Path) -> RecoveryOpenResult:
+        directory = Path(directory)
+        listing = self.recovery._inspect(directory)
+        try:
+            meta = read_json(directory / "session.json")
+            self.recovery._validate_session_meta(meta, directory)
+            data, used_fallback = self.recovery.load_checkpoint_with_fallback(directory)
+            if meta.get("session_id") and data.get("session_id") != meta["session_id"]:
+                raise ValueError("missing ids")
+            if meta.get("baseline_sha256") and meta["baseline_sha256"] != data.get("baseline_sha256"):
+                raise ValueError("wrong hashes")
+            extension = meta.get("extension") or Path(
+                data.get("source_locator", {}).get("path") or meta.get("source_path") or ".xlam"
+            ).suffix.lower()
+            if not extension:
+                extension = ".xlam"
+            self.recovery.validate_captured_package(directory, data, extension)
+            source = Path(data.get("source_locator", {}).get("path") or meta.get("source_path") or "")
+            original_exists = bool(source.parts) and source.exists()
+            status = "missing_source"
+            external = None
+            if original_exists:
+                current = paths.fingerprint(source)
+                if current.sha256 == data["baseline_sha256"] and current.size == int(data["baseline_size"]):
+                    status = "clean"
+                else:
+                    status = "needs_conflict"
+            session = self.sessions.attach_captured(
+                session_id=str(meta.get("session_id") or data["session_id"]),
+                directory=directory,
+                source_path=source if source.parts else directory / f"missing{extension}",
+                extension=extension,
+                revision=int(data["revision"]),
+                original_exists=status != "missing_source",
+                baseline_generation=int(meta.get("baseline_generation") or 1),
+            )
+            self.recovery.apply_checkpoint(session, data)
+            self.recovery.revalidate_capabilities(session.draft)
+            if status == "needs_conflict":
+                session.conflicts_pending = True
+                try:
+                    external = self.sessions.document_service.open(source).baseline
+                except Exception as exc:  # noqa: BLE001 - unparseable E is a blocked outcome
+                    return RecoveryOpenResult(
+                        status="needs_conflict",
+                        session=session,
+                        checkpoint=data,
+                        listing=listing,
+                        reason="unparseable_external",
+                        problems=(f"The current file could not be parsed ({type(exc).__name__}).",),
+                        used_fallback=used_fallback,
+                    )
+            return RecoveryOpenResult(
+                status=status,
+                session=session,
+                checkpoint=data,
+                listing=listing,
+                external=external,
+                used_fallback=used_fallback,
+            )
+        except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError, UnicodeError) as exc:
+            return RecoveryOpenResult(
+                status="invalid",
+                session=None,
+                checkpoint=None,
+                listing=listing,
+                reason=str(exc) if str(exc) else type(exc).__name__,
+                problems=(str(exc) or type(exc).__name__,),
             )

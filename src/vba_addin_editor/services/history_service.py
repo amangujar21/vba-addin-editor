@@ -54,7 +54,19 @@ class HistoryService:
 
     def _apply(self, draft: DocumentDraft, command: HistoryCommand, *, reverse: bool) -> None:
         state = command.before if reverse else command.after
-        if command.op in {"text", "paste", "replace_all"}:
+        if command.op in {"replace_all", "folder_sync", "import_batch", "revert"} and isinstance(state, dict):
+            modules = state.get("modules")
+            if isinstance(modules, list):
+                draft.modules[:] = [_module_from_snapshot(item) for item in modules]
+            xml_state = state.get("xml")
+            if isinstance(xml_state, list):
+                by_path = {item.get("path"): item for item in xml_state if isinstance(item, dict)}
+                for part in draft.xml_parts:
+                    payload = by_path.get(part.path)
+                    if payload is not None:
+                        part.text = payload.get("text")
+            return
+        if command.op in {"text", "paste"}:
             module = draft.module_by_id(command.target_id)
             if module is not None:
                 module.body = state
@@ -107,6 +119,10 @@ def _module_from_snapshot(item: dict) -> ModuleDraft:
         hidden_header=item.get("hidden_header") or "",
         project_item_kind=item.get("project_item_kind") or "unknown",
     )
+
+
+def snapshot_xml(draft: DocumentDraft) -> list[dict]:
+    return [{"path": part.path, "text": part.text} for part in draft.xml_parts]
 
 
 def snapshot_modules(draft: DocumentDraft) -> list[dict]:

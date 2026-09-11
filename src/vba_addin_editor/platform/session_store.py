@@ -99,6 +99,19 @@ def is_owned(directory: Path) -> bool:
     return False
 
 
+def copy_file_atomic(src: Path, dest: Path) -> None:
+    """Copy bytes to a sibling temp, fsync, then atomically replace dest."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    data = Path(src).read_bytes()
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, dest)
+
+
 def write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")

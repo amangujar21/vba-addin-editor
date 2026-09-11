@@ -42,6 +42,8 @@ class DocumentSession:
     history: UndoHistory = field(default_factory=UndoHistory)
     original_exists: bool = True
     recovery_generation: str | None = None
+    baseline_generation: int = 1
+    conflicts_pending: bool = False
 
     @property
     def original_path(self) -> Path:

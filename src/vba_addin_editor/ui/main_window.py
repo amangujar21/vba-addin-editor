@@ -18,6 +18,7 @@ from vba_addin_editor.domain.document import (
     ModuleDisplayKind,
     ModuleDraft,
     new_module_id,
+    revert_all,
 )
 from vba_addin_editor.domain.history import HistoryCommand
 from vba_addin_editor.platform import windows_processes as wp
@@ -28,13 +29,20 @@ from vba_addin_editor.services.document_service import DocumentService
 from vba_addin_editor.services.folder_sync_service import FolderSyncService
 from vba_addin_editor.services.history_service import HistoryService, snapshot_modules
 from vba_addin_editor.services.import_export_service import ImportExportService
-from vba_addin_editor.services.recovery_service import IDLE_MS, MAX_INTERVAL_MS, RecoveryService
+from vba_addin_editor.services.recovery_service import (
+    IDLE_MS,
+    MAX_INTERVAL_MS,
+    RecoveryOpenService,
+    RecoveryService,
+)
 from vba_addin_editor.services.review_service import ReviewService
 from vba_addin_editor.services.save_service import SaveService
 from vba_addin_editor.services.search_service import SearchService
 from vba_addin_editor.services.session_service import SessionService
 from vba_addin_editor.services.validation_service import validate_module_name
 from vba_addin_editor.ui.code_editor import CodeEditor
+from vba_addin_editor.ui.conflict_dialog import ConflictDialog
+from vba_addin_editor.ui.search_dialog import ProjectSearchDialog
 from vba_addin_editor.ui.xml_editor import XmlEditor
 from vba_addin_editor.version import APP_NAME, VERSION, build_identity
 
@@ -82,6 +90,8 @@ class MainWindow:
         self.search_service = SearchService()
         self.folder_sync = FolderSyncService()
         self.history_service = HistoryService()
+        self.recovery_open = RecoveryOpenService(self.recovery_service, self.session_service)
+        self._search_dialog = None
 
         root.title(APP_NAME)
         root.geometry("1000x680")
@@ -116,6 +126,7 @@ class MainWindow:
         file_menu.add_separator()
         file_menu.add_command(label="Restore Backup…", command=self.restore_backup)
         file_menu.add_command(label="Backup Browser…", command=self.backup_browser)
+        file_menu.add_command(label="Compare External Changes…", command=self.compare_external_changes)
         file_menu.add_command(label="Open File Location", command=self.open_location)
         file_menu.add_separator()
         file_menu.add_command(label="Export Source Folder…", command=self.export_source_folder)
@@ -259,11 +270,24 @@ class MainWindow:
         name = draft.baseline.path.name
         n = dirty_count(draft)
         self.file_label.config(text=f"{name} — unsaved changes: {n}")
-        can_save = not self._saving
-        self.save_btn.config(state="normal" if can_save else "disabled")
+        inplace_ok = (
+            not self._saving
+            and (self.session is None or (self.session.original_exists and not self.session.conflicts_pending))
+        )
+        self.save_btn.config(state="normal" if inplace_ok else "disabled")
         self.review_btn.config(state="normal" if n else "disabled")
         self.revert_btn.config(state="normal" if n else "disabled")
-        if self._recovery_warning:
+        if self.session is not None and not self.session.original_exists:
+            self._set_banner(
+                "The original add-in is missing. In-place Save is disabled. "
+                "Use Save a Copy to write a recovered draft to a new path."
+            )
+        elif self.session is not None and self.session.conflicts_pending:
+            self._set_banner(
+                "The original file changed after this draft was captured. "
+                "Resolve external changes before saving in place."
+            )
+        elif self._recovery_warning:
             self._set_banner(self._recovery_warning)
         elif draft.baseline.safety.password_protected:
             self._set_banner(
@@ -476,6 +500,20 @@ class MainWindow:
     def save(self) -> None:
         if self.draft is None or self._saving:
             return
+        if self.session is not None and not self.session.original_exists:
+            messagebox.showwarning(
+                APP_NAME,
+                "In-place Save is disabled because the original add-in is missing. "
+                "Use Save a Copy to write the recovered draft to a different path.",
+            )
+            return
+        if self.session is not None and self.session.conflicts_pending:
+            messagebox.showwarning(
+                APP_NAME,
+                "The original file has changed. Compare and resolve external changes before saving in place.",
+            )
+            self.compare_external_changes()
+            return
         self._flush_all_editors()
         self._checkpoint_now()
         changes = compute_changes(self.draft)
@@ -513,7 +551,19 @@ class MainWindow:
                 operation_type=result.operation_type,
             )
             if self.session is not None:
-                self.session.history.clear()
+                saved = Path(str(result.details.get("saved") or self.draft.baseline.path))
+                published = self.session_service.publish_verified_baseline(self.session, saved)
+                if published is not None:
+                    self._last_result = published
+                    messagebox.showerror(
+                        APP_NAME,
+                        (published.message or "Session baseline publication failed.")
+                        + f"\n\nCommitted file: {saved}"
+                        + f"\nCaptured baseline: {self.session.captured_path}"
+                        + f"\nSession folder: {self.session.session_dir}",
+                    )
+                    self._refresh_state()
+                    return
                 self.recovery_service.mark_complete(self.session)
             self._refresh_tree()
             self._refresh_xml_tree()
@@ -543,17 +593,13 @@ class MainWindow:
             details = "\n".join(result.problems)
             messagebox.showerror(APP_NAME, result.message + "\n\n" + details)
         elif kind == "recovery_required":
-            if messagebox.askyesno(
+            messagebox.showerror(
                 APP_NAME,
-                "Final verification failed after replacing the add-in.\n\nRestore the backup now?",
-            ):
-                try:
-                    self.backup_service.restore(self.draft.baseline.path, result.backup_path)
-                    messagebox.showinfo(APP_NAME, "Backup restored.")
-                except AdapterError as exc:
-                    messagebox.showerror(APP_NAME, str(exc))
-            else:
-                messagebox.showwarning(APP_NAME, f"Keep this backup safe: {result.backup_path}")
+                (result.message or "Final verification failed after replacing the add-in.")
+                + f"\n\nBackup: {result.backup_path}"
+                + f"\nCandidate: {result.candidate_path}"
+                + "\n\nUse File → Restore Backup to recover. The editor will not restore automatically.",
+            )
         elif kind == "error":
             messagebox.showerror(APP_NAME, result.message or "Save failed.")
         self._refresh_state()
@@ -660,11 +706,22 @@ class MainWindow:
             from vba_addin_editor.platform import paths as pathmod
 
             dest_hash = pathmod.fingerprint(dest).sha256
+        recovered = bool(self.session is not None and (
+            not self.session.original_exists or self.session.conflicts_pending
+        ))
+        if recovered and not messagebox.askokcancel(
+            APP_NAME,
+            "Save recovered draft as a separate copy?\n\n"
+            "Newer or missing original bytes will not be included. "
+            "The destination must differ from the original path.",
+        ):
+            return
         result = self.save_service.save_copy(
             self.draft,
             dest,
             source_path=self.session.captured_path if self.session is not None else None,
             allow_overwrite=dest.exists(),
+            recovered_copy=recovered,
             reviewed_dest_hash=dest_hash,
             session_dir=self.session.session_dir if self.session is not None else None,
         )
@@ -924,19 +981,70 @@ class MainWindow:
         if self.draft is None:
             messagebox.showinfo(APP_NAME, "Open the add-in first, then restore a backup.")
             return
+        if self.draft.is_dirty():
+            choice = messagebox.askyesnocancel(
+                APP_NAME, "You have unsaved changes. Save before restoring a backup?"
+            )
+            if choice is None:
+                return
+            if choice:
+                self.save()
+                if self.draft is not None and self.draft.is_dirty():
+                    return
+            else:
+                self._checkpoint_now()
+                self.draft = revert_all(self.draft)
+                if self.session is not None:
+                    self.session.draft = self.draft
+                self._reload_editors_from_draft()
         path = filedialog.askopenfilename(
             title="Select Backup", filetypes=_FILETYPES
         )
         if not path:
             return
-        try:
-            safety = self.backup_service.restore(self.draft.baseline.path, Path(path))
-            messagebox.showinfo(
-                APP_NAME, f"Backup restored.\n\nPre-restore safety copy: {safety}"
+        backup = Path(path)
+        inspect = self.backup_service.inspect(backup, current_path=self.draft.baseline.path)
+        if inspect.problems:
+            messagebox.showerror(APP_NAME, "\n".join(inspect.problems))
+            return
+        summary = "\n".join(inspect.summary_lines) or backup.name
+        if not messagebox.askokcancel(APP_NAME, "Restore this backup?\n\n" + summary[:4000]):
+            return
+        result = self.backup_service.restore_transaction(
+            self.draft.baseline.path,
+            backup,
+            expected_backup_hash=inspect.sha256,
+            expected_target_hash=self.draft.baseline.file_fingerprint.sha256,
+        )
+        if result.kind != "success":
+            messagebox.showerror(
+                APP_NAME,
+                (result.message or "Restore failed.")
+                + "\n\n"
+                + "\n".join(f"{k}: {v}" for k, v in result.details.items() if k.endswith("backup") or k in {"target", "candidate", "safety_backup", "selected_backup"})
             )
-            self.load_path(self.draft.baseline.path)
+            return
+        warning = result.details.get("catalog_warning")
+        try:
+            refreshed = self.doc_service.open(self.draft.baseline.path)
         except AdapterError as exc:
             messagebox.showerror(APP_NAME, str(exc))
+            return
+        self.draft = refreshed
+        if self.session is not None:
+            self.session.draft = refreshed
+            published = self.session_service.publish_verified_baseline(
+                self.session, self.draft.baseline.path
+            )
+            if published is not None:
+                messagebox.showerror(APP_NAME, published.message or "Session baseline publication failed.")
+            else:
+                self.recovery_service.checkpoint(self.session)
+        self._reload_editors_from_draft()
+        msg = f"Backup restored.\n\nPre-restore safety copy: {result.backup_path}"
+        if warning:
+            msg += f"\n\n{warning}"
+        messagebox.showinfo(APP_NAME, msg)
 
     def open_location(self) -> None:
         if self.draft is None:
@@ -1011,6 +1119,8 @@ class MainWindow:
     def _note_text_edit(self, *, kind: str) -> None:
         if self.session is None or self.draft is None:
             return
+        if self._search_dialog is not None:
+            self._search_dialog.mark_stale()
         self._schedule_autosave()
 
     def _schedule_autosave(self) -> None:
@@ -1090,25 +1200,42 @@ class MainWindow:
         if self.draft is None:
             return
         self._flush_all_editors()
-        query = self._prompt_name("Find in Project", "")
-        if not query:
-            return
-        revision = self.session.revision if self.session is not None else 0
-        results = self.search_service.search(
-            self.draft, query, revision=revision, include_xml=True
-        )
-        lines = [f"{results.total} matches for {query!r}", ""]
-        for hit in self.search_service.page(results, 0):
-            lines.append(f"{hit.path}:{hit.line}:{hit.column}  {hit.snippet}")
-        messagebox.showinfo(APP_NAME, "\n".join(lines)[:4000] or "No matches.")
-        if results.hits:
-            first = results.hits[0]
-            if first.kind == "vba":
-                self.tree.selection_set(first.target_id)
-                self.editor.goto_line(first.line)
-            else:
-                self.editor_notebook.select(self.xml_tab)
-                self.xml_tree.selection_set("xml::" + first.target_id)
+        if self._search_dialog is not None:
+            try:
+                if self._search_dialog.win.winfo_exists():
+                    self._search_dialog.win.lift()
+                    return
+            except tk.TclError:
+                self._search_dialog = None
+        dialog = ProjectSearchDialog(self.root, self)
+        self._search_dialog = dialog
+        self.root.update_idletasks()
+
+    def goto_search_hit(self, hit) -> None:
+        if hit.kind == "vba":
+            self.editor_notebook.select(0)
+            try:
+                self.tree.selection_set(hit.target_id)
+            except tk.TclError:
+                pass
+            self.current_module_id = hit.target_id
+            if self.draft is not None:
+                mod = self.draft.module_by_id(hit.target_id)
+                if mod is not None:
+                    self.editor.set_text(mod.body)
+            self.editor.goto_position(hit.line, hit.column, hit.length)
+        else:
+            self.editor_notebook.select(self.xml_tab)
+            try:
+                self.xml_tree.selection_set("xml::" + hit.target_id)
+            except tk.TclError:
+                pass
+            self.current_xml_part_path = hit.target_id
+            if self.draft is not None:
+                part = self.draft.xml_part_by_path(hit.target_id)
+                if part is not None and part.text is not None:
+                    self.xml_editor.set_text(part.text)
+            self.xml_editor.goto_position(hit.line, hit.column, hit.length)
 
     def backup_browser(self) -> None:
         if self.draft is None:
@@ -1153,16 +1280,14 @@ class MainWindow:
         if not lines:
             messagebox.showinfo(APP_NAME, "No folder changes to apply.")
             return
-        if not messagebox.askokcancel(APP_NAME, "Apply selected folder edits?\n\n" + "\n".join(lines)):
+        if not messagebox.askokcancel(APP_NAME, "Apply currently selected folder edits?\n\n" + "\n".join(lines)):
             return
-        for change in preview.changes:
-            if change.operation in {"edit", "add"}:
-                change.selected = True
         try:
-            self.folder_sync.apply(self.session, preview)
+            self.folder_sync.apply(self.session, preview, history_service=self.history_service)
         except AdapterError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
+        self.recovery_service.checkpoint(self.session)
         self._reload_editors_from_draft()
         self.review_changes()
 
@@ -1185,11 +1310,39 @@ class MainWindow:
         text.insert("1.0", report)
         text.config(state="disabled")
 
+    def _adopt_session(self, session) -> None:
+        if self.session is not None and self.session is not session:
+            self.session_service.close(self.session)
+        self.session = session
+        self.draft = session.draft
+        self.current_module_id = None
+        self.current_xml_part_path = None
+        path = session.original_path
+        xml_supported = path.suffix.lower() in XML_EDITABLE_EXTENSIONS
+        self.editor_notebook.tab(self.xml_tab, state="normal" if xml_supported else "disabled")
+        self._reload_editors_from_draft()
+        first = next((m.id for m in session.draft.modules if not m.is_deleted), None)
+        if first:
+            try:
+                self.tree.selection_set(first)
+            except tk.TclError:
+                pass
+        self._refresh_host_status()
+        self._refresh_state()
+        self.status.config(text=f"Recovered {path.name}")
+
     def _offer_recovery(self) -> None:
         listings = self.recovery_service.list_recoverable()
         if not listings:
             return
         first = listings[0]
+        if first.invalid:
+            messagebox.showwarning(
+                APP_NAME,
+                f"A recovery folder is present but invalid ({first.reason}). "
+                "It was left in place for inspection/export.",
+            )
+            return
         choice = messagebox.askyesnocancel(
             APP_NAME,
             f"A recovered draft was found for {first.filename} "
@@ -1201,40 +1354,96 @@ class MainWindow:
             return
         if choice is False:
             return
-        source = Path(first.source_path) if first.source_path else None
-        if source is None or not source.exists():
-            messagebox.showwarning(
+        opened = self.recovery_open.open_recoverable(first.directory)
+        if opened.status == "invalid" or opened.session is None:
+            messagebox.showerror(
                 APP_NAME,
-                "The original add-in is missing. Recover the draft, then use Save a Copy.",
+                "Recovery data is invalid and was left in place for inspection.\n\n"
+                + (opened.reason or "invalid"),
             )
             return
-        self.load_path(source)
-        if self.session is None:
+        self._adopt_session(opened.session)
+        if opened.status == "missing_source":
+            messagebox.showwarning(
+                APP_NAME,
+                "The original add-in is missing. In-place Save is disabled. "
+                "Use Save a Copy to write the recovered draft to a different path. "
+                "Newer or missing source bytes are not included.",
+            )
             return
-        try:
-            data = self.recovery_service.load_checkpoint(first.directory)
-            self.recovery_service.apply_checkpoint(self.session, data)
-            self.recovery_service.revalidate_capabilities(self.session.draft)
-            self.draft = self.session.draft
-            self._reload_editors_from_draft()
-        except (OSError, ValueError, KeyError) as exc:
-            messagebox.showerror(APP_NAME, f"Recovery could not be applied: {type(exc).__name__}")
+        if opened.status == "needs_conflict":
+            if opened.external is None:
+                messagebox.showwarning(
+                    APP_NAME,
+                    "The original file changed and could not be parsed. "
+                    "In-place Save is blocked. Use Save a Copy or Cancel.",
+                )
+                return
+            self._run_conflict_resolution(opened.external)
 
     def compare_external_changes(self) -> None:
         if self.session is None or self.draft is None:
             return
-        try:
-            external = self.doc_service.open(self.draft.baseline.path)
-        except AdapterError as exc:
-            messagebox.showerror(APP_NAME, str(exc))
+        snapshot, _digest, error = self.conflict_service.snapshot_external(self.draft.baseline.path)
+        if snapshot is None:
+            messagebox.showerror(
+                APP_NAME,
+                "The current file could not be compared: " + (error or "unknown"),
+            )
             return
-        proposal = self.conflict_service.compare(self.session, external.baseline)
-        unresolved = [item for item in proposal.items if item.requires_choice]
-        if not unresolved:
-            messagebox.showinfo(APP_NAME, "No unresolved external differences.")
+        self._run_conflict_resolution(snapshot)
+
+    def _run_conflict_resolution(self, external) -> None:
+        if self.session is None:
             return
-        lines = [f"{item.category} {item.property_name} {item.target_id}" for item in unresolved]
-        messagebox.showwarning(APP_NAME, "External changes need review:\n\n" + "\n".join(lines)[:4000])
+        proposal = self.conflict_service.compare(self.session, external)
+        if proposal.parse_failed:
+            messagebox.showwarning(
+                APP_NAME,
+                "The current file could not be parsed. Cancel, save a recovered copy, or discard.",
+            )
+            return
+        if not any(item.requires_choice for item in proposal.items):
+            if not messagebox.askokcancel(
+                APP_NAME,
+                "No unresolved choices. Apply auto-resolved external baseline adoption?",
+            ):
+                return
+            result = self.conflict_service.commit(
+                self.session,
+                proposal,
+                external,
+                live_external_hash=external.file_fingerprint.sha256,
+                external_path=self.session.original_path,
+                session_service=self.session_service,
+                recovery_service=self.recovery_service,
+            )
+            if result.kind != "success":
+                messagebox.showerror(APP_NAME, result.message or result.reason or "Apply failed.")
+                return
+            self.draft = self.session.draft
+            self._reload_editors_from_draft()
+            return
+        dialog = ConflictDialog(self.root, proposal)
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        choice = dialog.wait()
+        if choice != "apply":
+            return
+        result = self.conflict_service.commit(
+            self.session,
+            proposal,
+            external,
+            live_external_hash=external.file_fingerprint.sha256,
+            external_path=self.session.original_path,
+            session_service=self.session_service,
+            recovery_service=self.recovery_service,
+        )
+        if result.kind != "success":
+            messagebox.showerror(APP_NAME, result.message or result.reason or "Apply failed.")
+            return
+        self.draft = self.session.draft
+        self._reload_editors_from_draft()
 
     def on_close(self) -> None:
         self._flush_all_editors()

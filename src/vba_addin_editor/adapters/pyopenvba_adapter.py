@@ -31,6 +31,7 @@ from pyopenvba.vba import (
     serialize_project_stream,
 )
 
+from vba_addin_editor.adapters.ooxml_package_adapter import OoxmlPackageAdapter, PackageError
 from vba_addin_editor.adapters.source_codec import (
     split_attribute_header,
     to_editor_text,
@@ -238,6 +239,9 @@ def classify_host_module(
 
 
 class PyOpenVBAAdapter:
+    def __init__(self, package_adapter: OoxmlPackageAdapter | None = None) -> None:
+        self.package_adapter = package_adapter or OoxmlPackageAdapter()
+
     # -- safety inspection ------------------------------------------------
 
     def inspect_signature(self, host: VBAHostFile) -> tuple[bool, tuple[str, ...]]:
@@ -411,7 +415,10 @@ class PyOpenVBAAdapter:
         ]
         if logical_deletes:
             _scrub_project_declarations(
-                candidate_path, logical_deletes, draft.baseline.code_page
+                candidate_path,
+                logical_deletes,
+                draft.baseline.code_page,
+                self.package_adapter,
             )
 
     # -- candidate verification (plan 14 Stage J, 77) ----------------------
@@ -560,11 +567,17 @@ def _assert_destructive_ops_against_snapshot(draft: DocumentDraft) -> None:
             )
 
 
-def _scrub_project_declarations(candidate_path: Path, logical_names: list[str], code_page: int) -> None:
+def _scrub_project_declarations(
+    candidate_path: Path,
+    logical_names: list[str],
+    code_page: int,
+    package_adapter: OoxmlPackageAdapter,
+) -> None:
     """Shim pyOpenVBA 3.4.0: save() deletes PROJECT lines by stream name.
 
     serialize_project_stream expects logical names. When they differ, Class=
     declarations leak. Rewrite PROJECT with the logical names after save.
+    ZIP rewriting is owned by OoxmlPackageAdapter.
     """
     entry = vba_entry_for(candidate_path)
     with zipfile.ZipFile(candidate_path) as package:
@@ -581,17 +594,10 @@ def _scrub_project_declarations(candidate_path: Path, logical_names: list[str], 
         code_page=code_page,
     )
     cfb.write_stream("PROJECT", rewritten)
-    _rewrite_zip_member(candidate_path, entry, cfb.to_bytes())
-
-
-def _rewrite_zip_member(path: Path, member: str, data: bytes) -> None:
-    temp = path.with_name(path.stem + ".vbaae-proj" + path.suffix)
-    with zipfile.ZipFile(path) as src, zipfile.ZipFile(temp, "w") as dst:
-        dst.comment = src.comment
-        for info in src.infolist():
-            payload = data if info.filename == member else src.read(info.filename)
-            dst.writestr(info, payload)
-    temp.replace(path)
+    try:
+        package_adapter.replace_members(candidate_path, {entry: cfb.to_bytes()})
+    except PackageError as exc:
+        raise AdapterError(str(exc), getattr(exc, "details", None)) from exc
 
 
 def _verify_project_cleanup(host: VBAHostFile, expected: DocumentDraft) -> list[str]:
@@ -632,21 +638,33 @@ def _verify_project_cleanup(host: VBAHostFile, expected: DocumentDraft) -> list[
     for name in sorted(deleted_names):
         if name in declared:
             problems.append(f"Deleted module still declared in PROJECT: {name!r}")
+    dir_names = {module.name.casefold() for module in host.vba_project().modules}
+    for name in sorted(deleted_names):
+        if name in dir_names:
+            problems.append(f"Deleted module still listed in dir: {name!r}")
     try:
         vba_streams = {item.casefold() for item in cfb.list_streams_in_storage("VBA")}
-    except Exception:  # noqa: BLE001
-        vba_streams = set()
+    except Exception as exc:  # noqa: BLE001 - inability to verify is failure
+        problems.append(f"Could not enumerate VBA streams ({type(exc).__name__}).")
+        return problems
     for stream in deleted_streams:
         if stream and stream.casefold() in vba_streams:
             problems.append(f"Deleted module stream still present: {stream!r}")
     try:
-        wm = parse_projectwm(cfb.get_stream("PROJECTwm"), code_page=expected.baseline.code_page)
-        wm_names = {item[0].casefold() for item in wm} if wm else set()
-        for name in sorted(deleted_names):
-            if name in wm_names:
-                problems.append(f"Deleted module still listed in PROJECTwm: {name!r}")
-    except (KeyError, OSError, UnicodeError, ValueError):
-        pass
+        wm_raw = cfb.get_stream("PROJECTwm")
+    except KeyError:
+        if deleted_names:
+            problems.append("Candidate PROJECTwm stream is missing.")
+        return problems
+    try:
+        wm = parse_projectwm(wm_raw, code_page=expected.baseline.code_page)
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        problems.append(f"Candidate PROJECTwm stream could not be parsed ({type(exc).__name__}).")
+        return problems
+    wm_names = {item[0].casefold() for item in wm} if wm else set()
+    for name in sorted(deleted_names):
+        if name in wm_names:
+            problems.append(f"Deleted module still listed in PROJECTwm: {name!r}")
     return problems
 
 

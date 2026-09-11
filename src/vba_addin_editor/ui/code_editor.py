@@ -62,6 +62,14 @@ class CodeEditor(ttk.Frame):
         self.text.mark_set("insert", f"{line}.0")
         self.text.see("insert")
 
+    def goto_position(self, line: int, column: int, length: int = 0) -> None:
+        start = f"{line}.{max(column - 1, 0)}"
+        self.text.mark_set("insert", start)
+        self.text.tag_remove("sel", "1.0", "end")
+        if length:
+            self.text.tag_add("sel", start, f"{start}+{length}c")
+        self.text.see("insert")
+
     # -- internals ---------------------------------------------------------
 
     def _on_modified(self, event) -> None:

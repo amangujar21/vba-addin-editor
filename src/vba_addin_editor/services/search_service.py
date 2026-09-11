@@ -5,7 +5,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from vba_addin_editor.domain.document import DocumentDraft
+from vba_addin_editor.adapters.ooxml_package_adapter import OoxmlPackageAdapter
+from vba_addin_editor.domain.document import DocumentDraft, clone_draft
+from vba_addin_editor.domain.session import DocumentSession
+from vba_addin_editor.services.validation_service import validate_draft
 
 PAGE_SIZE = 200
 _WORD_EXTRA = "_"
@@ -36,6 +39,19 @@ class SearchResults:
     revision: int
     total: int
     hits: tuple[SearchHit, ...]
+
+
+@dataclass
+class ReplaceApplyResult:
+    ok: bool
+    changed: int = 0
+    draft: DocumentDraft | None = None
+    reason: str | None = None
+    problems: tuple[str, ...] = ()
+    before_modules: list | None = None
+    after_modules: list | None = None
+    before_xml: list | None = None
+    after_xml: list | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +119,74 @@ class SearchService:
     def page(self, results: SearchResults, page: int = 0) -> tuple[SearchHit, ...]:
         start = page * PAGE_SIZE
         return results.hits[start : start + PAGE_SIZE]
+
+    def preview_replacements(
+        self,
+        draft: DocumentDraft,
+        results: SearchResults,
+        replacement: str,
+        selected: set[tuple[str, int]],
+    ) -> list[tuple[SearchHit, str, str]]:
+        """Return (hit, before, after) for selected occurrences."""
+        rows = []
+        for hit in results.hits:
+            if (hit.target_id, hit.offset) not in selected:
+                continue
+            text = self._text_for(draft, hit)
+            if text is None:
+                continue
+            before = text[hit.offset : hit.offset + hit.length]
+            after = replacement
+            rows.append((hit, before, after))
+        return rows
+
+    def apply_replacements(
+        self,
+        session: DocumentSession,
+        results: SearchResults,
+        replacement: str,
+        selected: set[tuple[str, int]],
+        *,
+        package_adapter: OoxmlPackageAdapter | None = None,
+    ) -> ReplaceApplyResult:
+        if session.revision != results.revision:
+            return ReplaceApplyResult(ok=False, reason="stale_proposal", problems=("Search results are out of date.",))
+        from vba_addin_editor.services.history_service import snapshot_modules, snapshot_xml
+
+        clone = clone_draft(session.draft)
+        before_modules = snapshot_modules(session.draft)
+        before_xml = snapshot_xml(session.draft)
+        changed = self.replace_all(clone, results, replacement, selected)
+        if changed == 0:
+            return ReplaceApplyResult(ok=True, changed=0, draft=clone)
+        problems = list(validate_draft(clone))
+        adapter = package_adapter or OoxmlPackageAdapter()
+        for part in clone.changed_xml_parts():
+            problems.extend(adapter.validate_draft_part(part))
+        if problems:
+            return ReplaceApplyResult(
+                ok=False,
+                reason="invalid_draft",
+                problems=tuple(problems),
+            )
+        return ReplaceApplyResult(
+            ok=True,
+            changed=changed,
+            draft=clone,
+            before_modules=before_modules,
+            after_modules=snapshot_modules(clone),
+            before_xml=before_xml,
+            after_xml=snapshot_xml(clone),
+        )
+
+    def _text_for(self, draft: DocumentDraft, hit: SearchHit) -> str | None:
+        if hit.kind == "vba":
+            module = draft.module_by_id(hit.target_id)
+            return None if module is None else module.body
+        part = draft.xml_part_by_path(hit.target_id)
+        if part is None or part.text is None:
+            return None
+        return part.text
 
     def replace_all(
         self,
