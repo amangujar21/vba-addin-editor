@@ -1,6 +1,6 @@
 [project]
 name = "vba-addin-editor"
-version = "0.2.0"
+version = "0.2.1"
 description = "Safely edit VBA source inside installed Excel .xlam and PowerPoint .ppam add-ins, in place, with backup and verification."
 requires-python = ">=3.10"
 license = { text = "MIT" }

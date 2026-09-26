@@ -37,7 +37,7 @@ if release_mode and dirty:
     raise SystemExit("Release builds require a clean git tree.")
 mode = "onefile" if ONEFILE else "onedir"
 identity = {
-    "version": "0.2.0",
+    "version": "0.2.1",
     "source_commit": commit,
     "dirty_tree": dirty,
     "build_time_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
