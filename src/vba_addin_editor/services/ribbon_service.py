@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from xml.sax.saxutils import escape
 
 from vba_addin_editor.domain.document import (
@@ -366,11 +367,17 @@ def procedure_index(draft: DocumentDraft) -> dict[str, list[ProcedureLocation]]:
     for module in draft.modules:
         if module.is_deleted:
             continue
-        for proc in parse_procedures(module.body, module.id):
+        for proc in _procedures(module.body, module.id):
             if proc.kind not in ("Sub", "Function"):
                 continue
             index.setdefault(proc.name.casefold(), []).append(_location(module, proc))
     return index
+
+
+@lru_cache(maxsize=256)
+def _procedures(body: str, module_id: str) -> tuple[ProcedureInfo, ...]:
+    # Baseline and draft share most module bodies; parse each text once.
+    return tuple(parse_procedures(body, module_id))
 
 
 def _location(module: ModuleDraft, proc: ProcedureInfo) -> ProcedureLocation:
@@ -493,12 +500,13 @@ class RibbonEntry:
 
 
 def ribbon_entries(draft: DocumentDraft) -> list[RibbonEntry]:
-    index = procedure_index(draft)
-    return [
-        RibbonEntry(cb, resolve(index, cb.name))
-        for part in ribbon_parts(draft)
-        for cb in find_callbacks(part.text or "", part.path)
+    callbacks = [
+        cb for part in ribbon_parts(draft) for cb in find_callbacks(part.text or "", part.path)
     ]
+    if not callbacks:
+        return []  # skip parsing every module when there is nothing to resolve
+    index = procedure_index(draft)
+    return [RibbonEntry(cb, resolve(index, cb.name)) for cb in callbacks]
 
 
 def callbacks_for_procedure(
@@ -550,5 +558,8 @@ def check_ribbon(draft: DocumentDraft) -> list[RibbonIssue]:
 
 def new_issues(draft: DocumentDraft) -> list[RibbonIssue]:
     """Issues present in the draft but not in the file as opened."""
+    current = check_ribbon(draft)
+    if not current:
+        return []
     baseline = {issue.key for issue in check_ribbon(draft_from_snapshot(draft.baseline))}
-    return [issue for issue in check_ribbon(draft) if issue.key not in baseline]
+    return [issue for issue in current if issue.key not in baseline]

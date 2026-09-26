@@ -140,3 +140,13 @@ def test_callbacks_for_procedure(tmp_path: Path):
     m1 = draft.find_current("Module1")
     found = rs.callbacks_for_procedure(draft, m1.id, "hello")
     assert [cb.control_id for cb in found] == ["btnHello"]
+
+
+def test_ribbon_check_skips_module_parsing_without_ribbon(work_xlam: Path, monkeypatch):
+    # Pre-save check must not parse every module when there is no customUI.
+    draft = DocumentService().open(work_xlam)
+    monkeypatch.setattr(
+        rs, "_procedures", lambda *_a: (_ for _ in ()).throw(AssertionError("parsed"))
+    )
+    assert rs.ribbon_entries(draft) == []
+    assert rs.new_issues(draft) == []

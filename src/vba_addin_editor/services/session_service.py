@@ -207,11 +207,16 @@ class SessionService:
                 )
             data = committed.read_bytes()
             tmp.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "wb") as handle:
+            # Read back through the writing handle: reopening a freshly written
+            # macro package makes Defender scan it synchronously (seconds per
+            # save). The scan is deferred to the next real reader instead.
+            with open(tmp, "w+b") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            tmp_digest = paths.sha256_bytes(tmp.read_bytes())
+                handle.seek(0)
+                written = handle.read()
+            tmp_digest = paths.sha256_bytes(written)
             if tmp_digest != source_fp.sha256 or tmp.stat().st_size != source_fp.size:
                 tmp.unlink(missing_ok=True)
                 return _publication_failure(
@@ -220,7 +225,8 @@ class SessionService:
                     extra={"reason": "temp_copy_mismatch"},
                 )
             os.replace(tmp, captured)
-            captured_fp = paths.fingerprint(captured)
+            stat = captured.stat()
+            captured_fp = replace(source_fp, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
             if not captured_fp.content_equal(source_fp):
                 return _publication_failure(
                     fail_msg, committed=committed, captured=captured,

@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import TypeVar
 
 from vba_addin_editor.adapters.ooxml_package_adapter import XML_EDITABLE_EXTENSIONS
 from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError
@@ -59,6 +62,9 @@ _FILETYPES = [
     ("PowerPoint Add-ins", "*.ppam"),
     ("PowerPoint Macro-Enabled Presentations", "*.pptm"),
 ]
+
+
+_T = TypeVar("_T")
 
 
 class MainWindow:
@@ -178,6 +184,7 @@ class MainWindow:
         help_menu.add_command(label="Copy Diagnostic Report", command=self.copy_last_diagnostic)
         bar.add_cascade(label="Help", menu=help_menu)
         self._last_result = None
+        self.menubar = bar
         self.root.config(menu=bar)
 
     def _build_toolbar(self) -> None:
@@ -297,8 +304,94 @@ class MainWindow:
             self.banner.pack_forget()
 
     def _on_progress(self, stage: str) -> None:
-        self.status.config(text=f"Saving… {stage}")
+        # Called from the save worker thread; Tk is only touched by the poller.
+        self._progress_stage = stage
+
+    def _run_in_background(self, work: Callable[[], _T]) -> _T:
+        """Run ``work()`` on a worker thread; keep the UI painted but inert until done.
+
+        Blocks the caller in a nested event loop so callers keep synchronous
+        semantics. Saves are dominated by antivirus scans of freshly written
+        packages; running them off the Tk thread keeps the window responsive.
+        """
+        outcome: dict = {}
+
+        def target() -> None:
+            try:
+                outcome["result"] = work()
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the UI thread
+                outcome["error"] = exc
+
+        # Non-daemon: interpreter exit must never cut a commit in half.
+        thread = threading.Thread(target=target, name="vbaae-save")
+        # A bare Tcl variable name, not tk.BooleanVar: a Variable finalized by
+        # the GC on the worker thread would call into Tk off the main thread.
+        done = f"vbaae_bg_done_{id(thread)}"
+        self.root.setvar(done, "0")
+        self._progress_stage = None
+        held = self._hold_ui()
+
+        def poll() -> None:
+            stage = self._progress_stage
+            if stage:
+                self.status.config(text=f"Saving… {stage}")
+            if thread.is_alive():
+                self.root.after(50, poll)
+            else:
+                self.root.setvar(done, "1")
+
+        try:
+            thread.start()
+            self.root.after(50, poll)
+            self.root.wait_variable(done)
+        finally:
+            self._release_ui(held)
+            try:
+                self.root.globalunsetvar(done)
+            except tk.TclError:
+                pass
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    def _hold_ui(self) -> list[str]:
+        """Block mouse, keyboard shortcuts and menus while a save runs."""
+        held: list[str] = []
+        windows = [self.root] + [w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)]
+        for window in windows:
+            name = str(window)
+            try:
+                self.root.tk.call("tk", "busy", "hold", name)
+                busy = "._Busy" if name == "." else name + "_Busy"
+                # Keep only the busy window's own tag so root shortcuts cannot fire.
+                self.root.tk.call("bindtags", busy, (busy,))
+                held.append(name)
+            except tk.TclError:
+                pass
+        if held:
+            try:
+                self.root.tk.call("focus", "._Busy")
+            except tk.TclError:
+                pass
+        self._set_menubar_state("disabled")
         self.root.update_idletasks()
+        return held
+
+    def _release_ui(self, held: list[str]) -> None:
+        for name in held:
+            try:
+                self.root.tk.call("tk", "busy", "forget", name)
+            except tk.TclError:
+                pass
+        self._set_menubar_state("normal")
+
+    def _set_menubar_state(self, state: str) -> None:
+        try:
+            last = self.menubar.index("end")
+            for i in range(0 if last is None else last + 1):
+                self.menubar.entryconfig(i, state=state)
+        except tk.TclError:
+            pass
 
     def _refresh_state(self) -> None:
         draft = self.draft
@@ -587,8 +680,9 @@ class MainWindow:
         self._saving = True
         self._refresh_state()
         result = None
+        published = None
         try:
-            result = self.save_service.save_addin(self.draft)
+            result, published = self._run_in_background(self._save_work)
         except Exception as exc:  # noqa: BLE001 - UI boundary
             from vba_addin_editor.domain.results import SaveResult
 
@@ -601,9 +695,20 @@ class MainWindow:
             self._saving = False
             self._refresh_host_status()
             self._refresh_state()
-        self._handle_save_result(result)
+        self._handle_save_result(result, published=published)
 
-    def _handle_save_result(self, result) -> None:
+    def _save_work(self):
+        """Worker-thread half of save: commit, then publish the session baseline."""
+        draft = self.draft
+        assert draft is not None
+        result = self.save_service.save_addin(draft)
+        published = None
+        if result.kind == "success" and self.session is not None:
+            saved = Path(str(result.details.get("saved") or draft.baseline.path))
+            published = self.session_service.publish_verified_baseline(self.session, saved)
+        return result, published
+
+    def _handle_save_result(self, result, *, published=None) -> None:
         self._last_result = result
         kind = result.kind
         if kind == "success":
@@ -614,7 +719,6 @@ class MainWindow:
             )
             if self.session is not None:
                 saved = Path(str(result.details.get("saved") or self.draft.baseline.path))
-                published = self.session_service.publish_verified_baseline(self.session, saved)
                 if published is not None:
                     self._last_result = published
                     messagebox.showerror(
@@ -780,15 +884,26 @@ class MainWindow:
             "The destination must differ from the original path.",
         ):
             return
-        result = self.save_service.save_copy(
-            self.draft,
-            dest,
-            source_path=self.session.captured_path if self.session is not None else None,
-            allow_overwrite=dest.exists(),
-            recovered_copy=recovered,
-            reviewed_dest_hash=dest_hash,
-            session_dir=self.session.session_dir if self.session is not None else None,
-        )
+        draft = self.draft
+        session = self.session
+        allow_overwrite = dest.exists()
+        self._saving = True
+        self._refresh_state()
+        try:
+            result = self._run_in_background(
+                lambda: self.save_service.save_copy(
+                    draft,
+                    dest,
+                    source_path=session.captured_path if session is not None else None,
+                    allow_overwrite=allow_overwrite,
+                    recovered_copy=recovered,
+                    reviewed_dest_hash=dest_hash,
+                    session_dir=session.session_dir if session is not None else None,
+                )
+            )
+        finally:
+            self._saving = False
+            self._refresh_state()
         result.operation_type = "save_copy"
         if result.kind == "success":
             self.backup_service.record_success(
@@ -1153,7 +1268,7 @@ class MainWindow:
         self._host_label = probe.label or wp.corresponding_host_label(self.draft.baseline.path)
 
     def _on_focus_in(self, _event=None) -> None:
-        if self.draft is None:
+        if self.draft is None or self._saving:
             return
         self._refresh_host_status()
         self._refresh_state()
@@ -1169,7 +1284,7 @@ class MainWindow:
         self._poll_after = self.root.after(5000, self._poll_host)
 
     def _poll_host(self) -> None:
-        if self.draft is not None:
+        if self.draft is not None and not self._saving:
             self._refresh_host_status()
             self._refresh_state()
         self._schedule_host_poll()
@@ -1206,6 +1321,10 @@ class MainWindow:
                 pass
             self._max_after = None
         if self.session is None:
+            return
+        if self._saving:
+            # The save worker owns the draft; retry once it has finished.
+            self._schedule_autosave()
             return
         self._flush_all_editors()
         failed = self.recovery_service.checkpoint(self.session)
@@ -1904,6 +2023,8 @@ class MainWindow:
         self._reload_editors_from_draft()
 
     def on_close(self) -> None:
+        if self._saving:
+            return  # never tear down mid-commit
         self._flush_all_editors()
         if self.draft is not None and self.draft.is_dirty():
             self._refresh_host_status()
