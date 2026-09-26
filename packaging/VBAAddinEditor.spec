@@ -16,7 +16,9 @@ from pathlib import Path
 
 block_cipher = None
 ONEFILE = "--onefile" in sys.argv
-ROOT = Path(SPECPATH).resolve().parent.parent
+# SPECPATH is the spec's directory; locate the repo root from it.
+_SPEC_DIR = Path(SPECPATH).resolve()
+ROOT = next(p for p in (_SPEC_DIR, *_SPEC_DIR.parents) if (p / "pyproject.toml").exists())
 SRC = ROOT / "src" / "vba_addin_editor"
 BUILD_INFO = SRC / "_build_info.py"
 
