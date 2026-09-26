@@ -38,6 +38,26 @@ updated code the next time it starts.
    replace with a pre-restore safety copy; it does not run automatically after
    a failed final verification.
 
+## Ribbon buttons ↔ macros
+
+For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
+
+- **Go to Macro** — in the XML tab, Ctrl+click (or right-click, or F12) any
+  `onAction="…"` or other callback attribute to jump to that Sub. If it does
+  not exist, you are offered a stub with the right callback signature,
+  placed in the module that already holds most of your ribbon callbacks.
+- **Add Ribbon Button for This Macro** — right-click inside a Sub in the VBA
+  tab. Pick the label, group or menu, icon and size. The id is generated
+  and unique, the XML is inserted with matching indentation, and a small
+  `…Callback(control As IRibbonControl)` wrapper is added when the Sub has
+  no ribbon argument. One Undo reverts both.
+- **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA tab.
+- **Ribbon → Ribbon Buttons…** lists every callback with its module and
+  status; **Check Ribbon Callbacks** and **Validate XML** report callbacks
+  that point to missing, ambiguous or class-module procedures, and duplicate
+  control ids. Save warns (never blocks) only about problems your edits
+  introduced.
+
 ## Safety model
 
 - **Backups are mandatory.** Every in-place save creates a same-folder backup

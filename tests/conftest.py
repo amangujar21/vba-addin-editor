@@ -42,6 +42,35 @@ def build_xlam_with_class(path: Path, *, stream_name: str | None = None) -> Path
     return path
 
 
+RIBBON = """<customUI xmlns="http://schemas.microsoft.com/office/2009/07/customui">
+  <ribbon>
+    <tabs>
+      <tab id="tabTools" label="Tools">
+        <group id="grpMain" label="Main">
+          <button id="btnHello" label="Say Hello" size="large" onAction="Hello" />
+          <!-- <button id="btnOld" onAction="Ghost" /> -->
+          <button id="btnMissing" label="Broken" onAction="NoSuchMacro" />
+        </group>
+        <group id="grpMenus" label="Menus">
+          <menu id="mnuMore" label="More">
+            <toggleButton id="tglX" label="Toggle" onAction="OnToggle" getPressed="GetToggle" />
+          </menu>
+        </group>
+        <group id="grpEmpty" label="Empty"></group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>
+"""
+
+
+def build_xlam_with_ribbon(path: Path, xml: str = RIBBON) -> Path:
+    build_xlam_with_class(path)
+    with zipfile.ZipFile(path, "a") as package:
+        package.writestr("customUI/customUI14.xml", xml.encode("utf-8"))
+    return path
+
+
 def build_pptm_with_class(path: Path) -> Path:
     with PowerPointFile.create_new(path) as host:
         host.set_module(

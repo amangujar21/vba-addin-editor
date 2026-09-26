@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+from collections.abc import Callable
 
 
 def _has_selection(text: tk.Text) -> bool:
@@ -32,7 +33,17 @@ class TextContextMenu:
         self.menu.add_separator()
         self.menu.add_command(label="Undo", command=self._undo)
         self.menu.add_command(label="Redo", command=self._redo)
+        self._extras: list[tuple[int, Callable[[], bool] | None]] = []
         text.bind("<Button-3>", self._show_menu, add=True)
+
+    def add_extra(
+        self, label: str, command, is_enabled: Callable[[], bool] | None = None
+    ) -> None:
+        """Append a caller-owned command; is_enabled() is checked on each popup."""
+        if not self._extras:
+            self.menu.add_separator()
+        self.menu.add_command(label=label, command=command)
+        self._extras.append((int(self.menu.index("end") or 0), is_enabled))
 
     # -- menu state -------------------------------------------------------
 
@@ -79,6 +90,9 @@ class TextContextMenu:
         self.menu.entryconfig(0, state=cut)
         self.menu.entryconfig(1, state=copy)
         self.menu.entryconfig(2, state=paste)
+        for index, is_enabled in self._extras:
+            enabled = is_enabled is None or bool(is_enabled())
+            self.menu.entryconfig(index, state="normal" if enabled else "disabled")
         return "break"
 
     def _cut(self) -> None:

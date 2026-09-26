@@ -313,18 +313,27 @@ def parse_procedures(body: str, module_id: str) -> list[ProcedureInfo]:
 
 
 def _join_continuations(text: str) -> str:
+    """Join `` _`` continuations onto their first physical line.
+
+    Consumed lines become blank so line numbers still match the source.
+    """
     lines = text.split("\n")
     out: list[str] = []
     buf = ""
+    pending = 0
     for line in lines:
         stripped = line.rstrip()
         if stripped.endswith(" _"):
             buf += stripped[:-1]
+            pending += 1
             continue
         out.append(buf + stripped)
+        out.extend([""] * pending)
         buf = ""
+        pending = 0
     if buf:
         out.append(buf)
+        out.extend([""] * (pending - 1))
     return "\n".join(out)
 
 

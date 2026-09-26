@@ -43,7 +43,7 @@ class CodeEditor(ttk.Frame):
         self.text.bind("<Control-y>", self._on_redo, add=True)
         self.on_undo = None
         self.on_redo = None
-        install_text_context_menu(self.text)
+        self.context_menu = install_text_context_menu(self.text)
 
         self.header = None  # optional metadata label set by subclasses (XmlEditor)
 

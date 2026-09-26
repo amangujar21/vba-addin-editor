@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
 import tkinter as tk
@@ -22,12 +23,17 @@ from vba_addin_editor.domain.document import (
 )
 from vba_addin_editor.domain.history import HistoryCommand
 from vba_addin_editor.platform import windows_processes as wp
+from vba_addin_editor.services import ribbon_service as rs
 from vba_addin_editor.services.backup_service import BackupService
 from vba_addin_editor.services.conflict_service import ConflictService
 from vba_addin_editor.services.diagnostics_service import dialog_text, report_for
 from vba_addin_editor.services.document_service import DocumentService
 from vba_addin_editor.services.folder_sync_service import FolderSyncService
-from vba_addin_editor.services.history_service import HistoryService, snapshot_modules
+from vba_addin_editor.services.history_service import (
+    HistoryService,
+    snapshot_modules,
+    snapshot_xml,
+)
 from vba_addin_editor.services.import_export_service import ImportExportService
 from vba_addin_editor.services.recovery_service import (
     IDLE_MS,
@@ -42,6 +48,7 @@ from vba_addin_editor.services.session_service import SessionService
 from vba_addin_editor.services.validation_service import validate_module_name
 from vba_addin_editor.ui.code_editor import CodeEditor
 from vba_addin_editor.ui.conflict_dialog import ConflictDialog
+from vba_addin_editor.ui.ribbon_dialogs import AddButtonDialog, RibbonButtonsDialog, choose
 from vba_addin_editor.ui.search_dialog import ProjectSearchDialog
 from vba_addin_editor.ui.xml_editor import XmlEditor
 from vba_addin_editor.version import APP_NAME, VERSION, build_identity
@@ -92,6 +99,7 @@ class MainWindow:
         self.history_service = HistoryService()
         self.recovery_open = RecoveryOpenService(self.recovery_service, self.session_service)
         self._search_dialog = None
+        self._ribbon_dialog: RibbonButtonsDialog | None = None
 
         root.title(APP_NAME)
         root.geometry("1000x680")
@@ -153,6 +161,18 @@ class MainWindow:
         module_menu.add_command(label="Export All…", command=self.export_all)
         bar.add_cascade(label="Module", menu=module_menu)
 
+        ribbon_menu = tk.Menu(bar, tearoff=0)
+        ribbon_menu.add_command(label="Ribbon Buttons…", command=self.show_ribbon_buttons)
+        ribbon_menu.add_command(
+            label="Go to Macro / Button", accelerator="F12", command=self.goto_callback_under_cursor
+        )
+        ribbon_menu.add_command(
+            label="Add Ribbon Button for This Macro…", command=self.add_ribbon_button
+        )
+        ribbon_menu.add_separator()
+        ribbon_menu.add_command(label="Check Ribbon Callbacks", command=self.check_ribbon_callbacks)
+        bar.add_cascade(label="Ribbon", menu=ribbon_menu)
+
         help_menu = tk.Menu(bar, tearoff=0)
         help_menu.add_command(label="About", command=self.show_about)
         help_menu.add_command(label="Copy Diagnostic Report", command=self.copy_last_diagnostic)
@@ -185,6 +205,27 @@ class MainWindow:
         self.banner = ttk.Label(self.root, text="", background="#fff3cd", padding=4)
         self.banner.pack(fill="x", before=self.editor_notebook)
         self.banner.pack_forget()
+        self._install_ribbon_actions()
+
+    def _install_ribbon_actions(self) -> None:
+        xml_menu = self.xml_editor.context_menu
+        xml_menu.add_extra(
+            "Go to Macro",
+            self.goto_callback_under_cursor,
+            lambda: self._xml_cursor_callback() is not None,
+        )
+        vba_menu = self.editor.context_menu
+        vba_menu.add_extra(
+            "Add Ribbon Button for This Macro…",
+            self.add_ribbon_button,
+            lambda: self._cursor_procedure()[1] is not None,
+        )
+        vba_menu.add_extra(
+            "Show Ribbon Buttons Using This Macro",
+            self.show_buttons_for_macro,
+            lambda: self._cursor_procedure()[1] is not None,
+        )
+        self.xml_editor.text.bind("<Control-Button-1>", self._on_xml_ctrl_click)
 
     def _build_vba_tab(self, parent) -> None:
         panes = ttk.Panedwindow(parent, orient="horizontal")
@@ -244,6 +285,7 @@ class MainWindow:
         self.root.bind("<Control-Shift-F>", lambda _e: self.project_search())
         self.root.bind("<Control-z>", lambda _e: self.undo())
         self.root.bind("<Control-y>", lambda _e: self.redo())
+        self.root.bind("<F12>", lambda _e: self.goto_callback_under_cursor())
 
     # -- banners / status ----------------------------------------------------
 
@@ -390,8 +432,10 @@ class MainWindow:
         selection = self.tree.selection()
         if not selection:
             return
-        self._flush_all_editors()
         mid = selection[0]
+        if mid == self.current_module_id:
+            return  # already shown (programmatic re-selection)
+        self._flush_all_editors()
         self.current_module_id = mid
         mod = draft.module_by_id(mid)
         if mod is None:
@@ -407,8 +451,10 @@ class MainWindow:
         selection = self.xml_tree.selection()
         if not selection:
             return
-        self._flush_all_editors()
         path = selection[0][len("xml::"):]
+        if path == self.current_xml_part_path:
+            return  # already shown (programmatic re-selection)
+        self._flush_all_editors()
         part = draft.xml_part_by_path(path)
         if part is None:
             return
@@ -453,6 +499,20 @@ class MainWindow:
         problems = self.doc_service.package_adapter.validate_draft_part(part)
         if problems:
             messagebox.showerror(APP_NAME, "\n".join(problems))
+            return
+        issues = (
+            [i for i in rs.check_ribbon(draft) if i.part_path == part.path]
+            if rs.is_ribbon_part(part.path)
+            else []
+        )
+        if issues:
+            messagebox.showwarning(
+                APP_NAME,
+                "XML is well-formed, but some ribbon callbacks have problems:\n\n"
+                + "\n".join(f"Line {i.line}: {i.message}" for i in issues[:15])
+                + ("\n…" if len(issues) > 15 else "")
+                + "\n\nUse Ribbon → Ribbon Buttons… to fix them.",
+            )
         else:
             messagebox.showinfo(APP_NAME, "XML is well-formed.")
 
@@ -519,6 +579,8 @@ class MainWindow:
         changes = compute_changes(self.draft)
         if changes.is_empty:
             messagebox.showinfo(APP_NAME, "No changes to save.")
+            return
+        if not self._confirm_ribbon_issues():
             return
         if not self._review_and_confirm(operation_type="save"):
             return
@@ -691,6 +753,8 @@ class MainWindow:
             filetypes=_FILETYPES,
         )
         if not dest_name:
+            return
+        if not self._confirm_ribbon_issues():
             return
         dest = Path(dest_name)
         if dest.exists() and not messagebox.askyesno(
@@ -1213,29 +1277,423 @@ class MainWindow:
 
     def goto_search_hit(self, hit) -> None:
         if hit.kind == "vba":
-            self.editor_notebook.select(0)
-            try:
-                self.tree.selection_set(hit.target_id)
-            except tk.TclError:
-                pass
-            self.current_module_id = hit.target_id
-            if self.draft is not None:
-                mod = self.draft.module_by_id(hit.target_id)
-                if mod is not None:
-                    self.editor.set_text(mod.body)
-            self.editor.goto_position(hit.line, hit.column, hit.length)
+            self._open_module_at(hit.target_id, hit.line, hit.column, hit.length)
         else:
-            self.editor_notebook.select(self.xml_tab)
-            try:
-                self.xml_tree.selection_set("xml::" + hit.target_id)
-            except tk.TclError:
-                pass
-            self.current_xml_part_path = hit.target_id
-            if self.draft is not None:
-                part = self.draft.xml_part_by_path(hit.target_id)
-                if part is not None and part.text is not None:
-                    self.xml_editor.set_text(part.text)
-            self.xml_editor.goto_position(hit.line, hit.column, hit.length)
+            self._open_xml_at(hit.target_id, hit.line, hit.column, hit.length)
+
+    def _open_module_at(self, module_id: str, line: int, column: int = 1, length: int = 0) -> None:
+        if self.draft is None:
+            return
+        mod = self.draft.module_by_id(module_id)
+        if mod is None or mod.is_deleted:
+            return
+        self._flush_all_editors()
+        self.editor_notebook.select(0)
+        if self.current_module_id != module_id:
+            self.current_module_id = module_id
+            self.editor.text.config(state="normal")
+            self.editor.set_text(mod.body)
+        try:
+            self.tree.selection_set(module_id)
+            self.tree.see(module_id)
+        except tk.TclError:
+            pass
+        self.editor.goto_position(line, column, length)
+        self.editor.text.focus_set()
+        self._refresh_state()
+
+    def _open_xml_at(self, part_path: str, line: int, column: int = 1, length: int = 0) -> None:
+        if self.draft is None:
+            return
+        part = self.draft.xml_part_by_path(part_path)
+        if part is None or part.text is None:
+            return
+        self._flush_all_editors()
+        self.editor_notebook.select(self.xml_tab)
+        if self.current_xml_part_path != part_path:
+            self.current_xml_part_path = part_path
+            self.xml_editor.text.config(state="normal")
+            self.xml_editor.set_text(part.text)
+            if not part.editable:
+                self.xml_editor.text.config(state="disabled")
+            self.xml_editor.set_part_info(part)
+            self.validate_xml_btn.config(state="normal")
+        try:
+            self.xml_tree.selection_set("xml::" + part_path)
+            self.xml_tree.see("xml::" + part_path)
+        except tk.TclError:
+            pass
+        self.xml_editor.goto_position(line, column, length)
+        self.xml_editor.text.focus_set()
+        self._refresh_state()
+
+    # -- ribbon callbacks ----------------------------------------------------------
+
+    def flush_editors(self) -> None:
+        self._flush_all_editors()
+
+    def _xml_cursor_callback(self):
+        path = self.current_xml_part_path
+        if self.draft is None or path is None or not rs.is_ribbon_part(path):
+            return None
+        offset = len(self.xml_editor.text.get("1.0", "insert"))
+        return rs.callback_at(self.xml_editor.get_text(), offset, path)
+
+    def _cursor_procedure(self):
+        if self.draft is None or self.current_module_id is None:
+            return None, None
+        mod = self.draft.module_by_id(self.current_module_id)
+        if mod is None or mod.is_deleted:
+            return None, None
+        line = int(self.editor.text.index("insert").split(".")[0])
+        return mod, rs.procedure_at(self.editor.get_text(), mod.id, line)
+
+    def _on_xml_ctrl_click(self, event):
+        self.xml_editor.text.mark_set("insert", f"@{event.x},{event.y}")
+        self.goto_callback_under_cursor()
+        return "break"
+
+    def goto_callback_under_cursor(self) -> None:
+        if self.draft is None:
+            return
+        if self._active_text_editor() is self.editor:
+            self.show_buttons_for_macro()
+            return
+        callback = self._xml_cursor_callback()
+        if callback is None:
+            self.status.config(
+                text="Put the cursor on an onAction (or other callback) attribute in the ribbon XML."
+            )
+            return
+        self.goto_callback(callback)
+
+    def goto_callback(self, callback) -> None:
+        draft = self.draft
+        if draft is None:
+            return
+        self._flush_all_editors()
+        resolution = rs.resolve(rs.procedure_index(draft), callback.name)
+        if not resolution.matches:
+            if messagebox.askyesno(
+                APP_NAME, f"{resolution.message}\n\nCreate a callback Sub for it now?"
+            ):
+                self.create_callback(callback)
+            return
+        match = resolution.matches[0]
+        if len(resolution.matches) > 1:
+            index = choose(
+                self.root,
+                "Go to Macro",
+                resolution.message or "Choose a procedure:",
+                [f"{m.module_name}.{m.name}   (line {m.line})" for m in resolution.matches],
+            )
+            if index is None:
+                return
+            match = resolution.matches[index]
+        module = draft.module_by_id(match.module_id)
+        if module is None:
+            return
+        line_text = module.body.split("\n")[match.line - 1]
+        found = re.search(rf"\b{re.escape(match.name)}\b", line_text)
+        column = found.start() + 1 if found else 1
+        self._open_module_at(match.module_id, match.line, column, len(match.name) if found else 0)
+        if resolution.status != rs.STATUS_OK and resolution.message:
+            self.status.config(text=resolution.message)
+        else:
+            self.status.config(text=f"{callback.name} → {match.module_name}, line {match.line}")
+
+    def goto_callback_xml(self, callback) -> None:
+        self._open_xml_at(callback.part_path, callback.line, callback.column, callback.length)
+
+    def _batch_edit(self, mutate) -> None:
+        """Apply a programmatic multi-target edit as one undoable step."""
+        draft = self.draft
+        if draft is None:
+            return
+        self._flush_all_editors()
+        before = {"modules": snapshot_modules(draft), "xml": snapshot_xml(draft)}
+        mutate()
+        # Reload before checkpointing: a checkpoint flushes the (stale) editors.
+        self._reload_editors_from_draft()
+        if self.session is not None:
+            after = {"modules": snapshot_modules(draft), "xml": snapshot_xml(draft)}
+            self.history_service.record_structural(
+                self.session,
+                HistoryCommand(op="replace_all", target_id="*", before=before, after=after),
+            )
+            self._checkpoint_now()
+        if self._search_dialog is not None:
+            self._search_dialog.mark_stale()
+
+    def create_callback(self, callback) -> bool:
+        draft = self.draft
+        if draft is None:
+            return False
+        self._flush_all_editors()
+        if draft.baseline.safety.password_protected:
+            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
+            return False
+        module_name, proc_name = rs.split_callback_name(callback.name)
+        if not rs.is_valid_procedure_name(proc_name):
+            messagebox.showerror(APP_NAME, f"'{callback.name}' is not a valid VBA procedure name.")
+            return False
+        if module_name is not None:
+            target = draft.find_current(module_name)
+            if target is None:
+                messagebox.showerror(
+                    APP_NAME,
+                    f"'{callback.name}' refers to module {module_name}, which does not exist.",
+                )
+                return False
+        else:
+            standard = [
+                m for m in draft.modules if not m.is_deleted and m.pyopenvba_kind == "standard"
+            ]
+            if not standard:
+                messagebox.showerror(
+                    APP_NAME, "Ribbon callbacks must live in a standard module. Add one first."
+                )
+                return False
+            usage: dict[str, int] = {}
+            for entry in rs.ribbon_entries(draft):
+                for match in entry.resolution.matches:
+                    usage[match.module_id] = usage.get(match.module_id, 0) + 1
+            initial = max(range(len(standard)), key=lambda i: usage.get(standard[i].id, 0))
+            index = choose(
+                self.root,
+                "Create Callback",
+                f"Add  Sub {proc_name}  to which module?",
+                [
+                    m.current_name
+                    + (f"   ({usage[m.id]} ribbon callbacks)" if usage.get(m.id) else "")
+                    for m in standard
+                ],
+                initial,
+            )
+            if index is None:
+                return False
+            target = standard[index]
+        stub = rs.callback_stub(proc_name, callback.attribute, callback.element)
+        new_body, line = rs.append_procedure(target.body, stub)
+
+        def mutate() -> None:
+            target.body = new_body
+
+        self._batch_edit(mutate)
+        self._open_module_at(target.id, line + 1, 5)
+        self.status.config(text=f"Created {proc_name} in {target.current_name}.")
+        return True
+
+    def add_ribbon_button(self) -> None:
+        draft = self.draft
+        if draft is None:
+            return
+        self._flush_all_editors()
+        mod, proc = self._cursor_procedure()
+        if mod is None or proc is None:
+            messagebox.showinfo(APP_NAME, "Put the cursor inside the Sub you want a button for.")
+            return
+        if draft.baseline.safety.password_protected:
+            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
+            return
+        parts = [p for p in rs.ribbon_parts(draft) if p.editable]
+        if not parts:
+            messagebox.showinfo(
+                APP_NAME,
+                "This file has no editable ribbon XML (customUI/customUI.xml or "
+                "customUI14.xml).\n\nAdding a new ribbon part is not supported yet.",
+            )
+            return
+        containers = [c for p in parts for c in rs.find_containers(p.text or "", p.path)]
+        if not containers:
+            messagebox.showinfo(
+                APP_NAME, "The ribbon XML has no custom group or menu to add a button to."
+            )
+            return
+        plan = self._plan_button_callback(mod, proc)
+        if plan is None:
+            return
+        callback_name, wrapper, note = plan
+        existing_ids = {
+            value for p in rs.ribbon_parts(draft) for value, _o in rs.control_ids(p.text or "")
+        }
+        images = sorted(
+            {v for p in parts for v in re.findall(r'imageMso="([^"]+)"', p.text or "")},
+            key=str.casefold,
+        )
+        dialog = AddButtonDialog(
+            self.root,
+            callback_name=callback_name,
+            note=note,
+            containers=containers,
+            existing_ids=existing_ids,
+            image_suggestions=images,
+            default_label=rs.suggested_label(proc.name),
+            default_id=rs.unique_control_id(existing_ids, proc.name),
+            show_part=len(parts) > 1,
+        )
+        spec = dialog.wait()
+        if spec is not None:
+            self.apply_ribbon_button(mod.id, callback_name, wrapper, spec)
+
+    def _plan_button_callback(self, mod, proc):
+        """(callback name, wrapper stub or None, note) for a button that runs proc."""
+        if self.draft is None:
+            return None
+        if proc.kind not in ("Sub", "Function"):
+            messagebox.showerror(APP_NAME, f"{proc.name} is a {proc.kind}; a button needs a Sub.")
+            return None
+        if mod.pyopenvba_kind != "standard":
+            messagebox.showerror(
+                APP_NAME,
+                f"{proc.name} is in {mod.current_name}, which is not a standard module. "
+                "Ribbon buttons can only call Subs in standard modules.",
+            )
+            return None
+        if rs.is_ribbon_ready(proc.signature):
+            return proc.name, None, ""
+        if rs.takes_arguments(proc.signature):
+            messagebox.showerror(
+                APP_NAME,
+                f"{proc.name} takes arguments, so a ribbon button cannot call it directly. "
+                "Write a callback Sub that supplies them, then add the button from there.",
+            )
+            return None
+        index = rs.procedure_index(self.draft)
+        base = f"{proc.name}Callback"
+        existing = index.get(base.casefold(), [])
+        if (
+            len(existing) == 1
+            and existing[0].is_standard
+            and rs.is_ribbon_ready(existing[0].signature)
+        ):
+            return base, None, f"Uses the existing {base} in {existing[0].module_name}."
+        name, n = base, 2
+        while name.casefold() in index:
+            name, n = f"{base}{n}", n + 1
+        wrapper = rs.callback_stub(name, "onAction", "button", calls=proc.name)
+        note = (
+            f"{proc.name} has no (control As IRibbonControl) argument, so a small {name} "
+            f"Sub that calls it will be added to {mod.current_name}."
+        )
+        return name, wrapper, note
+
+    def apply_ribbon_button(self, module_id: str, callback_name: str, wrapper, spec) -> None:
+        draft = self.draft
+        if draft is None:
+            return
+        part = draft.xml_part_by_path(spec.container.part_path)
+        mod = draft.module_by_id(module_id)
+        if part is None or part.text is None or mod is None:
+            return
+        element = rs.build_button_xml(
+            control_id=spec.control_id,
+            label=spec.label,
+            on_action=callback_name,
+            image_mso=spec.image_mso,
+            size=spec.size,
+            screentip=spec.screentip,
+            supertip=spec.supertip,
+        )
+        new_text, offset, length = rs.insert_into_container(part.text, spec.container, element)
+        new_body = rs.append_procedure(mod.body, wrapper)[0] if wrapper else mod.body
+
+        def mutate() -> None:
+            part.text = new_text
+            mod.body = new_body
+
+        self._batch_edit(mutate)
+        line = new_text.count("\n", 0, offset) + 1
+        column = offset - (new_text.rfind("\n", 0, offset) + 1) + 1
+        self._open_xml_at(part.path, line, column, length)
+        extra = f" and {callback_name} in {mod.current_name}" if wrapper else ""
+        self.status.config(
+            text=f'Added button "{spec.label}"{extra}. Nothing is written until Save File.'
+        )
+
+    def show_buttons_for_macro(self) -> None:
+        if self.draft is None:
+            return
+        self._flush_all_editors()
+        mod, proc = self._cursor_procedure()
+        if mod is None or proc is None:
+            self.status.config(
+                text="Put the cursor inside a Sub to find the ribbon buttons that call it."
+            )
+            return
+        callbacks = rs.callbacks_for_procedure(self.draft, mod.id, proc.name)
+        callbacks += rs.callbacks_for_procedure(self.draft, mod.id, f"{proc.name}Callback")
+        if not callbacks:
+            messagebox.showinfo(
+                APP_NAME,
+                f"No ribbon button calls {proc.name}.\n\n"
+                "Use Ribbon → Add Ribbon Button for This Macro… to add one.",
+            )
+        elif len(callbacks) == 1:
+            self.goto_callback_xml(callbacks[0])
+        else:
+            self.show_ribbon_buttons(initial_filter=proc.name)
+
+    def show_ribbon_buttons(self, initial_filter: str = "", problems_only: bool = False) -> None:
+        if self.draft is None:
+            return
+        if not rs.ribbon_parts(self.draft):
+            messagebox.showinfo(APP_NAME, "This file has no ribbon XML (customUI).")
+            return
+        dialog = self._ribbon_dialog
+        try:
+            alive = dialog is not None and bool(dialog.win.winfo_exists())
+        except tk.TclError:
+            alive = False
+        if dialog is None or not alive:
+            dialog = self._ribbon_dialog = RibbonButtonsDialog(self.root, self, initial_filter)
+        else:
+            dialog.filter_var.set(initial_filter)
+            dialog.win.lift()
+        dialog.problems_only.set(problems_only)
+        dialog.refresh()
+
+    def check_ribbon_callbacks(self) -> None:
+        if self.draft is None:
+            return
+        self._flush_all_editors()
+        if not rs.ribbon_parts(self.draft):
+            messagebox.showinfo(APP_NAME, "This file has no ribbon XML (customUI).")
+            return
+        issues = rs.check_ribbon(self.draft)
+        if not issues:
+            total = len(rs.ribbon_entries(self.draft))
+            messagebox.showinfo(
+                APP_NAME,
+                f"All {total} ribbon callbacks point to existing macros, "
+                "and control ids are unique.",
+            )
+            return
+        text = "\n".join(i.describe() for i in issues[:15]) + ("\n…" if len(issues) > 15 else "")
+        if messagebox.askyesno(
+            APP_NAME,
+            f"{len(issues)} ribbon problem(s):\n\n{text}\n\nOpen the Ribbon Buttons list?",
+            icon="warning",
+        ):
+            self.show_ribbon_buttons(problems_only=True)
+
+    def _confirm_ribbon_issues(self) -> bool:
+        """Warn (never block) about ribbon problems introduced by this draft."""
+        if self.draft is None:
+            return True
+        try:
+            issues = rs.new_issues(self.draft)
+        except Exception:  # noqa: BLE001 - a checker bug must never block saving
+            return True
+        if not issues:
+            return True
+        text = "\n".join(i.describe() for i in issues[:12]) + ("\n…" if len(issues) > 12 else "")
+        return messagebox.askyesno(
+            APP_NAME,
+            "Your edits introduce ribbon problems that will make buttons fail in Office:\n\n"
+            f"{text}\n\nSave anyway?",
+            icon="warning",
+        )
 
     def backup_browser(self) -> None:
         if self.draft is None:
