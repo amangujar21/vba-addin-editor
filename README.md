@@ -126,12 +126,12 @@ VBAAddinEditor.exe --version-json
 Parser tests use a synthetic add-in built from pyOpenVBA's Excel-authored
 template. The release promise (Office opens the edited add-in with no repair
 dialog and runs the updated macro from the same installed path) requires the
-live Office qualification matrix from the implementation plan
-(`VBA_Addin_Editor_Implementation_Plan.md`, sections 4 and 29) run against
-authentic Office-authored `.xlam`/`.ppam` fixtures. The XML feature adds the
-same requirement for authentic `.xlam`/`.ppam`/`.pptm` fixtures: the automated
-live cycle edits a known XML marker and VBA code in one save, and the human gate
-verifies Excel or PowerPoint opens the saved file with **no repair dialog**.
+live Office qualification run (`pytest tests -m live`) against authentic
+Office-authored fixtures placed in `tests/fixtures/` (`xlam/RealAddin.xlam`,
+`ppam/RealAddin.ppam`, `pptm/RealPresentation.pptm`; the PPAM/PPTM need a
+`customUI` part containing `VBAAE_XML_ORIGINAL`). The automated live cycle
+edits that XML marker and VBA code in one save; a human then verifies Excel or
+PowerPoint opens the saved file with **no repair dialog** and runs the macro.
 
 ### Dependency pin
 
