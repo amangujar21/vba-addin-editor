@@ -44,8 +44,8 @@ identity = {
     "python_version": sys.version.split()[0],
     "python_architecture": "64bit" if sys.maxsize > 2**32 else "32bit",
     "packaged_mode": mode if not dirty or not release_mode else f"{mode}-dirty",
-    "pyopenvba_pin": "3.4.0",
-    "dependencies": {"pyopenvba": "3.4.0"},
+    "pyopenvba_pin": "6.2.0",
+    "dependencies": {"pyopenvba": "6.2.0"},
 }
 if dirty and not release_mode:
     identity["packaged_mode"] = f"{mode}-development-dirty"

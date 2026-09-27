@@ -44,6 +44,18 @@ def validate_module_name(name: str, draft: DocumentDraft, exclude_id: str | None
     if name.lower() in VBA_RESERVED:
         return f"'{name}' is a reserved VBA word and cannot be used as a module name."
     for m in draft.modules:
+        if (
+            m.is_deleted
+            and not m.is_new
+            and m.project_item_kind == "userform"
+            and (m.origin_name or m.current_name).casefold() == name.casefold()
+        ):
+            # Reusing the name would make the save recycle the form's streams
+            # and leave its layout storage in place.
+            return (
+                f"The UserForm '{m.origin_name or m.current_name}' is deleted in this draft. "
+                "Save the deletion before reusing its name."
+            )
         if m.is_deleted or m.id == exclude_id:
             continue
         if m.current_name.casefold() == name.casefold():

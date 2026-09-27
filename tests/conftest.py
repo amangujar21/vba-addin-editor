@@ -42,6 +42,53 @@ def build_xlam_with_class(path: Path, *, stream_name: str | None = None) -> Path
     return path
 
 
+def build_xlam_with_form(path: Path) -> Path:
+    """Synthetic XLAM with Module1 plus UserForm EntryForm (a frame holding a textbox, a button)."""
+    with ExcelFile.create_new(path) as host:
+        host.set_module(
+            "Module1",
+            'Public Const TEST_BUILD As String = "ORIGINAL"\r\n'
+            "Public Sub Hello()\r\n    EntryForm.Show\r\nEnd Sub\r\n",
+        )
+        form = host.add_form("EntryForm", caption="Entry")
+        form.add_control("Frame", "fraMain")
+        form.add_control("TextBox", "txtName", container="fraMain")
+        form.add_control("CommandButton", "cmdOK")
+        form.control("cmdOK").set_property("Caption", "OK")
+        host.set_module("EntryForm", "Private Sub cmdOK_Click()\r\n    Unload Me\r\nEnd Sub\r\n")
+        host.save()
+    return path
+
+
+_SIG_REL = "http://schemas.microsoft.com/office/2006/relationships/vbaProjectSignature"
+
+
+def add_signature_parts(path: Path, vba_entry: str = "xl/vbaProject.bin") -> None:
+    """Lay out a (fake) VBA signature in package parts, as Office stores one."""
+    folder, _, name = vba_entry.rpartition("/")
+    sig_part = f"{folder}/vbaProjectSignature.bin"
+    rels_part = f"{folder}/_rels/{name}.rels"
+    with zipfile.ZipFile(path) as package:
+        members = {info.filename: package.read(info) for info in package.infolist()}
+    assert rels_part not in members
+    members[sig_part] = b"\x00" * 64
+    members[rels_part] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{_SIG_REL}" Target="vbaProjectSignature.bin"/>'
+        "</Relationships>"
+    ).encode()
+    types = members["[Content_Types].xml"].decode("utf-8")
+    override = (
+        f'<Override PartName="/{sig_part}" '
+        'ContentType="application/vnd.ms-office.vbaProjectSignature"/>'
+    )
+    members["[Content_Types].xml"] = types.replace("</Types>", override + "</Types>").encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as package:
+        for member, data in members.items():
+            package.writestr(member, data)
+
+
 RIBBON = """<customUI xmlns="http://schemas.microsoft.com/office/2009/07/customui">
   <ribbon>
     <tabs>
@@ -128,6 +175,11 @@ def work_pptm(tmp_path: Path, pptm_path: Path) -> Path:
 
 
 @pytest.fixture()
+def work_xlam_with_form(tmp_path: Path) -> Path:
+    return build_xlam_with_form(tmp_path / "FormAddin.xlam")
+
+
+@pytest.fixture
 def work_xlam_with_class(tmp_path: Path) -> Path:
     dest = tmp_path / "work" / "ClassAddin.xlam"
     dest.parent.mkdir(parents=True, exist_ok=True)

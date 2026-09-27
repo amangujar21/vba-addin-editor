@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Windows-only, offline Tkinter/ttk app that edits VBA source (and existing OOXML parts) inside Excel `.xlam`, PowerPoint `.ppam` and `.pptm` files **in place**: verified candidate → mandatory same-folder backup → atomic `ReplaceFileW`. No COM, no Office automation. VBA parsing/writing goes through `pyopenvba==3.4.0` (exact pin; the adapter imports its internals).
+Windows-only, offline Tkinter/ttk app that edits VBA source (and existing OOXML parts) inside Excel `.xlam`, PowerPoint `.ppam` and `.pptm` files **in place**: verified candidate → mandatory same-folder backup → atomic `ReplaceFileW`. No COM, no Office automation. VBA parsing/writing goes through `pyopenvba==6.2.0` (exact pin; the adapter imports its internals).
 
 ## Commands
 
@@ -31,8 +31,8 @@ scripts/build.ps1 -Release                 # strict gate: clean tree, tests, lin
 
 Layers under `src/vba_addin_editor/`:
 
-- **domain/** — `DocumentSnapshot` (immutable open-time state, the *trusted* source) vs `DocumentDraft` (editable `ModuleDraft`s + `XmlPartDraft`s). `capabilities.py` classifies each component from the VBA `PROJECT` stream + dir records (standard / class / document / designer); only snapshot capabilities authorize delete/rename — draft flags never do.
-- **adapters/** — the only places bytes are touched. `pyopenvba_adapter.py` is the single VBA seam (build/verify candidate, delete/rename replay, PROJECT scrub shim for pyOpenVBA 3.4.0). `ooxml_package_adapter.py` is the only code that reads/rewrites ZIP entries; the GUI never touches package members. `xml_codec.py` preserves each part's codec/BOM/newline; editor text is LF-normalized.
+- **domain/** — `DocumentSnapshot` (immutable open-time state, the *trusted* source) vs `DocumentDraft` (editable `ModuleDraft`s + `XmlPartDraft`s). `capabilities.py` classifies each component from the VBA `PROJECT` stream + dir records (standard / class / document / designer / userform); only snapshot capabilities authorize delete/rename — draft flags never do.
+- **adapters/** — the only places bytes are touched. `pyopenvba_adapter.py` is the single VBA seam (build/verify candidate, delete/rename replay, PROJECT scrub shim written for pyOpenVBA 3.4.0; read-only UserForm layouts via `pyopenvba.forms`; signature-part removal edits via `pyopenvba._package_signature`). `ooxml_package_adapter.py` is the only code that reads/rewrites ZIP entries; the GUI never touches package members. `xml_codec.py` preserves each part's codec/BOM/newline; editor text is LF-normalized.
 - **services/** — `save_service.py` runs the composite transaction: VBA candidate first, then XML patch applied to the disposable candidate; `verify_candidate(..., allowed_non_vba_changes=...)` permits differences only on the exact changed XML paths; post-commit verification compares against the backup. `session_service`/`recovery_service`/`history_service` implement draft sessions, recovery checkpoints and undo (`HistoryCommand` ops: `text`, `xml_text`, `rename`, `add`, `delete`, `replace_all` with `{"modules","xml"}` snapshots for multi-target undo). `ribbon_service.py` is pure-text customUI ↔ VBA callback linking (lexical XML scan so it works on mid-edit XML).
 - **platform/** — `ReplaceFileW`, exclusive-access probes, Office process detection.
 - **ui/** — `main_window.py` owns everything; VBA and XML tabs each use a `CodeEditor` (`xml_editor.py` subclasses it). `text_context_menu.py` provides right-click menus with `add_extra()` hooks.
@@ -42,7 +42,8 @@ Layers under `src/vba_addin_editor/`:
 - No change → no write. Office host running / file locked / fingerprint changed → save blocked, draft kept.
 - Untouched package members (including malformed baseline XML) must stay byte-identical; only XML in the change set is parsed/validated. Don't reintroduce parse-all verification.
 - Password-protected VBA blocks only VBA mutations; XML-only saves must keep `vbaProject.bin` byte-identical. OPC signatures block XML edits.
-- Document modules (`ThisWorkbook`, sheets) and designers (UserForms) are never deletable/renamable.
+- Document modules (`ThisWorkbook`, sheets) are never deletable/renamable. Verified UserForms (`project_item_kind == "userform"`) are delete-only; other designers stay locked.
+- The editor never writes UserForm layouts. Never call `host.forms()` on a host that will `save()` — pyOpenVBA writes back any form it has read. Verification requires every surviving form storage to be byte-identical.
 - In `MainWindow`, editor widgets hold unflushed text. Call `_flush_all_editors()` before reading/mutating the draft. `_checkpoint_now()` flushes editors, so after mutating the draft programmatically reload editors **before** checkpointing (see `_batch_edit`). `on_module_selected`/`on_xml_part_selected` ignore re-selection of the already-shown item; navigate with `_open_module_at` / `_open_xml_at`.
 
 ## Tests

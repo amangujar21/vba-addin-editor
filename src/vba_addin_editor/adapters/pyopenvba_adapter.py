@@ -3,11 +3,17 @@
 All pyopenvba imports (public and internal) live here. GUI and services
 must never import pyopenvba directly (plan sections 2.9, 5.3, 24).
 
-Internals used and why (pinned pyopenvba==3.4.0):
+Internals used and why (pinned pyopenvba==6.2.0):
 - ``_encoding_for_codepage``: maps the project's dir-stream code page to a
   Python codec for strict save-time validation; no public equivalent exists.
-- ``detect_signature`` / ``CFB``: signature detection without mutating the
-  host file, by building a CFB from ``host.vba_project_bytes()``.
+- ``CFB``: reads streams and designer storages without mutating the host.
+- ``_package_signature.without_signature``: the exact package edits
+  ``host.save()`` makes when it drops a signature kept in parts beside
+  ``vbaProject.bin``; verification allows those edits and nothing else.
+- ``forms.form_names`` / ``forms.read_form``: UserForm designer storages,
+  read for display and structural verification only. The editor never
+  writes form layouts; ``host.forms()`` is never called on a host that
+  saves, so ``save()`` cannot write a designer back.
 """
 
 from __future__ import annotations
@@ -20,12 +26,13 @@ from typing import Any
 
 from pyopenvba import ExcelFile, PowerPointFile
 from pyopenvba._host import VBAHostFile
+from pyopenvba._package_signature import without_signature
 from pyopenvba.cfb import CFB
 from pyopenvba.exceptions import UnsupportedFormatError, VBAProjectError
+from pyopenvba.forms import FormControl, form_names, read_form
 from pyopenvba.vba import (
     VBAModuleKind,
     _encoding_for_codepage,
-    detect_signature,
     parse_project_stream,
     parse_projectwm,
     serialize_project_stream,
@@ -43,10 +50,13 @@ from vba_addin_editor.domain.capabilities import (
     classify_component,
     empty_project_index,
 )
+from vba_addin_editor.domain.changes import compute_changes
 from vba_addin_editor.domain.document import (
     DocumentDraft,
     DocumentSnapshot,
     FileFingerprint,
+    FormControlSnapshot,
+    FormDesignSnapshot,
     HostKind,
     ModuleDisplayKind,
     ModuleSnapshot,
@@ -119,7 +129,7 @@ def _decrypt_project_data(value: str) -> bytes:
 def _has_active_project_protection(protection: Any) -> bool:
     """Return whether decoded CMG says user, host, or VBE protection is active.
 
-    pyOpenVBA 3.4.0 derives ``has_password`` from raw DPB string length. DPB
+    pyOpenVBA (still in 6.2.0) derives ``has_password`` from raw DPB string length. DPB
     describes password material, while CMG is the authoritative active
     protection state. Fall back to pyOpenVBA only when CMG is absent; malformed
     or unexpected CMG data fails closed because its protection flags are unknown.
@@ -208,6 +218,62 @@ def _designer_storage_names(cfb: CFB) -> frozenset[str]:
     return frozenset(name.casefold() for name in storages if name.upper() != "VBA")
 
 
+def _form_storage_names(cfb: CFB) -> list[str]:
+    """Top-level designer storages holding a UserForm ``f`` stream."""
+    try:
+        return form_names(cfb)
+    except Exception:  # noqa: BLE001 - unreadable => no deletable forms
+        return []
+
+
+def _display_value(value: object) -> str:
+    size = getattr(value, "width", None), getattr(value, "height", None)
+    if None not in size:
+        return f"{size[0]} x {size[1]} (HIMETRIC)"
+    return str(value)
+
+
+def _display_properties(props: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    return tuple((name, _display_value(value)) for name, value in props.items())
+
+
+def _control_snapshot(control: FormControl) -> FormControlSnapshot:
+    return FormControlSnapshot(
+        name=control.name,
+        kind=control.kind,
+        properties=_display_properties(control.properties()),
+        children=tuple(_control_snapshot(child) for child in control.children),
+    )
+
+
+def _read_form_designs(cfb: CFB, names: list[str], code_page: int) -> tuple[FormDesignSnapshot, ...]:
+    """Display-only form layouts; a form that fails to parse reports why."""
+    designs: list[FormDesignSnapshot] = []
+    for name in names:
+        try:
+            form = read_form(cfb, name, code_page=code_page)
+            designs.append(
+                FormDesignSnapshot(
+                    name=name,
+                    properties=_display_properties(form.properties()),
+                    controls=tuple(_control_snapshot(c) for c in form.controls),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - shown to the user, never fatal
+            designs.append(FormDesignSnapshot(name=name, problem=f"{type(exc).__name__}: {exc}"))
+    return tuple(designs)
+
+
+def _storage_tree(cfb: CFB, path: list[str]) -> dict[str, bytes]:
+    """Every stream under the storage at ``path``, keyed by relative path."""
+    out: dict[str, bytes] = {}
+    for stream in cfb.list_streams_at(path):
+        out["/".join([*path, stream])] = cfb.get_stream_at(path, stream)
+    for storage in cfb.list_storages_at(path):
+        out.update(_storage_tree(cfb, [*path, storage]))
+    return out
+
+
 def _index_from_project(parsed: object | None, *, lossy: bool, missing: bool) -> object:
     if parsed is None:
         return empty_project_index(missing=missing, lossy=lossy)
@@ -227,6 +293,7 @@ def classify_host_module(
     *,
     index,
     designer_storages: frozenset[str],
+    form_storages: frozenset[str] = frozenset(),
 ) -> ComponentCapabilities:
     return classify_component(
         logical_name=module.name,
@@ -235,6 +302,7 @@ def classify_host_module(
         is_read_only=bool(module.is_read_only),
         index=index,
         designer_storages=designer_storages,
+        form_storages=form_storages,
     )
 
 
@@ -245,8 +313,9 @@ class PyOpenVBAAdapter:
     # -- safety inspection ------------------------------------------------
 
     def inspect_signature(self, host: VBAHostFile) -> tuple[bool, tuple[str, ...]]:
-        cfb = CFB.from_bytes(host.vba_project_bytes())
-        info = detect_signature(cfb)
+        # Streams inside the project plus the package parts beside it, which
+        # is where Office itself keeps a VBA signature.
+        info = host.vba_signature()
         return info.present, tuple(info.kinds)
 
     # -- snapshot ---------------------------------------------------------
@@ -297,6 +366,9 @@ class PyOpenVBAAdapter:
                 parsed_project, lossy=lossy, missing=missing_project
             )
             designer_storages = _designer_storage_names(cfb)
+            form_storage_list = _form_storage_names(cfb)
+            form_storages = frozenset(name.casefold() for name in form_storage_list)
+            forms = _read_form_designs(cfb, form_storage_list, project.code_page)
             safety = ProjectSafetyInfo(
                 password_protected=_has_active_project_protection(project.protection),
                 signature_present=sig_present,
@@ -309,7 +381,10 @@ class PyOpenVBAAdapter:
                 source = to_editor_text(m.source)
                 header, body = split_attribute_header(source)
                 caps = classify_host_module(
-                    m, index=type_index, designer_storages=designer_storages
+                    m,
+                    index=type_index,
+                    designer_storages=designer_storages,
+                    form_storages=form_storages,
                 )
                 modules.append(
                     ModuleSnapshot(
@@ -340,6 +415,7 @@ class PyOpenVBAAdapter:
                 code_page=project.code_page,
                 safety=safety,
                 modules=tuple(modules),
+                forms=forms,
             )
 
     def codepage_encoding(self, code_page: int) -> str:
@@ -393,7 +469,7 @@ class PyOpenVBAAdapter:
                     host.save(
                         candidate_path,
                         allow_invalidate_signature=allow_signature_removal,
-                        # pyOpenVBA 3.4.0 can falsely infer protection from raw
+                        # pyOpenVBA (3.4.0-6.2.0) can falsely infer protection from raw
                         # DPB length. Override only when decoded CMG proves the
                         # project is unlocked; active/malformed protection stays
                         # blocked by both the service preflight and the library.
@@ -444,20 +520,38 @@ class PyOpenVBAAdapter:
             return CandidateVerificationResult(False, ("Candidate file missing or empty.",))
         if candidate_path.suffix.lower() != reference_path.suffix.lower():
             problems.append("Candidate extension does not match original.")
+        ref_vba: bytes | None = None
         try:
             with zipfile.ZipFile(candidate_path) as cand, zipfile.ZipFile(reference_path) as ref:
                 if cand.testzip() is not None:
                     problems.append("Candidate ZIP has a corrupt entry.")
                 cand_names = set(cand.namelist())
                 ref_names = set(ref.namelist())
-                if cand_names != ref_names:
+                ref_vba = ref.read(entry) if entry in ref_names else None
+                # An approved signature drop removes the signature parts and
+                # rewrites their relationships / content-type overrides, as
+                # Office does. Exactly those edits are allowed; nothing else.
+                sig_edits = _signature_removal_edits(ref, entry, expected)
+                removed = {name for name, data in sig_edits.items() if data is None}
+                expected_names = ref_names - removed
+                if cand_names != expected_names:
                     problems.append(
-                        f"ZIP entry set changed: only-in-original={sorted(ref_names - cand_names)} "
-                        f"only-in-candidate={sorted(cand_names - ref_names)}"
+                        f"ZIP entry set changed: only-in-original={sorted(expected_names - cand_names)} "
+                        f"only-in-candidate={sorted(cand_names - expected_names)}"
                     )
+                for name, data in sig_edits.items():
+                    if data is None or name not in cand_names:
+                        continue
+                    if name in allowed_non_vba_changes:
+                        problems.append(
+                            f"{name} was edited and is also rewritten by removing the VBA "
+                            "signature; save the XML and VBA changes separately."
+                        )
+                    elif cand.read(name) != data:
+                        problems.append(f"Signature removal changed {name} unexpectedly.")
                 differing: list[str] = []
                 for name in sorted(ref_names & cand_names):
-                    if name == entry or name in allowed_non_vba_changes:
+                    if name == entry or name in allowed_non_vba_changes or name in sig_edits:
                         continue
                     if (
                         hashlib.sha256(ref.read(name)).digest()
@@ -508,6 +602,14 @@ class PyOpenVBAAdapter:
                         f"{actual[name].kind.name} != {expected_kind}."
                     )
             problems.extend(_verify_project_cleanup(cand_host, expected))
+            if ref_vba is not None:
+                problems.extend(
+                    _verify_form_storages(
+                        CFB.from_bytes(ref_vba),
+                        CFB.from_bytes(cand_host.vba_project_bytes()),
+                        expected,
+                    )
+                )
             sig_present, kinds = self.inspect_signature(cand_host)
             if expected.baseline.safety.signature_present:
                 if sig_present and allow_removal_expected(expected):
@@ -517,6 +619,16 @@ class PyOpenVBAAdapter:
                 if sig_present:
                     problems.append("Candidate unexpectedly gained a signature.")
         return CandidateVerificationResult(not problems, tuple(problems), details)
+
+    def signature_removal_edits(
+        self, reference_path: Path, draft: DocumentDraft
+    ) -> dict[str, bytes | None]:
+        """Package edits an approved signature drop makes (None = part removed)."""
+        try:
+            with zipfile.ZipFile(reference_path) as ref:
+                return _signature_removal_edits(ref, vba_entry_for(reference_path), draft)
+        except (zipfile.BadZipFile, OSError):
+            return {}
 
     # -- import/export -----------------------------------------------------
 
@@ -545,6 +657,18 @@ def allow_removal_expected(draft: DocumentDraft) -> bool:
     return draft.signed_save_confirmed
 
 
+def _signature_removal_edits(
+    ref: zipfile.ZipFile, entry: str, draft: DocumentDraft
+) -> dict[str, bytes | None]:
+    """What host.save() does to the package when it drops a signature kept in
+    parts beside vbaProject.bin, as Office does; empty unless approved."""
+    if not (draft.baseline.safety.signature_present and allow_removal_expected(draft)):
+        return {}
+    if not compute_changes(draft).has_vba_changes:
+        return {}  # XML-only saves never rewrite the VBA project
+    return without_signature(ref.namelist(), ref.read, entry)
+
+
 def _assert_destructive_ops_against_snapshot(draft: DocumentDraft) -> None:
     trusted = {module.id: module for module in draft.baseline.modules}
     for mod in draft.deleted_original_modules():
@@ -555,6 +679,19 @@ def _assert_destructive_ops_against_snapshot(draft: DocumentDraft) -> None:
                 f"Deleting {mod.origin_name or mod.current_name!r} is not permitted "
                 f"({reason or 'unverified component'}).",
                 {"module_id": mod.id, "reason": reason},
+            )
+    # pyOpenVBA recycles a deleted stream when a module of the same name is
+    # added in the same save, which would leave a deleted form's layout
+    # storage in place under the new module.
+    final_names = {m.current_name.casefold() for m in draft.final_module_state()}
+    for mod in draft.deleted_original_modules():
+        snap = trusted.get(mod.id)
+        name = mod.origin_name or mod.current_name
+        if snap is not None and snap.project_item_kind == "userform" and name.casefold() in final_names:
+            raise AdapterError(
+                f"The UserForm {name!r} is deleted in this draft and its name is reused. "
+                "Save the deletion before reusing the name.",
+                {"module_id": mod.id},
             )
     for mod in draft.changed_names():
         snap = trusted.get(mod.id)
@@ -666,6 +803,43 @@ def _verify_project_cleanup(host: VBAHostFile, expected: DocumentDraft) -> list[
         if name in wm_names:
             problems.append(f"Deleted module still listed in PROJECTwm: {name!r}")
     return problems
+
+
+def _verify_form_storages(ref_cfb: CFB, cand_cfb: CFB, expected: DocumentDraft) -> list[str]:
+    """Deleted forms leave no storage; every other form layout is byte-identical.
+
+    The editor never writes layouts, so any designer difference is a defect.
+    """
+    problems: list[str] = []
+    surviving = {m.current_name.casefold() for m in expected.final_module_state()}
+    ref_forms = {name.casefold(): name for name in _form_storage_names(ref_cfb)}
+    try:
+        cand_storages = {name.casefold(): name for name in cand_cfb.list_storages_at(())}
+    except Exception as exc:  # noqa: BLE001 - inability to verify is failure
+        return [f"Could not enumerate candidate designer storages ({type(exc).__name__})."]
+    for folded, name in sorted(ref_forms.items()):
+        if folded not in surviving:
+            if folded in cand_storages:
+                problems.append(f"Deleted UserForm layout still present: {name!r}")
+            continue
+        if folded not in cand_storages:
+            problems.append(f"UserForm layout missing in candidate: {name!r}")
+            continue
+        try:
+            before = _storage_tree(ref_cfb, [name])
+            after = _storage_tree(cand_cfb, [cand_storages[folded]])
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"Could not read UserForm layout {name!r} ({type(exc).__name__}).")
+            continue
+        if before != after:
+            problems.append(f"UserForm layout changed: {name!r}")
+    for folded in sorted(set(_form_storage_names_folded(cand_cfb)) - set(ref_forms)):
+        problems.append(f"Unexpected UserForm layout in candidate: {folded!r}")
+    return problems
+
+
+def _form_storage_names_folded(cfb: CFB) -> list[str]:
+    return [name.casefold() for name in _form_storage_names(cfb)]
 
 
 def _make_unique_temp_name(project: Any) -> str:

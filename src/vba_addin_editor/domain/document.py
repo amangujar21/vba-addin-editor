@@ -100,6 +100,33 @@ class XmlPartSnapshot(_XmlPartHealth):
     is_content_types_part: bool
     open_problem: str | None = None
 
+
+@dataclass(frozen=True)
+class FormControlSnapshot:
+    """One UserForm control as read from its designer storage (display only)."""
+
+    name: str
+    kind: str  # "MSForms.TextBox", ...
+    properties: tuple[tuple[str, str], ...]  # stored (non-default) properties
+    children: tuple[FormControlSnapshot, ...] = ()
+
+
+@dataclass(frozen=True)
+class FormDesignSnapshot:
+    """Read-only open-time view of one UserForm's layout."""
+
+    name: str
+    properties: tuple[tuple[str, str], ...] = ()
+    controls: tuple[FormControlSnapshot, ...] = ()
+    problem: str | None = None  # set when the designer streams could not be read
+
+    def control_count(self) -> int:
+        def count(items: tuple[FormControlSnapshot, ...]) -> int:
+            return sum(1 + count(c.children) for c in items)
+
+        return count(self.controls)
+
+
 @dataclass(frozen=True)
 class DocumentSnapshot:
     path: Path
@@ -112,6 +139,7 @@ class DocumentSnapshot:
     modules: tuple[ModuleSnapshot, ...]
     xml_parts: tuple[XmlPartSnapshot, ...] = ()
     package_safety: PackageSafetyInfo = PackageSafetyInfo()
+    forms: tuple[FormDesignSnapshot, ...] = ()
 
 
 @dataclass

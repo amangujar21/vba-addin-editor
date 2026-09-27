@@ -252,6 +252,7 @@ class SaveService:
                 reference_path=reference,
                 candidate_path=candidate,
                 draft=draft,
+                signature_edits=self.adapter.signature_removal_edits(reference, draft),
             )
             problems.extend(xml_verification.problems)
         return not problems, tuple(problems)

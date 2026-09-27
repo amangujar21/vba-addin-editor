@@ -19,6 +19,8 @@ from vba_addin_editor.domain.capabilities import RESTRICTION_MESSAGES
 from vba_addin_editor.domain.changes import compute_changes, dirty_count
 from vba_addin_editor.domain.document import (
     DocumentDraft,
+    FormControlSnapshot,
+    FormDesignSnapshot,
     ModuleDisplayKind,
     ModuleDraft,
     new_module_id,
@@ -206,8 +208,11 @@ class MainWindow:
         self._build_vba_tab(vba_tab)
         self.xml_tab = ttk.Frame(self.editor_notebook)
         self._build_xml_tab(self.xml_tab)
+        self.forms_tab = ttk.Frame(self.editor_notebook)
+        self._build_forms_tab(self.forms_tab)
         self.editor_notebook.add(vba_tab, text="VBA")
         self.editor_notebook.add(self.xml_tab, text="XML")
+        self.editor_notebook.add(self.forms_tab, text="Forms")
         self.editor_notebook.pack(fill="both", expand=True)
         self.banner = ttk.Label(self.root, text="", background="#fff3cd", padding=4)
         self.banner.pack(fill="x", before=self.editor_notebook)
@@ -278,6 +283,120 @@ class MainWindow:
         panes.add(right, weight=4)
 
         self.current_xml_part_path: str | None = None
+
+    def _build_forms_tab(self, parent) -> None:
+        """Read-only UserForm layouts, as stored in the file when it was opened."""
+        panes = ttk.Panedwindow(parent, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+
+        left = ttk.Frame(panes, padding=4)
+        bar = ttk.Frame(left)
+        bar.pack(fill="x")
+        self.form_code_btn = ttk.Button(
+            bar, text="Go to Code", command=self.goto_form_code, state="disabled"
+        )
+        self.form_code_btn.pack(side="left", padx=2)
+        self.forms_tree = ttk.Treeview(left, show="tree", selectmode="browse")
+        tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.forms_tree.yview)
+        self.forms_tree.configure(yscrollcommand=tree_sb.set)
+        self.forms_tree.pack(side="left", fill="both", expand=True)
+        tree_sb.pack(side="right", fill="y")
+        self.forms_tree.bind("<<TreeviewSelect>>", self.on_form_item_selected)
+        panes.add(left, weight=1)
+
+        right = ttk.Frame(panes, padding=4)
+        self.form_heading = ttk.Label(right, text="", anchor="w", wraplength=560, justify="left")
+        self.form_heading.pack(fill="x")
+        props = ttk.Frame(right)
+        props.pack(fill="both", expand=True, pady=(4, 0))
+        self.form_props = ttk.Treeview(props, columns=("value",), show="tree headings", selectmode="browse")
+        self.form_props.heading("#0", text="Property")
+        self.form_props.heading("value", text="Value")
+        self.form_props.column("#0", width=200, stretch=False)
+        props_sb = ttk.Scrollbar(props, orient="vertical", command=self.form_props.yview)
+        self.form_props.configure(yscrollcommand=props_sb.set)
+        self.form_props.pack(side="left", fill="both", expand=True)
+        props_sb.pack(side="right", fill="y")
+        ttk.Label(
+            right,
+            text=(
+                "Read-only view. Only properties that differ from the control's "
+                "default are stored in the file, so only those are listed."
+            ),
+            foreground="#555555",
+            wraplength=560,
+            justify="left",
+        ).pack(fill="x", pady=(4, 0))
+        panes.add(right, weight=3)
+
+        self._form_items: dict[str, tuple[str, FormDesignSnapshot | FormControlSnapshot]] = {}
+
+    def _refresh_forms(self) -> None:
+        self.forms_tree.delete(*self.forms_tree.get_children())
+        self.form_props.delete(*self.form_props.get_children())
+        self._form_items.clear()
+        self.form_code_btn.config(state="disabled")
+        draft = self.draft
+        if draft is None:
+            self.form_heading.config(text="")
+            return
+        if not draft.baseline.forms:
+            self.form_heading.config(text="This project has no UserForms.")
+            return
+        self.form_heading.config(text="Select a form or control to see its stored properties.")
+        deleted = {
+            (m.origin_name or m.current_name).casefold() for m in draft.deleted_original_modules()
+        }
+        for form in draft.baseline.forms:
+            label = form.name
+            if form.problem:
+                label += " [unreadable]"
+            elif form.name.casefold() in deleted:
+                label += " [deleted — pending save]"
+            iid = f"form::{form.name}"
+            self.forms_tree.insert("", "end", iid=iid, text=label, open=True)
+            self._form_items[iid] = (form.name, form)
+            self._insert_form_controls(iid, form.name, form.controls)
+
+    def _insert_form_controls(self, parent: str, form_name: str, controls) -> None:
+        for control in controls:
+            iid = f"{parent}/{control.name}"
+            kind = control.kind.rsplit(".", 1)[-1]
+            self.forms_tree.insert(parent, "end", iid=iid, text=f"{control.name}  ({kind})", open=True)
+            self._form_items[iid] = (form_name, control)
+            self._insert_form_controls(iid, form_name, control.children)
+
+    def on_form_item_selected(self, _event=None) -> None:
+        selection = self.forms_tree.selection()
+        if not selection or selection[0] not in self._form_items:
+            return
+        form_name, item = self._form_items[selection[0]]
+        self.form_props.delete(*self.form_props.get_children())
+        if isinstance(item, FormDesignSnapshot):
+            heading = f"UserForm {item.name} — {item.control_count()} control(s)"
+            if item.problem:
+                heading += f"\nThe layout could not be read: {item.problem}"
+        else:
+            heading = f"{item.name} ({item.kind}) on {form_name}"
+        self.form_heading.config(text=heading)
+        for name, value in item.properties:
+            self.form_props.insert("", "end", text=name, values=(value,))
+        self.form_code_btn.config(
+            state="normal" if self._form_code_module(form_name) is not None else "disabled"
+        )
+
+    def _form_code_module(self, form_name: str) -> ModuleDraft | None:
+        if self.draft is None:
+            return None
+        return self.draft.find_current(form_name)
+
+    def goto_form_code(self) -> None:
+        selection = self.forms_tree.selection()
+        if not selection or selection[0] not in self._form_items:
+            return
+        mod = self._form_code_module(self._form_items[selection[0]][0])
+        if mod is not None:
+            self._open_module_at(mod.id, 1)
 
     def _build_statusbar(self) -> None:
         self.status = ttk.Label(self.root, text="Ready", padding=3, anchor="w")
@@ -446,9 +565,11 @@ class MainWindow:
         self.tree.delete(*self.tree.get_children())
         if draft is None:
             return
+        self._refresh_forms()
         groups = {
             "Standard Modules": [],
             "Class Modules": [],
+            "UserForms": [],
             "Object / Class / Form Code": [],
         }
         for m in draft.modules:
@@ -465,12 +586,16 @@ class MainWindow:
                 group = "Class Modules"
             elif m.pyopenvba_kind == "standard":
                 group = "Standard Modules"
+            elif m.project_item_kind == "userform":
+                group = "UserForms"
             else:
                 group = "Object / Class / Form Code"
             locked = not (m.can_delete or m.can_rename or m.is_new)
             label = f"{m.current_name}{marker}" + ("" if not locked else " [lock]")
             groups[group].append((m.id, label))
         for group, items in groups.items():
+            if group == "UserForms" and not items:
+                continue
             parent = self.tree.insert("", "end", text=group, open=True)
             for mid, label in items:
                 self.tree.insert(parent, "end", iid=mid, text=label)
@@ -1033,11 +1158,20 @@ class MainWindow:
                 ),
             )
             return
-        if not messagebox.askyesno(
-            APP_NAME,
-            f'Delete module "{mod.current_name}"?\n\nThis removes the module from the '
-            "VBA project when you save. It is not written to the file until Save File.",
-        ):
+        if mod.project_item_kind == "userform" and not mod.is_new:
+            prompt = (
+                f'Delete UserForm "{mod.current_name}"?\n\nThis removes the form\'s code '
+                "AND its layout (all of its controls) from the VBA project when you save. "
+                "The layout cannot be exported or re-imported by this editor; the "
+                "pre-save backup is the only way to get it back.\n\n"
+                "It is not written to the file until Save File."
+            )
+        else:
+            prompt = (
+                f'Delete module "{mod.current_name}"?\n\nThis removes the module from the '
+                "VBA project when you save. It is not written to the file until Save File."
+            )
+        if not messagebox.askyesno(APP_NAME, prompt):
             return
         if mod.is_new:
             self.draft.modules.remove(mod)

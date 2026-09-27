@@ -14,6 +14,7 @@ from vba_addin_editor.domain.document import ModuleDisplayKind
 READ_ONLY = "read_only"
 DOCUMENT = "document"
 DESIGNER = "designer"
+USERFORM = "userform"
 UNKNOWN = "unknown"
 CONFLICTING_METADATA = "conflicting_metadata"
 DECODING_LOSS = "decoding_loss"
@@ -29,6 +30,10 @@ RESTRICTION_MESSAGES = {
     DESIGNER: (
         "This is a designer component (for example a UserForm). Renaming or "
         "deleting it is disabled."
+    ),
+    USERFORM: (
+        "This is a UserForm. It can be deleted together with its layout, but "
+        "renaming it is disabled because its layout would be left behind."
     ),
     UNKNOWN: (
         "This component's type could not be verified from project metadata, "
@@ -138,12 +143,14 @@ def classify_component(
     is_read_only: bool,
     index: ProjectTypeIndex,
     designer_storages: frozenset[str],
+    form_storages: frozenset[str] = frozenset(),
 ) -> ComponentCapabilities:
     """Classify one dir-stream module using PROJECT declarations.
 
     Never infers subtype from the logical name (Class1, ThisWorkbook, …)
     or from VB_PredeclaredId. ``dir_kind`` is the dir-stream kind name
-    (``standard`` or ``other``).
+    (``standard`` or ``other``). ``form_storages`` holds the case-folded
+    names of designer storages that carry a UserForm ``f`` stream.
     """
     if index.missing:
         return _restricted(ModuleDisplayKind.AMBIGUOUS, "unknown", MISSING_PROJECT)
@@ -167,6 +174,24 @@ def classify_component(
     if in_doc:
         return _restricted(ModuleDisplayKind.AMBIGUOUS, "document", DOCUMENT)
     if in_base or in_designer:
+        # A UserForm is deletable only when every signal agrees: declared
+        # BaseClass, dir kind other, and a same-named storage holding the
+        # form's `f` stream (the storage pyOpenVBA removes with the module).
+        is_userform = (
+            in_base
+            and dir_kind == "other"
+            and not is_read_only
+            and stream_folded == folded
+            and folded in form_storages
+        )
+        if is_userform:
+            return ComponentCapabilities(
+                display_kind=ModuleDisplayKind.AMBIGUOUS,
+                project_item_kind="userform",
+                can_delete=True,
+                can_rename=False,
+                restriction_reason=USERFORM,
+            )
         return _restricted(ModuleDisplayKind.AMBIGUOUS, "designer", DESIGNER)
 
     if in_class and dir_kind == "other":

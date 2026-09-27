@@ -18,9 +18,11 @@ updated code the next time it starts.
    The unrelated host does not block saving. If Save is blocked, keep the window
    open, close the host, and click **Save File** again — do not reload.
 2. Edit code; add/rename/delete standard modules and ordinary class modules.
-   Host document modules and designer/UserForm components stay locked for
-   rename/delete. On `.xlam`/`.ppam`/`.pptm`, switch to the **XML** tab to edit
-   existing package parts.
+   UserForms can be deleted (code and layout together) but not renamed; host
+   document modules and other designer components stay locked for
+   rename/delete. The **Forms** tab shows each UserForm's controls and stored
+   properties (read-only). On `.xlam`/`.ppam`/`.pptm`, switch to the **XML**
+   tab to edit existing package parts.
 3. **Save File** reviews the current draft, verifies the original has not
    changed, builds a verified candidate, creates a backup, and atomically
    replaces the original using Windows `ReplaceFileW`. **Save a Copy** writes a
@@ -95,8 +97,21 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   is disabled. Ordinary class modules are classified from the VBA PROJECT
   stream plus dir records and can be deleted or renamed when that metadata
   agrees. Unknown or conflicting components stay locked.
-- UserForm layout cannot be created or edited; `.frm/.frx` import is not
-  supported (`.bas`/`.cls` only).
+- A UserForm can be deleted when the PROJECT stream declares it (`BaseClass`),
+  the dir record agrees, and its designer storage holds a form. Deleting
+  removes the code, the layout storage and every declaration; verification
+  confirms nothing is left behind and that every other form's layout is
+  byte-identical. Renaming a UserForm stays disabled (the layout storage would
+  be orphaned). A deleted form's name cannot be reused until the deletion is
+  saved. Folder import never deletes a UserForm.
+- UserForm layout is read-only: it can be viewed in the **Forms** tab but not
+  created or edited; `.frm/.frx` import/export is not supported
+  (`.bas`/`.cls` only).
+- A VBA signature is detected both inside `vbaProject.bin` and in the package
+  parts beside it (where Office stores it). After you confirm, a save that
+  changes VBA removes the stale signature parts, their relationships and
+  content-type overrides as Office does; verification allows exactly those
+  package edits.
 - The corresponding Office host must be closed to save in place. The tool does
   not hot-patch a loaded add-in, manage add-in registration, or change file
   locations — the edited file keeps the same path, so existing registration
@@ -135,5 +150,5 @@ PowerPoint opens the saved file with **no repair dialog** and runs the macro.
 
 ### Dependency pin
 
-- `pyopenvba==3.4.0` (MIT) — see `THIRD_PARTY_NOTICES.md`.
+- `pyopenvba==6.2.0` (MIT) — see `THIRD_PARTY_NOTICES.md`.
 - Python 3.10+; build with one pinned Python minor version.

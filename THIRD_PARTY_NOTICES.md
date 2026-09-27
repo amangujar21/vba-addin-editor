@@ -2,7 +2,7 @@
 
 ## pyOpenVBA
 
-- Version pinned: **3.4.0** — https://pypi.org/project/pyOpenVBA/
+- Version pinned: **6.2.0** — https://pypi.org/project/pyOpenVBA/
 - MIT License.
 
 ```

@@ -6,8 +6,8 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     # Exact pin: adapter relies on pyopenvba internals (_encoding_for_codepage,
-    # detect_signature, split_attribute_header). Change only with a test pass.
-    "pyopenvba==3.4.0",
+    # detect_signature, _package_signature, forms). Change only with a test pass.
+    "pyopenvba==6.2.0",
 ]
 
 [project.optional-dependencies]

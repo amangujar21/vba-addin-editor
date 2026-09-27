@@ -551,6 +551,13 @@ class FolderSyncService:
                     continue
                 if not module.can_delete:
                     raise AdapterError(f"Cannot delete {module.current_name} from a folder import.")
+                if module.project_item_kind == "userform":
+                    # The folder holds only the form's code; a missing file must
+                    # never discard its layout. Delete forms in the editor.
+                    raise AdapterError(
+                        f"Cannot delete UserForm {module.current_name} from a folder import. "
+                        "Delete it in the editor instead."
+                    )
                 module.is_deleted = True
                 continue
             if change.operation == "add":

@@ -272,8 +272,13 @@ class OoxmlPackageAdapter:
         reference_path: Path,
         candidate_path: Path,
         draft: DocumentDraft,
+        signature_edits: dict[str, bytes | None] | None = None,
     ) -> CandidateVerificationResult:
+        """``signature_edits``: package edits of an approved VBA signature drop
+        (None = part removed); each must match exactly and nothing else may differ."""
         problems: list[str] = []
+        signature_edits = signature_edits or {}
+        removed = {path for path, data in signature_edits.items() if data is None}
         try:
             with zipfile.ZipFile(reference_path) as ref, zipfile.ZipFile(
                 candidate_path
@@ -282,7 +287,7 @@ class OoxmlPackageAdapter:
                 _check_duplicates(cand, Path(candidate_path))
                 if cand.testzip() is not None:
                     problems.append("Candidate ZIP has a corrupt entry.")
-                ref_names = set(ref.namelist())
+                ref_names = set(ref.namelist()) - removed
                 cand_names = set(cand.namelist())
                 if ref_names != cand_names:
                     problems.append(
@@ -315,7 +320,10 @@ class OoxmlPackageAdapter:
                 # Do not parse untouched baseline XML here. A malformed
                 # pre-existing part is allowed, but it must remain byte-identical.
                 # Changed XML is validated separately above.
-                for path in sorted(ref_names - changed):
+                for path, data in signature_edits.items():
+                    if data is not None and path in cand_names and cand.read(path) != data:
+                        problems.append(f"Signature removal changed {path!r} unexpectedly.")
+                for path in sorted(ref_names - changed - set(signature_edits)):
                     if _is_editable_xml_part(path) and ref.read(path) != cand.read(path):
                         problems.append(
                             f"XML part {path!r} changed without being part of the edit set."
