@@ -1,2 +1,2 @@
 pyinstaller>=6.6,<7
-pyopenvba==3.4.0
+pyopenvba==6.2.0
