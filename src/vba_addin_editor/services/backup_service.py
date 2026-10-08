@@ -10,7 +10,7 @@ from pathlib import Path
 
 from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError, PyOpenVBAAdapter
 from vba_addin_editor.domain.changes import compute_changes
-from vba_addin_editor.domain.document import draft_from_snapshot
+from vba_addin_editor.domain.document import DocumentSnapshot, draft_from_snapshot
 from vba_addin_editor.domain.results import SaveResult
 from vba_addin_editor.platform import paths
 from vba_addin_editor.platform import windows_file_ops as wfo
@@ -58,11 +58,15 @@ class BackupService:
         original: Path,
         backup: Path | None,
         operation_type: str,
+        sha256: str | None = None,
     ) -> str | None:
+        """Add ``backup`` to the catalog. ``sha256`` is its content hash when the
+        caller already knows it; a backup the last save wrote has never been
+        read, and reading it now would wait for an antivirus scan."""
         if backup is None or not backup.exists():
             return None
         try:
-            digest = sha256_bytes(backup.read_bytes())
+            digest = sha256 or sha256_bytes(backup.read_bytes())
             record = {
                 "schema_version": 1,
                 "original_path": str(original),
@@ -80,6 +84,27 @@ class BackupService:
         except OSError:
             return "The save succeeded, but the backup catalog could not be updated."
         return None
+
+    def create_manual_backup(self, snapshot: DocumentSnapshot) -> Path:
+        """Copy the add-in as it is on disk now to a same-folder backup file.
+
+        Unsaved edits are not included. The bytes held from open/last save are
+        used while the file on disk is still that file; otherwise it is read.
+        """
+        original = snapshot.path
+        data = snapshot.package_bytes
+        status = paths.fingerprint_status(original, snapshot.file_fingerprint)
+        if data is None or status != "match":
+            data, _fp = paths.read_stable(original)
+        backup = paths.backup_path_for(original)
+        wfo.write_verified(backup, data)
+        self.record_success(
+            original=original,
+            backup=backup,
+            operation_type="manual_backup",
+            sha256=sha256_bytes(data),
+        )
+        return backup
 
     def list_records(self, original: Path | None = None) -> list[BackupRecord]:
         records = []

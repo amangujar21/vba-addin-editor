@@ -14,13 +14,23 @@ Internals used and why (pinned pyopenvba==6.2.0):
   read for display and structural verification only. The editor never
   writes form layouts; ``host.forms()`` is never called on a host that
   saves, so ``save()`` cannot write a designer back.
+- ``VBAHostFile._open_zip`` / ``_write_container``: overridden so a host opens
+  from bytes already in memory and returns what ``save()`` produced instead of
+  writing a file. Antivirus scans a freshly written package the first time it
+  is opened for read, which takes seconds for a large project, so the save
+  pipeline never reads back a file it wrote.
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
+import os
+import threading
 import warnings
 import zipfile
+import zlib
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +48,12 @@ from pyopenvba.vba import (
     serialize_project_stream,
 )
 
-from vba_addin_editor.adapters.ooxml_package_adapter import OoxmlPackageAdapter, PackageError
+from vba_addin_editor.adapters.ooxml_package_adapter import (
+    OoxmlPackageAdapter,
+    PackageError,
+    PackageSource,
+    open_package,
+)
 from vba_addin_editor.adapters.source_codec import (
     split_attribute_header,
     to_editor_text,
@@ -170,6 +185,182 @@ def _host_class(path: Path) -> type[VBAHostFile]:
     if suffix == ".pptm":
         return PowerPointFile
     raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
+
+
+# A destination save() can never write: its folder does not exist. The
+# in-memory host recognises it and returns the saved parts instead.
+_CAPTURE_ONLY = Path("vbaae-capture-only") / "never-written"
+
+
+class _InMemoryHost:
+    """Mixin for the pyOpenVBA hosts: open from bytes, and capture a save."""
+
+    def __init__(self, path: Path, data: bytes | None = None) -> None:
+        self._preloaded = data
+        self.saved_project: bytes | None = None
+        self.saved_package_edits: dict[str, bytes | None] = {}
+        super().__init__(path)  # type: ignore[call-arg]
+
+    def _open_zip(self) -> None:
+        if self._preloaded is None:
+            super()._open_zip()  # type: ignore[misc]
+            return
+        self._container_raw = self._preloaded
+        self._zip = zipfile.ZipFile(io.BytesIO(self._preloaded), mode="r")
+        self._has_project = self._vba_entry in self._zip.namelist()  # type: ignore[attr-defined]
+
+    def _write_container(self, dest, new_cfb_bytes, package_edits) -> None:
+        if dest != _CAPTURE_ONLY:
+            super()._write_container(dest, new_cfb_bytes, package_edits)  # type: ignore[misc]
+            return
+        self.saved_project = new_cfb_bytes
+        self.saved_package_edits = dict(package_edits)
+
+
+_MEMORY_HOSTS: dict[type, type] = {}
+
+
+def _open_host(path: Path, data: bytes | None = None) -> Any:
+    """Open the host for ``path``; with ``data``, parse those bytes and read no file."""
+    base = _host_class(path)
+    cls = _MEMORY_HOSTS.get(base)
+    if cls is None:
+        cls = _MEMORY_HOSTS[base] = type(f"InMemory{base.__name__}", (_InMemoryHost, base), {})
+    return cls(path, data)
+
+
+def _package_bytes(source: PackageSource) -> bytes:
+    return source if isinstance(source, bytes) else Path(source).read_bytes()
+
+
+class _SourceCache:
+    """Decoded module sources, keyed by their compressed stream bytes.
+
+    pyOpenVBA's decompressor is pure Python (seconds for a large project), and
+    a save used to run it over every module three times. Decompression depends
+    on nothing but the stream, so each distinct stream is decoded once: per
+    run in memory, and across runs when a disk folder is set, which is what
+    makes reopening an add-in fast.
+    """
+
+    def __init__(self, max_chars: int = 64_000_000) -> None:
+        self._items: OrderedDict[tuple[bytes, str], str] = OrderedDict()
+        self._chars = 0
+        self._max_chars = max_chars
+        self._lock = threading.Lock()
+        self._disk: Path | None = None
+
+    def use_disk(self, root: Path | None) -> None:
+        self._disk = root
+
+    def get(self, key: tuple[bytes, str]) -> str | None:
+        with self._lock:
+            text = self._items.get(key)
+            if text is not None:
+                self._items.move_to_end(key)
+                return text
+        if self._disk is None:
+            return None
+        text = _read_cached_source(self._disk_path(key))
+        if text is not None:
+            self._remember(key, text)
+        return text
+
+    def put(self, key: tuple[bytes, str], text: str) -> None:
+        if self._remember(key, text) and self._disk is not None:
+            _write_cached_source(self._disk_path(key), text)
+
+    def _remember(self, key: tuple[bytes, str], text: str) -> bool:
+        with self._lock:
+            if key in self._items:
+                return False
+            self._items[key] = text
+            self._chars += len(text)
+            while self._chars > self._max_chars and len(self._items) > 1:
+                _old, dropped = self._items.popitem(last=False)
+                self._chars -= len(dropped)
+            return True
+
+    def _disk_path(self, key: tuple[bytes, str]) -> Path:
+        assert self._disk is not None
+        name = key[0].hex()
+        return self._disk / name[:2] / f"{name}.{key[1]}.z"
+
+
+def _read_cached_source(path: Path) -> str | None:
+    """A cached source, or None when absent or not exactly what was stored."""
+    try:
+        blob = path.read_bytes()
+        encoded = zlib.decompress(blob[32:])
+        if hashlib.sha256(encoded).digest() != blob[:32]:
+            return None
+        return encoded.decode("utf-8", errors="surrogatepass")
+    except (OSError, zlib.error, UnicodeError):
+        return None
+
+
+def _write_cached_source(path: Path, text: str) -> None:
+    try:
+        encoded = text.encode("utf-8", errors="surrogatepass")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+        tmp.write_bytes(hashlib.sha256(encoded).digest() + zlib.compress(encoded, 1))
+        os.replace(tmp, path)
+    except (OSError, UnicodeError):
+        pass  # a cache that cannot be written only costs time
+
+
+def _prune_source_cache(root: Path, max_bytes: int) -> None:
+    """Drop the oldest cached sources once the folder outgrows ``max_bytes``."""
+    try:
+        stats = [(f, f.stat()) for f in root.glob("*/*.z")]
+    except OSError:
+        return
+    files = sorted((st.st_mtime, st.st_size, f) for f, st in stats)
+    total = sum(size for _mtime, size, _f in files)
+    for _mtime, size, file in files:
+        if total <= max_bytes * 3 // 4:
+            break
+        try:
+            file.unlink()
+            total -= size
+        except OSError:
+            pass
+
+
+_SOURCES = _SourceCache()
+
+
+def enable_source_disk_cache(root: Path, max_bytes: int = 200 * 1024 * 1024) -> None:
+    """Keep decoded module sources under ``root`` between runs."""
+    _SOURCES.use_disk(Path(root))
+    threading.Thread(
+        target=_prune_source_cache, args=(Path(root), max_bytes), name="vbaae-cache-prune", daemon=True
+    ).start()
+
+
+def _module_source(cfb: CFB, module: Any, encoding: str, *, load: bool = True) -> str | None:
+    """Full source of a parsed module; ``load=False`` answers only from the cache."""
+    if module.source_loaded:
+        return module.source
+    stream_name = module.stream_name or module.name
+    try:
+        try:
+            stream = cfb.get_stream_in_storage("VBA", stream_name)
+        except KeyError:
+            stream = cfb.get_stream(stream_name)
+    except KeyError:
+        return module.source if load else None
+    key = (hashlib.sha256(stream[module.text_offset:]).digest(), encoding)
+    text = _SOURCES.get(key)
+    if text is not None:
+        module.source = text  # spares pyOpenVBA its own decompression
+        return text
+    if not load:
+        return None
+    text = module.source
+    _SOURCES.put(key, text)
+    return text
 
 
 def vba_entry_for(path: Path) -> str:
@@ -325,13 +516,17 @@ class PyOpenVBAAdapter:
         path: Path,
         fingerprint: FileFingerprint,
         host_process_running: bool = False,
+        *,
+        data: bytes | None = None,
     ) -> DocumentSnapshot:
+        """Parse the package at ``path``, or ``data`` when the caller already
+        holds the bytes ``fingerprint`` describes (nothing is read from disk)."""
         path = Path(path)
         suffix = path.suffix.lower()
         if suffix not in SUPPORTED_EXTENSIONS:
             raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
         try:
-            host = _host_class(path)(path)
+            host = _open_host(path, data)
         except UnsupportedFormatError as exc:
             raise AdapterError(
                 "Only .xlam, .ppam, and .pptm files are supported.", {"exception": repr(exc)}
@@ -377,8 +572,9 @@ class PyOpenVBAAdapter:
                 host_process_running=host_process_running,
             )
             modules: list[ModuleSnapshot] = []
+            encoding = _encoding_for_codepage(project.code_page)
             for m in project.modules:
-                source = to_editor_text(m.source)
+                source = to_editor_text(_module_source(cfb, m, encoding) or "")
                 header, body = split_attribute_header(source)
                 caps = classify_host_module(
                     m,
@@ -416,6 +612,7 @@ class PyOpenVBAAdapter:
                 safety=safety,
                 modules=tuple(modules),
                 forms=forms,
+                package_bytes=data,
             )
 
     def codepage_encoding(self, code_page: int) -> str:
@@ -432,10 +629,33 @@ class PyOpenVBAAdapter:
         allow_signature_removal: bool,
     ) -> None:
         """Open the ORIGINAL fresh, replay the draft onto it, serialize to candidate."""
+        built = self.build_candidate_bytes(
+            Path(original_path), draft, allow_signature_removal=allow_signature_removal
+        )
+        Path(candidate_path).write_bytes(built)
+
+    def build_candidate_bytes(
+        self,
+        source: PackageSource,
+        draft: DocumentDraft,
+        *,
+        allow_signature_removal: bool,
+        xml_replacements: dict[str, bytes] | None = None,
+    ) -> bytes:
+        """Replay the draft onto a fresh parse of ``source``; return the new package.
+
+        ``xml_replacements`` (member name -> encoded bytes) are written in the
+        same pass. Nothing is written to disk.
+        """
         _assert_destructive_ops_against_snapshot(draft)
-        host = _host_class(original_path)(original_path)
+        host_path = draft.baseline.path if isinstance(source, bytes) else Path(source)
+        data = _package_bytes(source)
+        host = _open_host(host_path, data)
         with host:
             project = host.vba_project()
+            encoding = _encoding_for_codepage(project.code_page)
+            for module in project.modules:
+                _module_source(host._get_cfb(), module, encoding, load=False)
             try:
                 # 1. Delete permitted original modules gone in final state.
                 for mod in draft.deleted_original_modules():
@@ -467,7 +687,7 @@ class PyOpenVBAAdapter:
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     host.save(
-                        candidate_path,
+                        _CAPTURE_ONLY,
                         allow_invalidate_signature=allow_signature_removal,
                         # pyOpenVBA (3.4.0-6.2.0) can falsely infer protection from raw
                         # DPB length. Override only when decoded CMG proves the
@@ -483,6 +703,9 @@ class PyOpenVBAAdapter:
                     )
             except ValueError as exc:
                 raise AdapterError(str(exc)) from exc
+        project_bytes = host.saved_project
+        if project_bytes is None:
+            raise AdapterError("pyOpenVBA did not return a VBA project to save.")
         surviving = {mod.current_name.casefold() for mod in draft.final_module_state()}
         logical_deletes = [
             mod.origin_name or mod.current_name
@@ -490,39 +713,54 @@ class PyOpenVBAAdapter:
             if (mod.origin_name or mod.current_name).casefold() not in surviving
         ]
         if logical_deletes:
-            _scrub_project_declarations(
-                candidate_path,
-                logical_deletes,
-                draft.baseline.code_page,
-                self.package_adapter,
+            project_bytes = _scrub_project_declarations(
+                project_bytes, logical_deletes, draft.baseline.code_page
             )
+        replacements: dict[str, bytes | None] = {
+            **host.saved_package_edits,
+            vba_entry_for(host_path): project_bytes,
+            **(xml_replacements or {}),
+        }
+        try:
+            return self.package_adapter.build_package(data, replacements)
+        except PackageError as exc:
+            raise AdapterError(str(exc), getattr(exc, "details", None)) from exc
 
     # -- candidate verification (plan 14 Stage J, 77) ----------------------
 
     def verify_candidate(
         self,
-        reference_path: Path,
-        candidate_path: Path,
+        reference_path: PackageSource,
+        candidate_path: PackageSource,
         expected: DocumentDraft,
         *,
         allowed_non_vba_changes: frozenset[str] = frozenset(),
     ) -> CandidateVerificationResult:
         """Verify the candidate against a reference package.
 
-        `reference_path` is the original for pre-commit verification and the
-        backup for post-commit verification (plan 12.12).
+        Either may be a path or the package bytes; the save pipeline passes
+        bytes so nothing it wrote is read back from disk.
         """
         problems: list[str] = []
         details: dict[str, Any] = {}
-        entry = vba_entry_for(reference_path)
-
-        if not candidate_path.exists() or candidate_path.stat().st_size == 0:
+        host_path = expected.baseline.path
+        if isinstance(candidate_path, Path):
+            if not candidate_path.exists() or candidate_path.stat().st_size == 0:
+                return CandidateVerificationResult(False, ("Candidate file missing or empty.",))
+            host_path = candidate_path
+            if (
+                isinstance(reference_path, Path)
+                and candidate_path.suffix.lower() != reference_path.suffix.lower()
+            ):
+                problems.append("Candidate extension does not match original.")
+        entry = vba_entry_for(reference_path if isinstance(reference_path, Path) else host_path)
+        cand_data = _package_bytes(candidate_path)
+        ref_data = _package_bytes(reference_path)
+        if not cand_data:
             return CandidateVerificationResult(False, ("Candidate file missing or empty.",))
-        if candidate_path.suffix.lower() != reference_path.suffix.lower():
-            problems.append("Candidate extension does not match original.")
         ref_vba: bytes | None = None
         try:
-            with zipfile.ZipFile(candidate_path) as cand, zipfile.ZipFile(reference_path) as ref:
+            with open_package(cand_data) as cand, open_package(ref_data) as ref:
                 if cand.testzip() is not None:
                     problems.append("Candidate ZIP has a corrupt entry.")
                 cand_names = set(cand.namelist())
@@ -567,14 +805,16 @@ class PyOpenVBAAdapter:
 
         expected_final = {m.current_name.casefold(): m for m in expected.final_module_state()}
         try:
-            cand_host = _host_class(candidate_path)(candidate_path)
+            cand_host = _open_host(host_path, cand_data)
         except Exception as exc:  # noqa: BLE001 - translated below
             return CandidateVerificationResult(
                 False, ("Candidate could not be reopened.", {"exception": repr(exc)})
             )
         with cand_host:
             project = cand_host.vba_project()
-            structural = project.validate(cand_host._get_cfb())
+            cand_cfb = cand_host._get_cfb()
+            encoding = _encoding_for_codepage(project.code_page)
+            structural = project.validate(cand_cfb)
             if structural:
                 problems.extend(f"Structural validation: {s}" for s in structural)
             if project.code_page != expected.baseline.code_page:
@@ -588,7 +828,7 @@ class PyOpenVBAAdapter:
                 if name not in actual:
                     problems.append(f"Expected module missing in candidate: {mod.current_name!r}")
                     continue
-                got = cand_host.get_module(actual[name].name)
+                got = _module_source(cand_cfb, actual[name], encoding) or ""
                 got_body = to_vba_crlf(split_attribute_header(to_editor_text(got))[1])
                 want = to_vba_crlf(mod.body)
                 if got_body != want:
@@ -621,12 +861,13 @@ class PyOpenVBAAdapter:
         return CandidateVerificationResult(not problems, tuple(problems), details)
 
     def signature_removal_edits(
-        self, reference_path: Path, draft: DocumentDraft
+        self, reference_path: PackageSource, draft: DocumentDraft
     ) -> dict[str, bytes | None]:
         """Package edits an approved signature drop makes (None = part removed)."""
+        entry_path = reference_path if isinstance(reference_path, Path) else draft.baseline.path
         try:
-            with zipfile.ZipFile(reference_path) as ref:
-                return _signature_removal_edits(ref, vba_entry_for(reference_path), draft)
+            with open_package(reference_path) as ref:
+                return _signature_removal_edits(ref, vba_entry_for(entry_path), draft)
         except (zipfile.BadZipFile, OSError):
             return {}
 
@@ -705,25 +946,18 @@ def _assert_destructive_ops_against_snapshot(draft: DocumentDraft) -> None:
 
 
 def _scrub_project_declarations(
-    candidate_path: Path,
-    logical_names: list[str],
-    code_page: int,
-    package_adapter: OoxmlPackageAdapter,
-) -> None:
+    project_bytes: bytes, logical_names: list[str], code_page: int
+) -> bytes:
     """Shim pyOpenVBA 3.4.0: save() deletes PROJECT lines by stream name.
 
     serialize_project_stream expects logical names. When they differ, Class=
     declarations leak. Rewrite PROJECT with the logical names after save.
-    ZIP rewriting is owned by OoxmlPackageAdapter.
     """
-    entry = vba_entry_for(candidate_path)
-    with zipfile.ZipFile(candidate_path) as package:
-        raw = package.read(entry)
-    cfb = CFB.from_bytes(raw)
+    cfb = CFB.from_bytes(project_bytes)
     try:
         project_raw = cfb.get_stream("PROJECT")
     except KeyError:
-        return
+        return project_bytes
     rewritten = serialize_project_stream(
         project_raw,
         {},
@@ -731,10 +965,7 @@ def _scrub_project_declarations(
         code_page=code_page,
     )
     cfb.write_stream("PROJECT", rewritten)
-    try:
-        package_adapter.replace_members(candidate_path, {entry: cfb.to_bytes()})
-    except PackageError as exc:
-        raise AdapterError(str(exc), getattr(exc, "details", None)) from exc
+    return cfb.to_bytes()
 
 
 def _verify_project_cleanup(host: VBAHostFile, expected: DocumentDraft) -> list[str]:

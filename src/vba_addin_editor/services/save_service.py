@@ -1,10 +1,15 @@
 """The critical safe-save pipeline (original plan sections 14, 76; XML plan 12, 31).
 
 Never calls host.save() on the original path. Commit primitive is injectable
-for failure-injection tests. One save => one verified candidate => one backup
-=> one ReplaceFileW. XML changes are a second draft mutation type flowing
-through the same transaction; only explicitly changed XML part paths are
-allowed to differ from the reference package.
+for failure-injection tests. One save => one verified candidate => one atomic
+commit, with the old file kept as a backup unless auto_backup is off. XML
+changes are a second draft mutation type flowing through the same transaction;
+only explicitly changed XML part paths are allowed to differ from the
+reference package.
+
+The candidate is built and verified in memory from the baseline bytes captured
+at open, written once, and never read back: antivirus scans a freshly written
+macro package on its first open for read, which costs seconds per save.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ class SaveService:
     process_probe: Callable[[Path], bool] | None = None
     exclusive_probe: Callable[[Path], str | None] | None = None
     progress: Callable[[str], None] | None = None  # stage label callback
+    auto_backup: bool = True  # keep the replaced file as a same-folder backup
 
     def _report(self, stage: str) -> None:
         if self.progress is not None:
@@ -92,25 +98,39 @@ class SaveService:
         }
         return SaveResult.blocked(status, messages.get(status), stage=stage)
 
-    def _commit(self, replaced: Path, replacement: Path, backup: Path | None) -> None:
+    def _commit(self, replaced: Path, replacement: Path, backup: Path | None) -> str | None:
+        """Commit; returns how ("rename" / "replace_file"), None for an injected primitive."""
         if self.commit is not None:
             self.commit(replaced, replacement, backup)
-        else:
-            wfo.replace_file(replaced, replacement, backup)
+            return None
+        return wfo.commit_replace(replaced, replacement, backup)
 
-    def _open_full_snapshot(self, path: Path):
-        """Open VBA + XML state for baseline refresh (XML plan 12.13)."""
+    def _snapshot_of_written(self, path: Path, data: bytes):
+        """VBA + XML state of bytes this save just committed to ``path`` (XML plan 12.13)."""
         from dataclasses import replace
 
-        fp = paths.fingerprint(path)
-        snapshot = self.adapter.open_snapshot(path, fp, host_process_running=False)
+        fp = paths.written_fingerprint(data, path)
+        snapshot = self.adapter.open_snapshot(path, fp, host_process_running=False, data=data)
         if path.suffix.lower() in XML_EDITABLE_EXTENSIONS:
             snapshot = replace(
                 snapshot,
-                xml_parts=self.package_adapter.snapshot_xml_parts(path),
-                package_safety=self.package_adapter.inspect_package_signature(path),
+                xml_parts=self.package_adapter.snapshot_xml_parts(data),
+                package_safety=self.package_adapter.inspect_package_signature(data),
             )
         return snapshot
+
+    def _reference_bytes(self, draft: DocumentDraft, source: Path) -> bytes | None:
+        """The baseline package bytes, or None when they are no longer available.
+
+        Normally the bytes read when the file was opened. A draft without them
+        (an adopted external baseline, a hand-built snapshot) reads ``source``.
+        """
+        data = draft.baseline.package_bytes
+        if data is None:
+            data = source.read_bytes()
+        if paths.sha256_bytes(data) != draft.baseline.file_fingerprint.sha256:
+            return None
+        return data
 
     # ------------------------------------------------------------------
 
@@ -176,44 +196,29 @@ class SaveService:
 
     def _build_candidate(
         self,
-        original: Path,
+        reference: bytes,
         draft: DocumentDraft,
         changes: ChangeSet,
-        candidate: Path,
-    ) -> SaveResult | None:
-        """Stage F/G/H/I — build matrix (XML plan 12.8). Returns error result or None."""
-        has_vba = changes.has_vba_changes
-        has_xml = changes.has_xml_changes
+    ) -> bytes | SaveResult:
+        """Stage F/G/H/I — build matrix (XML plan 12.8). Returns the package or an error."""
         try:
-            if has_vba:
+            xml = (
+                self.package_adapter.xml_replacements(draft.changed_xml_parts())
+                if changes.has_xml_changes
+                else {}
+            )
+            if changes.has_vba_changes:
                 self._report("Building edited file")
-                self.adapter.build_candidate(
-                    original,
+                # Combined saves write the XML parts in the same pass.
+                return self.adapter.build_candidate_bytes(
+                    reference,
                     draft,
-                    candidate,
                     allow_signature_removal=draft.signed_save_confirmed,
+                    xml_replacements=xml,
                 )
-                if has_xml:
-                    # Combined: patch the disposable VBA candidate, never the original.
-                    xml_candidate = paths.xml_patch_path_for(candidate)
-                    try:
-                        self.package_adapter.write_xml_candidate(
-                            source_path=candidate,
-                            dest_path=xml_candidate,
-                            changed_parts=draft.changed_xml_parts(),
-                        )
-                        xml_candidate.replace(candidate)
-                    finally:
-                        _discard(xml_candidate)
-            else:
-                self._report("Building edited XML package")
-                self.package_adapter.write_xml_candidate(
-                    source_path=original,
-                    dest_path=candidate,
-                    changed_parts=draft.changed_xml_parts(),
-                )
+            self._report("Building edited XML package")
+            return self.package_adapter.build_package(reference, dict(xml))
         except AdapterError as exc:
-            _discard(candidate)
             reason = (
                 "unsupported_component_operation"
                 if "is not permitted" in str(exc)
@@ -221,19 +226,16 @@ class SaveService:
             )
             return SaveResult.error(str(exc), reason=reason)
         except PackageError as exc:
-            _discard(candidate)
             return SaveResult.error(str(exc), reason="invalid_xml")
         except (OSError, zipfile.BadZipFile) as exc:
-            _discard(candidate)
             return SaveResult.error(
                 f"The edited package could not be built: {exc!r}", reason="build"
             )
-        return None
 
     def _verify_candidate(
         self,
-        reference: Path,
-        candidate: Path,
+        reference: Path | bytes,
+        candidate: Path | bytes,
         draft: DocumentDraft,
         changes: ChangeSet,
     ):
@@ -342,30 +344,56 @@ class SaveService:
         if validation is not None:
             return validation
 
-        # Stage F/G/H/I — candidate build matrix.
-        candidate = paths.candidate_path_for(original)
-        build_error = self._build_candidate(original, draft, changes, candidate)
-        if build_error is not None:
-            return build_error
+        # Stage F/G/H/I — candidate build matrix, in memory.
+        try:
+            reference = self._reference_bytes(draft, original)
+        except OSError as exc:
+            return SaveResult.error(
+                f"The original add-in file could not be read: {exc!r}", reason="build"
+            )
+        if reference is None:
+            return SaveResult.blocked(
+                "external_change",
+                "The file changed on disk after you opened it. The draft was not overwritten.",
+            )
+        built = self._build_candidate(reference, draft, changes)
+        if isinstance(built, SaveResult):
+            return built
 
         # Stage J — dual candidate verification.
         self._report("Verifying the edited file")
-        ok, problems = self._verify_candidate(original, candidate, draft, changes)
+        candidate = paths.candidate_path_for(original)
+        ok, problems = self._verify_candidate(reference, built, draft, changes)
         if not ok:
-            keep = candidate.with_suffix(candidate.suffix + ".failed")
-            _rename_or_discard(candidate, keep)
-            return SaveResult.candidate_failed(problems, keep)
+            return SaveResult.candidate_failed(problems, _keep_failed(candidate, built))
+
+        self._report("Writing the edited file")
+        try:
+            wfo.write_verified(candidate, built)
+        except OSError as exc:
+            _discard(candidate)
+            return SaveResult.error(
+                f"The edited package could not be written: {exc!r}", reason="build"
+            )
 
         # Stage L — narrow the race window.
         race = self._race_narrowing(original, draft, candidate)
         if race is not None:
             return race
 
-        # Stage K/M — backup + ReplaceFileW commit.
-        backup = paths.backup_path_for(original)
-        self._report("Creating backup and replacing original")
+        # Stage K/M — atomic commit; the replaced file becomes the backup.
+        backup = paths.backup_path_for(original) if self.auto_backup else None
+        self._report("Creating backup and replacing original" if backup else "Replacing original")
         try:
-            self._commit(original, candidate, backup)
+            candidate_identity = paths.file_identity(candidate)
+            original_identity = paths.file_identity(original)
+        except OSError as exc:
+            _discard(candidate)
+            return SaveResult.error(
+                f"The original add-in file could not be inspected: {exc!r}", reason="build"
+            )
+        try:
+            commit_method = self._commit(original, candidate, backup)
         except wfo.FileOpsError as exc:
             return SaveResult.error(
                 "Windows could not safely replace the file. Your files have been "
@@ -380,21 +408,59 @@ class SaveService:
                 ),
                 details=dict(exc.details),
                 candidate_path=candidate if candidate.exists() else None,
-                backup_path=backup if backup.exists() else None,
+                backup_path=backup if backup is not None and backup.exists() else None,
             )
 
-        # Stage N — post-commit verification: the saved ORIGINAL path compared
-        # against the pre-save BACKUP (XML plan 12.12).
+        # Stage N — post-commit verification (XML plan 12.12).
         self._report("Final verification")
-        ok, problems = self._verify_candidate(backup, original, draft, changes)
-        if not ok:
+        problems = self._verify_commit(
+            original,
+            built,
+            candidate_identity,
+            backup,
+            reference,
+            original_identity,
+        )
+        if problems:
             return SaveResult.recovery_required(backup, problems)
 
-        self._refresh_baseline(draft, original)
-        return SaveResult.success(backup, original)
+        replaced_hash = draft.baseline.file_fingerprint.sha256
+        self._refresh_baseline(draft, original, built)
+        result = SaveResult.success(backup, original)
+        result.details["hash_candidate"] = draft.baseline.file_fingerprint.sha256
+        if backup is not None:
+            result.details["hash_backup"] = replaced_hash
+        if commit_method:
+            result.details["commit_method"] = commit_method
+        return result
 
-    def _refresh_baseline(self, draft: DocumentDraft, original: Path) -> None:
-        new_snapshot = self._open_full_snapshot(original)
+    def _verify_commit(
+        self,
+        committed: Path,
+        committed_bytes: bytes,
+        committed_identity: tuple[int, int, int, int] | None,
+        backup: Path | None,
+        backup_bytes: bytes,
+        backup_identity: tuple[int, int, int, int] | None,
+    ) -> tuple[str, ...]:
+        """The committed path holds the verified candidate; the backup holds the old file.
+
+        Both were moved, not copied, so each is proven by being the same file
+        (volume, file id, size, mtime) as before the commit. A file that is not
+        provably the same one is compared byte for byte instead.
+        """
+        problems: list[str] = []
+        try:
+            if not _holds(committed, committed_bytes, committed_identity):
+                problems.append("The saved file does not match the verified candidate.")
+            if backup is not None and not _holds(backup, backup_bytes, backup_identity):
+                problems.append("The backup does not match the file as it was before the save.")
+        except OSError as exc:
+            problems.append(f"The saved files could not be checked: {exc!r}")
+        return tuple(problems)
+
+    def _refresh_baseline(self, draft: DocumentDraft, original: Path, written: bytes) -> None:
+        new_snapshot = self._snapshot_of_written(original, written)
         refreshed = draft_from_snapshot(new_snapshot)
         draft.baseline = new_snapshot
         draft.modules[:] = refreshed.modules
@@ -509,28 +575,42 @@ class SaveService:
         temp = paths.sibling_temp_path(dest, kind="copy")
         dest_backup = None
         try:
+            try:
+                reference = self._reference_bytes(draft, build_from)
+            except OSError as exc:
+                return SaveResult.error(
+                    f"The copy source could not be read: {exc!r}",
+                    reason="build",
+                    operation_type="save_copy",
+                )
+            if reference is None:
+                return SaveResult.error(
+                    "The copy source no longer matches the captured baseline.",
+                    reason="source_unstable",
+                    operation_type="save_copy",
+                )
             if changes.is_empty:
-                temp.write_bytes(build_from.read_bytes())
-                if paths.sha256_bytes(temp.read_bytes()) != draft.baseline.file_fingerprint.sha256:
-                    _discard(temp)
-                    return SaveResult.error(
-                        "The copy source no longer matches the captured baseline.",
-                        reason="source_unstable",
-                        operation_type="save_copy",
-                    )
+                built = reference
             else:
-                build_error = self._build_candidate(build_from, draft, changes, temp)
-                if build_error is not None:
-                    build_error.operation_type = "save_copy"
-                    return build_error
-                ok, problems = self._verify_candidate(build_from, temp, draft, changes)
+                built = self._build_candidate(reference, draft, changes)
+                if isinstance(built, SaveResult):
+                    built.operation_type = "save_copy"
+                    return built
+                ok, problems = self._verify_candidate(reference, built, draft, changes)
                 if not ok:
-                    keep = temp.with_suffix(temp.suffix + ".failed")
-                    _rename_or_discard(temp, keep)
-                    result = SaveResult.candidate_failed(problems, keep)
+                    result = SaveResult.candidate_failed(problems, _keep_failed(temp, built))
                     result.operation_type = "save_copy"
                     return result
-            committed_hash = paths.sha256_bytes(temp.read_bytes())
+            try:
+                wfo.write_verified(temp, built)
+            except OSError as exc:
+                return SaveResult.error(
+                    f"The copy could not be written: {exc!r}",
+                    reason="build",
+                    operation_type="save_copy",
+                )
+            committed_hash = paths.sha256_bytes(built)
+            temp_identity = paths.file_identity(temp)
             if dest_exists:
                 dest_backup = paths.backup_path_for(dest, label="copy-backup")
                 try:
@@ -572,7 +652,7 @@ class SaveService:
                         candidate_path=temp if temp.exists() else None,
                         operation_type="save_copy",
                     )
-            if paths.sha256_bytes(dest.read_bytes()) != committed_hash:
+            if not _holds(dest, built, temp_identity):
                 return SaveResult.recovery_required(
                     dest_backup,
                     ("Committed copy does not match the verified candidate hash.",),
@@ -583,15 +663,26 @@ class SaveService:
         result.details["hash_candidate"] = committed_hash
         return result
 
+
+def _holds(path: Path, data: bytes, identity: tuple[int, int, int, int] | None) -> bool:
+    """True when ``path`` is the file known to hold ``data``, or reads back as it."""
+    if identity is not None and paths.file_identity(path) == identity:
+        return True
+    return path.read_bytes() == data
+
+
+def _keep_failed(candidate: Path, data: bytes) -> Path | None:
+    """Keep a candidate that failed verification beside the original for diagnosis."""
+    keep = candidate.with_suffix(candidate.suffix + ".failed")
+    try:
+        keep.write_bytes(data)
+    except OSError:
+        return None
+    return keep
+
+
 def _discard(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
     except OSError:
         pass
-
-
-def _rename_or_discard(path: Path, dest: Path) -> None:
-    try:
-        path.replace(dest)
-    except OSError:
-        _discard(path)

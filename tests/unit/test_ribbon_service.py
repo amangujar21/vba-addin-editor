@@ -150,3 +150,37 @@ def test_ribbon_check_skips_module_parsing_without_ribbon(work_xlam: Path, monke
     )
     assert rs.ribbon_entries(draft) == []
     assert rs.new_issues(draft) == []
+
+
+def test_build_menu_xml_indents_children_and_escapes():
+    xml = rs.build_menu_xml(
+        control_id="mnuA",
+        label='A "quoted" & more',
+        image_mso="Copy",
+        size="large",
+        item_size="large",
+        screentip="Tip",
+        children=['<button id="b1" label="One" onAction="One" />'],
+        indent="\t\t",
+        unit="\t",
+    )
+    assert xml.split("\n") == [
+        (
+            '<menu id="mnuA" label="A &quot;quoted&quot; &amp; more" size="large" '
+            'itemSize="large" imageMso="Copy" screentip="Tip">'
+        ),
+        '\t\t\t<button id="b1" label="One" onAction="One" />',
+        "\t\t</menu>",
+    ]
+
+
+def test_innermost_container_and_menu_ids():
+    containers = rs.find_containers(RIBBON, "customUI/customUI14.xml")
+    inside_menu = RIBBON.index('id="tglX"')
+    assert rs.innermost_container(containers, "customUI/customUI14.xml", inside_menu).control_id == "mnuMore"
+    in_group = RIBBON.index('id="btnHello"')
+    assert rs.innermost_container(containers, "customUI/customUI14.xml", in_group).control_id == "grpMain"
+    assert rs.innermost_container(containers, "other.xml", in_group) is None
+    assert rs.innermost_container(containers, "customUI/customUI14.xml", 0) is None
+    assert rs.unique_control_id({"mnuMore"}, "More", "mnu") == "mnuMore2"
+    assert rs.unique_control_id(set(), "", "mnu") == "mnuMenu"

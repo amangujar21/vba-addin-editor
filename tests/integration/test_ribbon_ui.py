@@ -147,3 +147,74 @@ def test_ribbon_buttons_dialog_lists_problems(window):
     dialog.goto_macro()
     assert window.draft.module_by_id(window.current_module_id).current_name == "Module1"
 
+
+
+def test_add_menu_with_macros_is_one_undo_step_and_saves(window):
+    from vba_addin_editor.ui.ribbon_dialogs import MenuSpec
+
+    m1 = window.draft.find_current("Module1")
+    m1.body += (
+        "\nPublic Sub ExportReport(control As IRibbonControl)\nEnd Sub\n"
+        "\nPublic Sub ClearReport(control As IRibbonControl)\nEnd Sub\n"
+        "\nPublic Sub NotACallback()\nEnd Sub\n"
+    )
+    ready = rs.ribbon_ready_procedures(window.draft)
+    assert [p.name for p in ready] == ["ExportReport", "ClearReport"]
+    part = window.draft.xml_part_by_path(PART)
+    before = part.text
+    group = next(c for c in rs.find_containers(part.text, PART) if c.control_id == "grpMain")
+    spec = MenuSpec(group, "mnuReports", "Reports & More", "", "large", "", "", tuple(ready))
+    window.apply_ribbon_menu(spec)
+    window.root.update()
+
+    assert (
+        '          <menu id="mnuReports" label="Reports &amp; More" size="large">\n'
+        '            <button id="btnExportReport" label="Export Report" onAction="ExportReport" />\n'
+        '            <button id="btnClearReport" label="Clear Report" onAction="ClearReport" />\n'
+        "          </menu>\n"
+        "        </group>"
+    ) in part.text
+    assert window.xml_editor.text.get("sel.first", "sel.last").startswith('<menu id="mnuReports"')
+    assert rs.new_issues(window.draft) == []
+    # The new menu is itself somewhere buttons and further menus can go.
+    assert "mnuReports" in {c.control_id for c in rs.find_containers(part.text, PART)}
+
+    window.undo()
+    assert part.text == before
+    window.redo()
+    result = make_service().save_addin(window.draft)
+    assert result.kind == "success", result
+    with zipfile.ZipFile(window.draft.baseline.path) as package:
+        assert 'id="mnuReports"' in package.read(PART).decode("utf-8")
+
+
+def test_add_menu_dialog_defaults_to_the_container_under_the_cursor(window, monkeypatch):
+    from vba_addin_editor.ui import ribbon_dialogs
+
+    seen = {}
+
+    def fake_wait(self):
+        seen["container"] = self._selected_container().control_id
+        seen["id"] = self.id_var.get()
+        self.label_var.set("Tools")
+        seen["id_after_label"] = self.id_var.get()
+        self.id_var.set("mnuMore")
+        seen["duplicate"] = self.validate()
+        self.id_var.set("mnuTools")
+        self.confirm()
+        return self.result
+
+    monkeypatch.setattr(ribbon_dialogs.AddMenuDialog, "wait", fake_wait)
+    _cursor_on(window, 'id="tglX"')  # inside the existing "More" menu
+    window.add_ribbon_menu()
+    window.root.update()
+    assert seen["container"] == "mnuMore"
+    assert (seen["id"], seen["id_after_label"]) == ("mnuMenu", "mnuTools")
+    assert "already exists" in seen["duplicate"]
+    text = window.draft.xml_part_by_path(PART).text
+    # Nested in a menu: no size attribute, and an empty menu is closed on its own line.
+    assert (
+        '            <menu id="mnuTools" label="Tools">\n'
+        "            </menu>\n"
+        "          </menu>"
+    ) in text

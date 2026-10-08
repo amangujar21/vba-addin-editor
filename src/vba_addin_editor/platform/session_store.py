@@ -99,17 +99,36 @@ def is_owned(directory: Path) -> bool:
     return False
 
 
-def copy_file_atomic(src: Path, dest: Path) -> None:
-    """Copy bytes to a sibling temp, fsync, then atomically replace dest."""
+def write_bytes_atomic(dest: Path, data: bytes) -> None:
+    """Write bytes to a sibling temp, fsync, verify, then atomically replace dest.
+
+    The check reads back through the writing handle: reopening a freshly
+    written macro package makes antivirus scan it first, which takes seconds.
+    """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".tmp")
-    data = Path(src).read_bytes()
-    with open(tmp, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, dest)
+    try:
+        with open(tmp, "w+b") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.seek(0)
+            written = handle.read()
+        if written != data:
+            raise SessionStoreError(f"{dest.name} did not read back as written.")
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def copy_file_atomic(src: Path, dest: Path) -> None:
+    """Copy bytes to a sibling temp, fsync, then atomically replace dest."""
+    write_bytes_atomic(dest, Path(src).read_bytes())
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:

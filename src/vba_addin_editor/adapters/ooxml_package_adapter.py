@@ -8,6 +8,7 @@ services never touch ZIP entries directly.
 from __future__ import annotations
 
 import hashlib
+import io
 import zipfile
 from pathlib import Path
 
@@ -54,7 +55,17 @@ def _is_editable_xml_part(name: str) -> bool:
     return lowered.endswith(tuple(XML_PART_SUFFIXES))
 
 
-def _check_duplicates(zf: zipfile.ZipFile, path: Path) -> None:
+PackageSource = Path | bytes
+
+
+def open_package(source: PackageSource) -> zipfile.ZipFile:
+    """Open a package from a path or from bytes already in memory."""
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        return zipfile.ZipFile(io.BytesIO(source))
+    return zipfile.ZipFile(Path(source))
+
+
+def _check_duplicates(zf: zipfile.ZipFile, path: object = None) -> None:
     names = zf.namelist()
     if len(names) != len(set(names)):
         seen: set[str] = set()
@@ -69,12 +80,11 @@ class OoxmlPackageAdapter:
     """Standard-library-only OOXML package operations for supported Office files."""
     # -- discovery ---------------------------------------------------------
 
-    def snapshot_xml_parts(self, path: Path) -> tuple[XmlPartSnapshot, ...]:
-        path = Path(path)
+    def snapshot_xml_parts(self, source: PackageSource) -> tuple[XmlPartSnapshot, ...]:
         parts: list[XmlPartSnapshot] = []
         total = 0
-        with zipfile.ZipFile(path) as zf:
-            _check_duplicates(zf, path)
+        with open_package(source) as zf:
+            _check_duplicates(zf)
             entries = [i for i in zf.infolist() if not i.is_dir()]
             if len(entries) > MAX_XML_PART_COUNT:
                 raise PackageError(
@@ -122,11 +132,10 @@ class OoxmlPackageAdapter:
 
     # -- signature inspection ------------------------------------------------
 
-    def inspect_package_signature(self, path: Path) -> PackageSafetyInfo:
+    def inspect_package_signature(self, source: PackageSource) -> PackageSafetyInfo:
         """Detect OPC/package-level digital signatures (plan 9.5)."""
-        path = Path(path)
         names: list[str] = []
-        with zipfile.ZipFile(path) as zf:
+        with open_package(source) as zf:
             for info in zf.infolist():
                 if info.is_dir():
                     continue
@@ -160,40 +169,56 @@ class OoxmlPackageAdapter:
 
         return validate_xml_draft(part)
 
+    def build_package(
+        self, source: PackageSource, replacements: dict[str, bytes | None]
+    ) -> bytes:
+        """The package with the given members replaced (None drops one), in memory.
+
+        Every other entry keeps its bytes and ZIP metadata.
+        """
+        if not replacements:
+            raise PackageError("No package members to replace.")
+        out = io.BytesIO()
+        with open_package(source) as src:
+            _check_duplicates(src)
+            missing = sorted(set(replacements) - set(src.namelist()))
+            if missing:
+                raise PackageError(f"Package members missing from the file: {missing}")
+            with zipfile.ZipFile(out, "w") as dst:
+                if src.comment:
+                    dst.comment = src.comment
+                for info in src.infolist():
+                    if info.filename in replacements:
+                        data = replacements[info.filename]
+                        if data is None:
+                            continue
+                    else:
+                        data = src.read(info.filename)
+                    new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                    new_info.compress_type = info.compress_type
+                    new_info.comment = info.comment
+                    new_info.extra = info.extra
+                    new_info.internal_attr = info.internal_attr
+                    new_info.external_attr = info.external_attr
+                    new_info.create_system = info.create_system
+                    new_info.create_version = info.create_version
+                    dst.writestr(new_info, data)
+        built = out.getvalue()
+        with open_package(built) as check:
+            bad = check.testzip()
+            if bad is not None:
+                raise PackageError(
+                    f"The edited package failed its integrity check at entry {bad!r}."
+                )
+        return built
+
     def replace_members(self, path: Path, replacements: dict[str, bytes]) -> None:
         """Rewrite selected ZIP members in place, preserving other entries and metadata."""
         path = Path(path)
-        if not replacements:
-            raise PackageError("No package members to replace.")
+        built = self.build_package(path, dict(replacements))
         temp = path.with_name(path.stem + ".vbaae-member" + path.suffix)
         try:
-            with zipfile.ZipFile(path) as src:
-                _check_duplicates(src, path)
-                missing = sorted(set(replacements) - set(src.namelist()))
-                if missing:
-                    raise PackageError(f"Package members missing from the file: {missing}")
-                with zipfile.ZipFile(temp, "w") as dst:
-                    if src.comment:
-                        dst.comment = src.comment
-                    for info in src.infolist():
-                        data = replacements.get(info.filename)
-                        if data is None:
-                            data = src.read(info.filename)
-                        new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
-                        new_info.compress_type = info.compress_type
-                        new_info.comment = info.comment
-                        new_info.extra = info.extra
-                        new_info.internal_attr = info.internal_attr
-                        new_info.external_attr = info.external_attr
-                        new_info.create_system = info.create_system
-                        new_info.create_version = info.create_version
-                        dst.writestr(new_info, data)
-            with zipfile.ZipFile(temp) as check:
-                bad = check.testzip()
-                if bad is not None:
-                    raise PackageError(
-                        f"The edited package failed its integrity check at entry {bad!r}."
-                    )
+            temp.write_bytes(built)
             temp.replace(path)
         except Exception:
             if temp.exists():
@@ -205,19 +230,11 @@ class OoxmlPackageAdapter:
 
     # -- candidate rewrite (plan 9.6, 12.8) -----------------------------------
 
-    def write_xml_candidate(
-        self,
-        source_path: Path,
-        dest_path: Path,
-        changed_parts: list,
-    ) -> None:
-        """Rebuild the package into dest_path with exactly the given XML parts replaced."""
-        source_path = Path(source_path)
-        dest_path = Path(dest_path)
-        changes = {p.path: p for p in changed_parts}
-        if not changes:
+    def xml_replacements(self, changed_parts: list) -> dict[str, bytes]:
+        """Encoded bytes of every changed XML part, validated as they will be written."""
+        if not changed_parts:
             raise PackageError("No XML changes to write.")
-
+        replacements: dict[str, bytes] = {}
         # Validate all changed parts first (plan 12.7): no candidate on failure.
         for part in changed_parts:
             raw = encode_xml(
@@ -228,49 +245,29 @@ class OoxmlPackageAdapter:
                 raise PackageError(
                     "The edited XML could not be validated: " + "; ".join(problems)
                 )
+            replacements[part.path] = raw
+        return replacements
 
-        replacement_bytes: dict[str, bytes] = {}
-        with zipfile.ZipFile(source_path) as src:
-            _check_duplicates(src, source_path)
-            src_names = set(src.namelist())
-            missing = sorted(set(changes) - src_names)
-            if missing:
-                raise PackageError(
-                    f"Changed XML parts missing from the package: {missing}"
-                )
-            for name, part in changes.items():
-                replacement_bytes[name] = encode_xml(
-                    part.text, encoding=part.encoding, bom=part.bom, newline=part.newline
-                )
-            with zipfile.ZipFile(dest_path, "w") as dst:
-                for info in src.infolist():
-                    data = replacement_bytes.get(info.filename)
-                    if data is None:
-                        data = src.read(info.filename)
-                    new_info = zipfile.ZipInfo(info.filename, date_time=info.date_time)
-                    new_info.compress_type = info.compress_type
-                    new_info.comment = info.comment
-                    new_info.extra = info.extra
-                    new_info.internal_attr = info.internal_attr
-                    new_info.external_attr = info.external_attr
-                    new_info.create_system = info.create_system
-                    new_info.create_version = info.create_version
-                    dst.writestr(new_info, data)
-                if src.comment:
-                    dst.comment = src.comment
-        with zipfile.ZipFile(dest_path) as check:
-            bad = check.testzip()
-            if bad is not None:
-                raise PackageError(
-                    f"The edited package failed its integrity check at entry {bad!r}."
-                )
+    def write_xml_candidate(
+        self,
+        source_path: Path,
+        dest_path: Path,
+        changed_parts: list,
+    ) -> None:
+        """Rebuild the package into dest_path with exactly the given XML parts replaced."""
+        replacements = self.xml_replacements(changed_parts)
+        with open_package(source_path) as src:
+            missing = sorted(set(replacements) - set(src.namelist()))
+        if missing:
+            raise PackageError(f"Changed XML parts missing from the package: {missing}")
+        Path(dest_path).write_bytes(self.build_package(source_path, dict(replacements)))
 
     # -- candidate verification (plan 13) --------------------------------------
 
     def verify_candidate_xml(
         self,
-        reference_path: Path,
-        candidate_path: Path,
+        reference_path: PackageSource,
+        candidate_path: PackageSource,
         draft: DocumentDraft,
         signature_edits: dict[str, bytes | None] | None = None,
     ) -> CandidateVerificationResult:
@@ -280,11 +277,9 @@ class OoxmlPackageAdapter:
         signature_edits = signature_edits or {}
         removed = {path for path, data in signature_edits.items() if data is None}
         try:
-            with zipfile.ZipFile(reference_path) as ref, zipfile.ZipFile(
-                candidate_path
-            ) as cand:
-                _check_duplicates(ref, Path(reference_path))
-                _check_duplicates(cand, Path(candidate_path))
+            with open_package(reference_path) as ref, open_package(candidate_path) as cand:
+                _check_duplicates(ref)
+                _check_duplicates(cand)
                 if cand.testzip() is not None:
                     problems.append("Candidate ZIP has a corrupt entry.")
                 ref_names = set(ref.namelist()) - removed

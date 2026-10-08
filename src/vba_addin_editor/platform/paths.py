@@ -17,8 +17,8 @@ class UnstableSourceError(OSError):
     """The file's bytes changed while they were being read."""
 
 
-def fingerprint(path: Path, *, retries: int = _FINGERPRINT_RETRIES) -> FileFingerprint:
-    """Hash file contents. Size/mtime never skip the hash.
+def read_stable(path: Path, *, retries: int = _FINGERPRINT_RETRIES) -> tuple[bytes, FileFingerprint]:
+    """Read a file's bytes together with their fingerprint.
 
     Reads twice per attempt so a change during the read is detected. A bounded
     retry covers brief writers; remaining instability raises UnstableSourceError.
@@ -38,15 +38,49 @@ def fingerprint(path: Path, *, retries: int = _FINGERPRINT_RETRIES) -> FileFinge
         if hashlib.sha256(again).hexdigest() != digest or len(again) != size:
             last_reason = "content changed during read"
             continue
-        return FileFingerprint(sha256=digest, size=size, mtime_ns=stat.st_mtime_ns)
+        return data, FileFingerprint(sha256=digest, size=size, mtime_ns=stat.st_mtime_ns)
     raise UnstableSourceError(
         f"The file changed while it was being read ({last_reason})."
+    )
+
+
+def fingerprint(path: Path, *, retries: int = _FINGERPRINT_RETRIES) -> FileFingerprint:
+    """Hash file contents. Size/mtime never skip the hash (see fingerprint_status
+    for the one exception: a file this process wrote and has not seen change)."""
+    return read_stable(path, retries=retries)[1]
+
+
+def file_identity(path: Path) -> tuple[int, int, int, int] | None:
+    """(volume, file id, size, mtime_ns) without opening the file for data.
+
+    Reading a package this process just wrote makes antivirus scan it
+    synchronously (seconds for a large VBA project); a stat does not.
+    None when the filesystem reports no file id.
+    """
+    stat = Path(path).stat()
+    if not stat.st_ino:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def written_fingerprint(data: bytes, path: Path) -> FileFingerprint:
+    """Fingerprint of bytes this process wrote to ``path`` and read back intact."""
+    path = Path(path)
+    return FileFingerprint(
+        sha256=hashlib.sha256(data).hexdigest(),
+        size=len(data),
+        mtime_ns=path.stat().st_mtime_ns,
+        written_identity=file_identity(path),
     )
 
 
 def fingerprint_status(path: Path, fp: FileFingerprint) -> str:
     """Return match | external_change | source_missing | source_unstable | access_denied."""
     try:
+        if fp.written_identity is not None and file_identity(path) == fp.written_identity:
+            # Still the very file this process wrote: same file id, size and
+            # mtime. Hashing it again would only buy an antivirus scan.
+            return "match"
         current = fingerprint(path)
     except FileNotFoundError:
         return "source_missing"

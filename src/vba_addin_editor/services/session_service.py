@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from pathlib import Path
 
 from vba_addin_editor.adapters.ooxml_package_adapter import (
-    XML_EDITABLE_EXTENSIONS,
     OoxmlPackageAdapter,
 )
 from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError, PyOpenVBAAdapter
@@ -17,12 +15,13 @@ from vba_addin_editor.domain.session import DocumentSession, ProposalBinding, ne
 from vba_addin_editor.platform import paths
 from vba_addin_editor.platform.session_store import (
     SessionLock,
+    SessionStoreError,
     acquire_lock,
     baseline_package_path,
-    copy_file_atomic,
     create_session_dir,
     read_json,
     session_dir_for,
+    write_bytes_atomic,
     write_json_atomic,
 )
 from vba_addin_editor.services.document_service import DocumentService
@@ -94,12 +93,12 @@ class SessionService:
         lock = acquire_lock(directory)
         self._locks[session_id] = lock
         captured = baseline_package_path(directory, path.suffix.lower())
-        copy_file_atomic(path, captured)
-        captured_fp = paths.fingerprint(captured)
-        original_fp = paths.fingerprint(path)
-        if not captured_fp.content_equal(original_fp):
-            raise paths.UnstableSourceError("Captured bytes do not match the original file.")
-        snapshot = self._snapshot_from_captured(captured, captured_fp, path)
+        # One stable read serves the fingerprint, the captured copy and the
+        # parse. The captured copy is verified as it is written, never reopened.
+        data, original_fp = paths.read_stable(path)
+        write_bytes_atomic(captured, data)
+        captured_fp = replace(original_fp, mtime_ns=captured.stat().st_mtime_ns)
+        snapshot = self._snapshot_from_captured(data, captured_fp, path)
         draft = draft_from_snapshot(snapshot)
         self._write_session_meta(
             directory,
@@ -137,8 +136,8 @@ class SessionService:
         lock = acquire_lock(directory)
         self._locks[session_id] = lock
         captured = baseline_package_path(directory, extension)
-        captured_fp = paths.fingerprint(captured)
-        snapshot = self._snapshot_from_captured(captured, captured_fp, Path(source_path))
+        data, captured_fp = paths.read_stable(captured)
+        snapshot = self._snapshot_from_captured(data, captured_fp, Path(source_path))
         draft = draft_from_snapshot(snapshot)
         return DocumentSession(
             session_id=session_id,
@@ -151,13 +150,12 @@ class SessionService:
             baseline_generation=baseline_generation,
         )
 
-    def _snapshot_from_captured(self, captured, captured_fp, user_path):
-        snapshot = self.adapter.open_snapshot(captured, captured_fp, host_process_running=False)
-        snapshot = replace(snapshot, path=Path(user_path), file_fingerprint=captured_fp)
-        if Path(user_path).suffix.lower() in XML_EDITABLE_EXTENSIONS or captured.suffix.lower() in XML_EDITABLE_EXTENSIONS:
-            snapshot = self.document_service._with_package_state(captured, snapshot)
-            snapshot = replace(snapshot, path=Path(user_path), file_fingerprint=captured_fp)
-        return snapshot
+    def _snapshot_from_captured(self, data: bytes, captured_fp, user_path):
+        """Snapshot of the captured baseline bytes, addressed by the user's path."""
+        snapshot = self.adapter.open_snapshot(
+            Path(user_path), captured_fp, host_process_running=False, data=data
+        )
+        return self.document_service._with_package_state(data, snapshot)
 
     def close(self, session: DocumentSession) -> None:
         lock = self._locks.pop(session.session_id, None)
@@ -181,8 +179,12 @@ class SessionService:
         self,
         session: DocumentSession,
         source_path: Path,
+        data: bytes | None = None,
     ) -> SaveResult | None:
         """Atomically replace the captured package from a verified source of truth.
+
+        ``data`` is the committed file's bytes when the caller already holds
+        them (the save pipeline does); otherwise the committed file is read.
 
         On failure after the add-in was already committed, return a structured
         error that names the committed file and session artifacts. Never describe
@@ -196,37 +198,29 @@ class SessionService:
             "Do not treat the original as unchanged. Use the committed path and "
             "session recovery artifacts below."
         )
-        tmp = captured.with_name(captured.stem + ".pubtmp" + captured.suffix)
         try:
             try:
-                source_fp = paths.fingerprint(committed)
+                if data is None:
+                    data, source_fp = paths.read_stable(committed)
+                else:
+                    source_fp = paths.written_fingerprint(data, committed)
             except OSError as exc:
                 return _publication_failure(
                     fail_msg, committed=committed, captured=captured,
                     session_dir=session.session_dir, exc=exc,
                 )
-            data = committed.read_bytes()
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            # Read back through the writing handle: reopening a freshly written
-            # macro package makes Defender scan it synchronously (seconds per
-            # save). The scan is deferred to the next real reader instead.
-            with open(tmp, "w+b") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-                handle.seek(0)
-                written = handle.read()
-            tmp_digest = paths.sha256_bytes(written)
-            if tmp_digest != source_fp.sha256 or tmp.stat().st_size != source_fp.size:
-                tmp.unlink(missing_ok=True)
+            try:
+                write_bytes_atomic(captured, data)
+            except SessionStoreError:
                 return _publication_failure(
                     fail_msg, committed=committed, captured=captured,
                     session_dir=session.session_dir,
                     extra={"reason": "temp_copy_mismatch"},
                 )
-            os.replace(tmp, captured)
             stat = captured.stat()
-            captured_fp = replace(source_fp, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+            captured_fp = replace(
+                source_fp, size=stat.st_size, mtime_ns=stat.st_mtime_ns, written_identity=None
+            )
             if not captured_fp.content_equal(source_fp):
                 return _publication_failure(
                     fail_msg, committed=committed, captured=captured,
@@ -249,12 +243,6 @@ class SessionService:
                 fail_msg, committed=committed, captured=captured,
                 session_dir=session.session_dir, exc=exc,
             )
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
 
         session.captured_path = captured
         session.captured_fingerprint = captured_fp

@@ -203,6 +203,197 @@ class AddButtonDialog:
         return self.result
 
 
+@dataclass(frozen=True)
+class MenuSpec:
+    container: rs.RibbonContainer
+    control_id: str
+    label: str
+    image_mso: str
+    size: str
+    item_size: str
+    screentip: str
+    macros: tuple[rs.ProcedureLocation, ...]  # one menu item per macro, in this order
+
+
+class AddMenuDialog:
+    """Form for a new ribbon menu, optionally filled with buttons for existing macros."""
+
+    def __init__(
+        self,
+        root,
+        *,
+        containers: list[rs.RibbonContainer],
+        existing_ids: set[str],
+        image_suggestions: list[str],
+        macros: list[rs.ProcedureLocation],
+        show_part: bool,
+        initial_container: int = 0,
+    ) -> None:
+        self.root = root
+        self.containers = containers
+        self.macros = macros
+        self._taken = set(existing_ids)
+        self.existing_ids = {item.casefold() for item in existing_ids}
+        self.result: MenuSpec | None = None
+        win = self.win = tk.Toplevel(root)
+        win.title("Add Ribbon Menu")
+        win.transient(root)
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(frame, text="Label:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        self.label_var = tk.StringVar(value="Menu")
+        self.label_entry = ttk.Entry(frame, textvariable=self.label_var, width=50)
+        self.label_entry.grid(row=row, column=1, sticky="ew", padx=4)
+
+        row += 1
+        ttk.Label(frame, text="Put it in:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        names = [
+            (f"{c.display}   [{c.part_path.rsplit('/', 1)[-1]}]" if show_part else c.display)
+            + ("" if c.element == "group" else f"   ({c.element})")
+            for c in containers
+        ]
+        self.container_box = ttk.Combobox(frame, values=names, state="readonly", width=60)
+        self.container_box.grid(row=row, column=1, sticky="ew", padx=4)
+        if names:
+            self.container_box.current(min(max(initial_container, 0), len(names) - 1))
+        self.container_box.bind("<<ComboboxSelected>>", lambda _e: self._sync_size())
+
+        row += 1
+        ttk.Label(frame, text="Icon (imageMso):").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        self.image_var = tk.StringVar()
+        ttk.Combobox(frame, textvariable=self.image_var, values=image_suggestions, width=40).grid(
+            row=row, column=1, sticky="w", padx=4
+        )
+
+        row += 1
+        ttk.Label(frame, text="Size:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        sizes = ttk.Frame(frame)
+        sizes.grid(row=row, column=1, sticky="w", padx=4)
+        self.size_var = tk.StringVar(value="large")
+        self.size_box = ttk.Combobox(
+            sizes, textvariable=self.size_var, values=["large", "normal"], state="readonly", width=10
+        )
+        self.size_box.pack(side="left")
+        ttk.Label(sizes, text="   Items:").pack(side="left")
+        self.item_size_var = tk.StringVar(value="normal")
+        ttk.Combobox(
+            sizes,
+            textvariable=self.item_size_var,
+            values=["normal", "large"],
+            state="readonly",
+            width=10,
+        ).pack(side="left", padx=4)
+
+        row += 1
+        ttk.Label(frame, text="Screentip:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        self.screentip_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.screentip_var).grid(row=row, column=1, sticky="ew", padx=4)
+
+        row += 1
+        ttk.Label(frame, text="Control id:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        self.id_var = tk.StringVar(value=rs.unique_control_id(self._taken, "Menu", "mnu"))
+        self._auto_id = self.id_var.get()
+        ttk.Entry(frame, textvariable=self.id_var, width=40).grid(row=row, column=1, sticky="w", padx=4)
+        self.label_var.trace_add("write", lambda *_a: self._sync_id())
+
+        row += 1
+        ttk.Label(frame, text="Menu items:").grid(row=row, column=0, sticky="ne", padx=4, pady=3)
+        items = ttk.Frame(frame)
+        items.grid(row=row, column=1, sticky="nsew", padx=4, pady=3)
+        frame.rowconfigure(row, weight=1)
+        self.macro_list = tk.Listbox(
+            items, selectmode="extended", height=min(max(len(macros), 3), 10), exportselection=False
+        )
+        sb = ttk.Scrollbar(items, orient="vertical", command=self.macro_list.yview)
+        self.macro_list.configure(yscrollcommand=sb.set)
+        self.macro_list.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for macro in macros:
+            self.macro_list.insert("end", f"{macro.name}   ({macro.module_name})")
+        row += 1
+        ttk.Label(
+            frame,
+            text=(
+                "Optional: select the macros to add as buttons in the menu (Ctrl+click for "
+                "several). Listed are Subs in standard modules that take control As "
+                "IRibbonControl. More buttons can be added later with Add Ribbon Button."
+                if macros
+                else "No Sub with a (control As IRibbonControl) argument exists yet, so the "
+                "menu starts empty. Add buttons to it with Add Ribbon Button."
+            ),
+            foreground="#555",
+            wraplength=460,
+            justify="left",
+        ).grid(row=row, column=1, sticky="w", padx=4)
+
+        row += 1
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=4)
+        ttk.Button(buttons, text="Add Menu", command=self.confirm).pack(side="right")
+        win.bind("<Return>", lambda _e: self.confirm())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self._sync_size()
+        self.label_entry.focus_set()
+        self.label_entry.select_range(0, "end")
+
+    def _selected_container(self) -> rs.RibbonContainer | None:
+        index = self.container_box.current()
+        return self.containers[index] if 0 <= index < len(self.containers) else None
+
+    def _sync_size(self) -> None:
+        # As for buttons: only a control directly in a group accepts size.
+        container = self._selected_container()
+        in_group = container is not None and container.element == "group"
+        self.size_box.config(state="readonly" if in_group else "disabled")
+
+    def _sync_id(self) -> None:
+        # Follow the label until the user types an id of their own.
+        if self.id_var.get() != self._auto_id:
+            return
+        self._auto_id = rs.unique_control_id(self._taken, self.label_var.get() or "Menu", "mnu")
+        self.id_var.set(self._auto_id)
+
+    def validate(self) -> str | None:
+        if not self.label_var.get().strip():
+            return "Enter a label for the menu."
+        if self._selected_container() is None:
+            return "Choose where to put the menu."
+        control_id = self.id_var.get().strip()
+        if not _ID_RE.match(control_id):
+            return "Control id must start with a letter or underscore and use letters, digits, _ . -"
+        if control_id.casefold() in self.existing_ids:
+            return f'A control with id "{control_id}" already exists.'
+        return None
+
+    def confirm(self) -> None:
+        problem = self.validate()
+        if problem:
+            messagebox.showerror(APP_NAME, problem, parent=self.win)
+            return
+        container = self._selected_container()
+        assert container is not None
+        self.result = MenuSpec(
+            container=container,
+            control_id=self.id_var.get().strip(),
+            label=self.label_var.get().strip(),
+            image_mso=self.image_var.get().strip(),
+            size=self.size_var.get() if container.element == "group" else "",
+            item_size="large" if self.item_size_var.get() == "large" else "",
+            screentip=self.screentip_var.get().strip(),
+            macros=tuple(self.macros[int(i)] for i in self.macro_list.curselection()),
+        )
+        self.win.destroy()
+
+    def wait(self) -> MenuSpec | None:
+        self.win.grab_set()
+        self.root.wait_window(self.win)
+        return self.result
+
+
 class RibbonButtonsDialog:
     """Non-modal list of every ribbon callback with its resolved macro."""
 

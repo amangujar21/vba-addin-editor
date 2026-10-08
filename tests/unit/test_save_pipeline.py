@@ -418,7 +418,7 @@ def test_pptm_package_rewrite_failure_leaves_original(work_pptm):
         def validate_draft_part(self, part):
             return ()
 
-        def write_xml_candidate(self, *a, **k):
+        def xml_replacements(self, *a, **k):
             raise OSError("disk exploded")
 
     svc = make_service()
@@ -483,20 +483,82 @@ def test_pptm_post_commit_xml_verification_failure_triggers_recovery(work_pptm):
     draft = DocumentService().open(work_pptm)
     _edit_core_xml(draft)
 
-    calls = {"n": 0}
-    real_verify = SaveService._verify_candidate
-
-    def flaky(self, reference, candidate, d, changes):
-        calls["n"] += 1
-        if calls["n"] == 2:  # post-commit check
-            return False, ("injected post-commit XML mismatch",)
-        return real_verify(self, reference, candidate, d, changes)
-
     svc = make_service()
-    svc._verify_candidate = flaky.__get__(svc)  # type: ignore[method-assign]
+    svc._verify_commit = lambda *a, **k: ("injected post-commit XML mismatch",)  # type: ignore[method-assign]
     result = svc.save_addin(draft)
     assert result.kind == "recovery_required"
     assert result.backup_path.exists()
+
+
+def test_commit_that_copies_instead_of_moving_is_verified_by_content(work_xlam):
+    """A commit that leaves a different file at the path is caught by reading it back."""
+    import shutil
+
+    def copying_commit(replaced, replacement, backup):
+        shutil.copyfile(replaced, backup)
+        shutil.copyfile(replacement, replaced)
+        replacement.unlink()
+
+    draft = DocumentService().open(work_xlam)
+    edit_module1(draft)
+    assert make_service(commit=copying_commit).save_addin(draft).kind == "success"
+
+    def corrupting_commit(replaced, replacement, backup):
+        copying_commit(replaced, replacement, backup)
+        replaced.write_bytes(replaced.read_bytes() + b"\x00")
+
+    m1 = next(m for m in draft.modules if m.current_name == "Module1")
+    m1.body = m1.body.replace("V2", "V3")
+    result = make_service(commit=corrupting_commit).save_addin(draft)
+    assert result.kind == "recovery_required"
+    assert "does not match the verified candidate" in result.problems[0]
+
+
+def test_save_without_auto_backup_leaves_no_backup_file(work_xlam):
+    draft = DocumentService().open(work_xlam)
+    edit_module1(draft)
+    result = make_service(auto_backup=False).save_addin(draft)
+    assert result.kind == "success", result
+    assert result.backup_path is None
+    assert [p.name for p in work_xlam.parent.iterdir()] == [work_xlam.name]
+    reopened = DocumentService().open(work_xlam)
+    assert "V2" in next(m for m in reopened.modules if m.current_name == "Module1").body
+
+
+def test_second_save_does_not_reread_the_file_it_wrote(work_xlam, monkeypatch):
+    """Re-reading a just-written package costs an antivirus scan; a stat proves it unchanged."""
+    draft = DocumentService().open(work_xlam)
+    edit_module1(draft)
+    assert make_service().save_addin(draft).kind == "success"
+    assert draft.baseline.file_fingerprint.written_identity is not None
+
+    reads: list[str] = []
+    real_read = type(work_xlam).read_bytes
+
+    def tracking_read(self):
+        reads.append(self.name)
+        return real_read(self)
+
+    monkeypatch.setattr(type(work_xlam), "read_bytes", tracking_read)
+    m1 = next(m for m in draft.modules if m.current_name == "Module1")
+    m1.body = m1.body.replace("V2", "V3")
+    assert make_service().save_addin(draft).kind == "success"
+    assert reads == []
+    monkeypatch.undo()
+    assert "V3" in next(
+        m for m in DocumentService().open(work_xlam).modules if m.current_name == "Module1"
+    ).body
+
+
+def test_external_change_after_own_save_is_still_detected(work_xlam):
+    draft = DocumentService().open(work_xlam)
+    edit_module1(draft)
+    assert make_service().save_addin(draft).kind == "success"
+    work_xlam.write_bytes(work_xlam.read_bytes() + b"\x00")
+    m1 = next(m for m in draft.modules if m.current_name == "Module1")
+    m1.body = m1.body.replace("V2", "V3")
+    result = make_service().save_addin(draft)
+    assert result.kind == "blocked" and result.reason == "external_change"
 
 
 def test_pptm_save_copy_extension_mismatch_rejected(work_pptm, tmp_path):

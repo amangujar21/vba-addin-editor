@@ -7,8 +7,8 @@ package parts (`.xml`, `.rels`, `[Content_Types].xml`) can be edited too.
 
 VBA Add-in Editor safely patches the VBA project inside the actual installed
 add-in file while Office is closed, verifies the edited add-in before replacing
-anything, creates a backup, keeps the same path, and lets Office load the
-updated code the next time it starts.
+anything, keeps a backup (unless you turn that off), keeps the same path, and
+lets Office load the updated code the next time it starts.
 
 ## What it does
 
@@ -24,8 +24,10 @@ updated code the next time it starts.
    properties (read-only). On `.xlam`/`.ppam`/`.pptm`, switch to the **XML**
    tab to edit existing package parts.
 3. **Save File** reviews the current draft, verifies the original has not
-   changed, builds a verified candidate, creates a backup, and atomically
-   replaces the original using Windows `ReplaceFileW`. **Save a Copy** writes a
+   changed, builds a verified candidate, and atomically replaces the original,
+   keeping the old file as a same-folder backup. **File → Back Up
+   Automatically on Save** turns that backup off (the choice is remembered);
+   **File → Back Up Now** makes one whenever you want. **Save a Copy** writes a
    separate file and does not clear the original dirty state.
 4. Closing the window with unsaved changes asks Save / Discard / Cancel.
    Cancel keeps the draft. A blocked save keeps the window open.
@@ -35,7 +37,10 @@ updated code the next time it starts.
    missing, in-place Save stays disabled and **Save a Copy** writes the
    recovered draft to a new path. If the original changed, compare and resolve
    external changes before saving in place.
-6. **Find in Project** (Ctrl+Shift+F) searches the current draft, not disk.
+6. **Find** (Ctrl+F) and **Replace** (Ctrl+H) open a bar under the editor you
+   are in: Enter / F3 for the next match, Shift+Enter / Shift+F3 for the
+   previous, Esc to close. **Find in Project** (Ctrl+Shift+F) searches the
+   current draft, not disk.
    Replace applies one undoable batch. **Restore Backup** is a verified
    replace with a pre-restore safety copy; it does not run automatically after
    a failed final verification.
@@ -53,6 +58,11 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   and unique, the XML is inserted with matching indentation, and a small
   `…Callback(control As IRibbonControl)` wrapper is added when the Sub has
   no ribbon argument. One Undo reverts both.
+- **Add Ribbon Menu** — Ribbon menu, or right-click in the ribbon XML. Pick
+  the label, the group or menu to put it in (the one under the cursor is
+  preselected), icon and sizes, and optionally tick the macros to add as its
+  buttons. The `<menu>` block is inserted with matching indentation and
+  unique ids; more buttons can be added to it later with Add Ribbon Button.
 - **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA tab.
 - **Ribbon → Ribbon Buttons…** lists every callback with its module and
   status; **Check Ribbon Callbacks** and **Validate XML** report callbacks
@@ -62,12 +72,18 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
 
 ## Safety model
 
-- **Backups are mandatory.** Every in-place save creates a same-folder backup
-  before the original is replaced.
+- **Backups are automatic unless you switch them off.** By default every
+  in-place save keeps the replaced file as a same-folder backup. With
+  **Back Up Automatically on Save** off, a save leaves no backup file; use
+  **Back Up Now** before risky edits.
 - **Candidate verification.** The edited copy is fully parsed and validated
   (VBA structure, ZIP entry set, non-VBA payload byte-equality, module set and
   bodies) *before* the original is touched. Any failure leaves the original
   untouched.
+- **Atomic commit.** The verified candidate is written beside the original and
+  moved over it. When the original carries security settings, attributes or
+  alternate data streams the new file would not have, Windows `ReplaceFileW`
+  does the move so they are kept.
 - **No change means no write.** Saving without edits never rewrites the file.
 - **Password-protected projects are read-only.** No bypass exists. (XML-only
   package edits on `.xlam`/`.ppam`/`.pptm` remain possible; they never modify the
@@ -83,10 +99,23 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
 - The tool never executes VBA, never changes Trust Center settings, never
   installs/uninstalls add-ins, and makes no network calls.
 
+## Speed and antivirus
+
+Windows Defender scans a macro package the first time it is opened for reading
+after it was written, and for a large VBA project that takes seconds. The
+editor therefore keeps the package in memory, builds and verifies the edited
+file there, writes it once and never reads it back. The scan still happens,
+once, when Office (or anything else) next opens the saved file. The same scan
+runs if you open an add-in that nothing has read since it was last written.
+
+Decoded module source is cached under
+`%LOCALAPPDATA%\VBAAddinEditor\source-cache` so reopening an add-in does not
+decompress modules that have not changed. The folder can be deleted at any time.
+
 ## Limitations (honest scope)
 
 - The tool validates structure, not VBA compilation. A syntax error you type
-  will surface when Office runs the macro. Use the automatic backup to roll back.
+  will surface when Office runs the macro. Use a backup to roll back.
 - **XML editing** covers existing parts only: no add/delete/rename of package
   parts, no schema validation against the full OOXML schemas (syntax and
   package integrity are validated; PowerPoint remains the final format

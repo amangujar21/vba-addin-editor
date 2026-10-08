@@ -91,6 +91,7 @@ class RibbonContainer:
     close_start: int
     indent: str
     child_indent: str
+    open_start: int = 0
 
 
 @dataclass(frozen=True)
@@ -282,7 +283,18 @@ def _container_for(text, part_path, open_tag, children, close_tag, stack):
         close_start=close_tag.start,
         indent=indent,
         child_indent=child_indent,
+        open_start=open_tag.start,
     )
+
+
+def innermost_container(
+    containers: list[RibbonContainer], part_path: str, offset: int
+) -> RibbonContainer | None:
+    """The deepest container of ``part_path`` whose element surrounds ``offset``."""
+    around = [
+        c for c in containers if c.part_path == part_path and c.open_start <= offset <= c.close_start
+    ]
+    return max(around, key=lambda c: c.open_start, default=None)
 
 
 # -- building XML ----------------------------------------------------------------
@@ -315,6 +327,48 @@ def build_button_xml(
     return " ".join(parts) + " />"
 
 
+def child_unit(container: RibbonContainer) -> str:
+    """One level of indentation as the container's own children use it."""
+    if container.child_indent.startswith(container.indent):
+        return container.child_indent[len(container.indent):] or "    "
+    return "    "
+
+
+def build_menu_xml(
+    *,
+    control_id: str,
+    label: str,
+    image_mso: str = "",
+    size: str = "",
+    item_size: str = "",
+    screentip: str = "",
+    supertip: str = "",
+    children: tuple[str, ...] | list[str] = (),
+    indent: str = "",
+    unit: str = "    ",
+) -> str:
+    """A <menu> element holding ``children`` (complete element strings).
+
+    The first line carries no indentation and later lines carry ``indent``, so
+    the block goes wherever a one-line element indented by ``indent`` would.
+    """
+    parts = [f'<menu id="{_attr(control_id)}"', f'label="{_attr(label)}"']
+    if size:
+        parts.append(f'size="{_attr(size)}"')
+    if item_size:
+        parts.append(f'itemSize="{_attr(item_size)}"')
+    if image_mso:
+        parts.append(f'imageMso="{_attr(image_mso)}"')
+    if screentip:
+        parts.append(f'screentip="{_attr(screentip)}"')
+    if supertip:
+        parts.append(f'supertip="{_attr(supertip)}"')
+    lines = [" ".join(parts) + ">"]
+    lines += [indent + unit + child for child in children]
+    lines.append(indent + "</menu>")
+    return "\n".join(lines)
+
+
 def insert_into_container(
     text: str, container: RibbonContainer, element_xml: str
 ) -> tuple[str, int, int]:
@@ -332,9 +386,9 @@ def insert_into_container(
     return text[:at] + insert + text[at:], offset, len(element_xml)
 
 
-def unique_control_id(existing: set[str], base: str) -> str:
-    stem = re.sub(r"[^A-Za-z0-9_]", "", base) or "Button"
-    candidate = "btn" + stem[0].upper() + stem[1:]
+def unique_control_id(existing: set[str], base: str, prefix: str = "btn") -> str:
+    stem = re.sub(r"[^A-Za-z0-9_]", "", base) or ("Menu" if prefix == "mnu" else "Button")
+    candidate = prefix + stem[0].upper() + stem[1:]
     taken = {item.casefold() for item in existing}
     if candidate.casefold() not in taken:
         return candidate
@@ -372,6 +426,17 @@ def procedure_index(draft: DocumentDraft) -> dict[str, list[ProcedureLocation]]:
                 continue
             index.setdefault(proc.name.casefold(), []).append(_location(module, proc))
     return index
+
+
+def ribbon_ready_procedures(draft: DocumentDraft) -> list[ProcedureLocation]:
+    """Subs a ribbon control can call as they are: standard module, IRibbonControl argument."""
+    ready = [
+        location
+        for locations in procedure_index(draft).values()
+        for location in locations
+        if location.is_standard and location.kind == "Sub" and is_ribbon_ready(location.signature)
+    ]
+    return sorted(ready, key=lambda p: (p.module_name.casefold(), p.line))
 
 
 @lru_cache(maxsize=256)

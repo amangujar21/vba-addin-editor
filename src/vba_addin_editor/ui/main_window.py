@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import re
 import tempfile
@@ -14,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import TypeVar
 
 from vba_addin_editor.adapters.ooxml_package_adapter import XML_EDITABLE_EXTENSIONS
-from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError
+from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError, enable_source_disk_cache
 from vba_addin_editor.domain.capabilities import RESTRICTION_MESSAGES
 from vba_addin_editor.domain.changes import compute_changes, dirty_count
 from vba_addin_editor.domain.document import (
@@ -28,6 +29,8 @@ from vba_addin_editor.domain.document import (
 )
 from vba_addin_editor.domain.history import HistoryCommand
 from vba_addin_editor.platform import windows_processes as wp
+from vba_addin_editor.platform.paths import appdata_root
+from vba_addin_editor.platform.settings import load_settings, save_settings
 from vba_addin_editor.services import ribbon_service as rs
 from vba_addin_editor.services.backup_service import BackupService
 from vba_addin_editor.services.conflict_service import ConflictService
@@ -53,10 +56,15 @@ from vba_addin_editor.services.session_service import SessionService
 from vba_addin_editor.services.validation_service import validate_module_name
 from vba_addin_editor.ui.code_editor import CodeEditor
 from vba_addin_editor.ui.conflict_dialog import ConflictDialog
-from vba_addin_editor.ui.ribbon_dialogs import AddButtonDialog, RibbonButtonsDialog, choose
+from vba_addin_editor.ui.ribbon_dialogs import (
+    AddButtonDialog,
+    AddMenuDialog,
+    RibbonButtonsDialog,
+    choose,
+)
 from vba_addin_editor.ui.search_dialog import ProjectSearchDialog
 from vba_addin_editor.ui.xml_editor import XmlEditor
-from vba_addin_editor.version import APP_NAME, VERSION, build_identity
+from vba_addin_editor.version import APP_NAME, PYOPENVBA_PIN, VERSION, build_identity
 
 _FILETYPES = [
     ("Supported Office VBA files", "*.xlam;*.ppam;*.pptm"),
@@ -108,6 +116,13 @@ class MainWindow:
         self.recovery_open = RecoveryOpenService(self.recovery_service, self.session_service)
         self._search_dialog = None
         self._ribbon_dialog: RibbonButtonsDialog | None = None
+        # Tests keep their settings beside their temporary sessions.
+        self._settings_path = root_path / "settings.json" if root_path is not None else None
+        self.settings = load_settings(self._settings_path)
+        self.save_service.auto_backup = self.settings.auto_backup
+        self.auto_backup_var = tk.BooleanVar(master=root, value=self.settings.auto_backup)
+        if root_path is None:
+            enable_source_disk_cache(appdata_root() / "source-cache" / f"pyopenvba-{PYOPENVBA_PIN}")
 
         root.title(APP_NAME)
         root.geometry("1000x680")
@@ -140,6 +155,12 @@ class MainWindow:
         file_menu.add_command(label="Save File", accelerator="Ctrl+S", command=self.save)
         file_menu.add_command(label="Save a Copy…", accelerator="Ctrl+Shift+S", command=self.save_copy)
         file_menu.add_separator()
+        file_menu.add_command(label="Back Up Now", command=self.backup_now)
+        file_menu.add_checkbutton(
+            label="Back Up Automatically on Save",
+            variable=self.auto_backup_var,
+            command=self._on_auto_backup_toggled,
+        )
         file_menu.add_command(label="Restore Backup…", command=self.restore_backup)
         file_menu.add_command(label="Backup Browser…", command=self.backup_browser)
         file_menu.add_command(label="Compare External Changes…", command=self.compare_external_changes)
@@ -155,6 +176,13 @@ class MainWindow:
         edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
         edit_menu.add_command(label="Redo", accelerator="Ctrl+Y", command=self.redo)
         edit_menu.add_separator()
+        edit_menu.add_command(label="Find…", accelerator="Ctrl+F", command=self.find_in_editor)
+        edit_menu.add_command(
+            label="Replace…", accelerator="Ctrl+H", command=lambda: self.find_in_editor(replace=True)
+        )
+        edit_menu.add_command(
+            label="Find Next", accelerator="F3", command=lambda: self._active_text_editor().find_next()
+        )
         edit_menu.add_command(label="Find in Project…", accelerator="Ctrl+Shift+F", command=self.project_search)
         bar.add_cascade(label="Edit", menu=edit_menu)
 
@@ -177,6 +205,7 @@ class MainWindow:
         ribbon_menu.add_command(
             label="Add Ribbon Button for This Macro…", command=self.add_ribbon_button
         )
+        ribbon_menu.add_command(label="Add Ribbon Menu…", command=self.add_ribbon_menu)
         ribbon_menu.add_separator()
         ribbon_menu.add_command(label="Check Ribbon Callbacks", command=self.check_ribbon_callbacks)
         bar.add_cascade(label="Ribbon", menu=ribbon_menu)
@@ -225,6 +254,11 @@ class MainWindow:
             "Go to Macro",
             self.goto_callback_under_cursor,
             lambda: self._xml_cursor_callback() is not None,
+        )
+        xml_menu.add_extra(
+            "Add Ribbon Menu Here…",
+            self.add_ribbon_menu,
+            lambda: rs.is_ribbon_part(self.current_xml_part_path or ""),
         )
         vba_menu = self.editor.context_menu
         vba_menu.add_extra(
@@ -406,8 +440,10 @@ class MainWindow:
         self.root.bind("<Control-o>", lambda _e: self.open_file())
         self.root.bind("<Control-s>", lambda _e: self.save())
         self.root.bind("<Control-S>", lambda _e: self.save_copy())
-        self.root.bind("<Control-f>", lambda _e: self._active_text_editor().find_dialog())
-        self.root.bind("<Control-h>", lambda _e: self._active_text_editor().replace_dialog())
+        # Reached only when focus is outside an editor's text; the text widget
+        # handles these keys itself and stops them there.
+        self.root.bind("<Control-f>", lambda _e: self.find_in_editor())
+        self.root.bind("<Control-h>", lambda _e: self.find_in_editor(replace=True))
         self.root.bind("<Control-Shift-F>", lambda _e: self.project_search())
         self.root.bind("<Control-z>", lambda _e: self.undo())
         self.root.bind("<Control-y>", lambda _e: self.redo())
@@ -426,12 +462,12 @@ class MainWindow:
         # Called from the save worker thread; Tk is only touched by the poller.
         self._progress_stage = stage
 
-    def _run_in_background(self, work: Callable[[], _T]) -> _T:
+    def _run_in_background(self, work: Callable[[], _T], label: str = "Saving…") -> _T:
         """Run ``work()`` on a worker thread; keep the UI painted but inert until done.
 
         Blocks the caller in a nested event loop so callers keep synchronous
-        semantics. Saves are dominated by antivirus scans of freshly written
-        packages; running them off the Tk thread keeps the window responsive.
+        semantics. Parsing or rebuilding a large VBA project takes a moment;
+        running it off the Tk thread keeps the window responsive.
         """
         outcome: dict = {}
 
@@ -448,12 +484,17 @@ class MainWindow:
         done = f"vbaae_bg_done_{id(thread)}"
         self.root.setvar(done, "0")
         self._progress_stage = None
+        self.status.config(text=label)
         held = self._hold_ui()
+        # The same goes for garbage: a closed dialog's Tk variables must not be
+        # collected by the worker, so cyclic GC waits until it has finished.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
 
         def poll() -> None:
             stage = self._progress_stage
             if stage:
-                self.status.config(text=f"Saving… {stage}")
+                self.status.config(text=f"{label} {stage}")
             if thread.is_alive():
                 self.root.after(50, poll)
             else:
@@ -464,6 +505,10 @@ class MainWindow:
             self.root.after(50, poll)
             self.root.wait_variable(done)
         finally:
+            if thread.is_alive():
+                thread.join()
+            if gc_was_enabled:
+                gc.enable()
             self._release_ui(held)
             try:
                 self.root.globalunsetvar(done)
@@ -703,6 +748,9 @@ class MainWindow:
             return self.xml_editor
         return self.editor
 
+    def find_in_editor(self, replace: bool = False) -> None:
+        self._active_text_editor().show_find(replace=replace)
+
     def _validate_selected_xml(self) -> None:
         draft = self.draft
         if draft is None or self.current_xml_part_path is None:
@@ -743,19 +791,35 @@ class MainWindow:
         self.load_path(Path(path))
 
     def load_path(self, path: Path) -> None:
-        try:
-            self._flush_all_editors()
-            if self.session is not None:
-                self.session_service.close(self.session)
-            try:
-                self.session = self.session_service.open(path)
-                draft = self.session.draft
-            except (AdapterError, OSError, ValueError):
-                self.session = None
-                draft = self.doc_service.open(path)
-        except AdapterError as exc:
-            messagebox.showerror(APP_NAME, str(exc))
+        if self._saving:
             return
+        self._flush_all_editors()
+
+        def work():
+            try:
+                session = self.session_service.open(path)
+            except (AdapterError, OSError, ValueError):
+                return None, self.doc_service.open(path)
+            return session, session.draft
+
+        self._saving = True  # keeps autosave and close away while the worker runs
+        try:
+            session, draft = self._run_in_background(work, f"Opening {path.name}…")
+        except (AdapterError, OSError) as exc:
+            self._saving = False
+            messagebox.showerror(
+                APP_NAME,
+                str(exc)
+                if isinstance(exc, AdapterError)
+                else f"{path.name} could not be opened.\n\n{exc}",
+            )
+            self._refresh_state()
+            return
+        finally:
+            self._saving = False
+        if self.session is not None:
+            self.session_service.close(self.session)
+        self.session = session
         self.draft = draft
         self._refresh_host_status()
         self.current_module_id = None
@@ -830,7 +894,10 @@ class MainWindow:
         published = None
         if result.kind == "success" and self.session is not None:
             saved = Path(str(result.details.get("saved") or draft.baseline.path))
-            published = self.session_service.publish_verified_baseline(self.session, saved)
+            # The refreshed baseline holds the committed bytes; no need to read them back.
+            published = self.session_service.publish_verified_baseline(
+                self.session, saved, draft.baseline.package_bytes
+            )
         return result, published
 
     def _handle_save_result(self, result, *, published=None) -> None:
@@ -841,6 +908,7 @@ class MainWindow:
                 original=self.draft.baseline.path if self.draft else Path("."),
                 backup=result.backup_path,
                 operation_type=result.operation_type,
+                sha256=result.details.get("hash_backup"),
             )
             if self.session is not None:
                 saved = Path(str(result.details.get("saved") or self.draft.baseline.path))
@@ -884,12 +952,19 @@ class MainWindow:
             details = "\n".join(result.problems)
             messagebox.showerror(APP_NAME, result.message + "\n\n" + details)
         elif kind == "recovery_required":
+            # Without a backup file, the copy captured when the add-in was opened
+            # (or last saved) is the pre-save version.
+            previous = result.backup_path or (
+                self.session.captured_path if self.session is not None else None
+            )
             messagebox.showerror(
                 APP_NAME,
-                (result.message or "Final verification failed after replacing the add-in.")
-                + f"\n\nBackup: {result.backup_path}"
-                + f"\nCandidate: {result.candidate_path}"
-                + "\n\nUse File → Restore Backup to recover. The editor will not restore automatically.",
+                "The add-in was replaced but final verification failed."
+                + "\n\n"
+                + "\n".join(result.problems)
+                + f"\n\nPrevious version: {previous}"
+                + "\n\nUse File → Restore Backup with that file to recover. "
+                "The editor will not restore automatically.",
             )
         elif kind == "error":
             messagebox.showerror(APP_NAME, result.message or "Save failed.")
@@ -906,7 +981,7 @@ class MainWindow:
         lines = [
             f"Review changes to {model.destination}",
             f"Type: {model.file_type}    VBA: {model.vba_count}    XML: {model.xml_count}",
-            model.backup_policy,
+            self._backup_policy_text() if operation_type == "save" else model.backup_policy,
             "",
         ]
         for item in model.items:
@@ -946,7 +1021,7 @@ class MainWindow:
             lines.append("  ✓ No OPC package signature detected")
         if has_vba and draft.baseline.safety.signature_present:
             lines.append("  ! VBA digital signature will be removed")
-        lines += ["", "A backup will be created before the original is replaced."]
+        lines += ["", self._backup_policy_text()]
         confirm_label = (
             "Save and Remove Signature"
             if has_vba and draft.baseline.safety.signature_present
@@ -964,8 +1039,14 @@ class MainWindow:
             "This add-in's VBA project is digitally signed.\n\n"
             "Any code change makes the existing signature invalid; saving will "
             "remove it. Office or your organization's security policy may then "
-            "block the add-in.\n\nA backup of the currently signed file will be "
-            "created automatically.\n\nRemove the signature and save?"
+            "block the add-in.\n\n"
+            + (
+                "A backup of the currently signed file will be created automatically."
+                if self.save_service.auto_backup
+                else "Automatic backup is off: the signed file will NOT be kept. "
+                "Use File → Back Up Now first if you want a copy."
+            )
+            + "\n\nRemove the signature and save?"
         )
         if messagebox.askyesno(APP_NAME, text, icon="warning"):
             self.draft.signed_save_confirmed = True
@@ -1162,9 +1243,14 @@ class MainWindow:
             prompt = (
                 f'Delete UserForm "{mod.current_name}"?\n\nThis removes the form\'s code '
                 "AND its layout (all of its controls) from the VBA project when you save. "
-                "The layout cannot be exported or re-imported by this editor; the "
-                "pre-save backup is the only way to get it back.\n\n"
-                "It is not written to the file until Save File."
+                "The layout cannot be exported or re-imported by this editor; "
+                + (
+                    "the pre-save backup is the only way to get it back."
+                    if self.save_service.auto_backup
+                    else "automatic backup is off, so use File → Back Up Now before "
+                    "saving if you may want it back."
+                )
+                + "\n\nIt is not written to the file until Save File."
             )
         else:
             prompt = (
@@ -1290,6 +1376,39 @@ class MainWindow:
         except (KeyError, AdapterError) as exc:
             messagebox.showerror(APP_NAME, str(exc))
 
+    def _backup_policy_text(self) -> str:
+        if self.save_service.auto_backup:
+            return "A same-folder backup is created before the original is replaced."
+        return "Automatic backup is off: the original is replaced without a backup file."
+
+    def _on_auto_backup_toggled(self) -> None:
+        enabled = bool(self.auto_backup_var.get())
+        self.settings.auto_backup = enabled
+        self.save_service.auto_backup = enabled
+        saved = save_settings(self.settings, self._settings_path)
+        self.status.config(
+            text=(
+                "Automatic backup on save is on."
+                if enabled
+                else "Automatic backup on save is off. Use File → Back Up Now when you want one."
+            )
+            + ("" if saved else " (This choice could not be saved for next time.)")
+        )
+
+    def backup_now(self) -> None:
+        """Copy the add-in as it is on disk to a same-folder backup file."""
+        if self.draft is None:
+            messagebox.showinfo(APP_NAME, "Open an add-in first.")
+            return
+        try:
+            backup = self.backup_service.create_manual_backup(self.draft.baseline)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"The backup could not be created.\n\n{exc}")
+            return
+        self._flush_all_editors()
+        note = "  Unsaved edits are not in it." if self.draft.is_dirty() else ""
+        self.status.config(text=f"Backup created: {backup.name}.{note}")
+
     def restore_backup(self) -> None:
         if self.draft is None:
             messagebox.showinfo(APP_NAME, "Open the add-in first, then restore a backup.")
@@ -1385,7 +1504,7 @@ class MainWindow:
             f"Mode: {identity.get('packaged_mode', 'development')}\n"
             f"pyOpenVBA: {identity.get('pyopenvba_installed') or identity.get('pyopenvba_pin')}\n\n"
             "Edits VBA source inside installed .xlam / .ppam add-ins and .pptm\n"
-            "presentations, in place, with automatic backup and verification.\n\n"
+            "presentations, in place, with verification and optional backups.\n\n"
             "Ordinary class modules can be deleted and renamed when PROJECT/dir\n"
             "metadata agrees. Close the corresponding Office host before saving.\n\n"
             "Uses pyOpenVBA (MIT) — see Help → Third-party notices.",
@@ -1788,6 +1907,97 @@ class MainWindow:
         spec = dialog.wait()
         if spec is not None:
             self.apply_ribbon_button(mod.id, callback_name, wrapper, spec)
+
+    def add_ribbon_menu(self) -> None:
+        """Ask for a new ribbon menu (and optionally its buttons) and insert the XML."""
+        draft = self.draft
+        if draft is None:
+            return
+        self._flush_all_editors()
+        parts = [p for p in rs.ribbon_parts(draft) if p.editable]
+        if not parts:
+            messagebox.showinfo(
+                APP_NAME,
+                "This file has no editable ribbon XML (customUI/customUI.xml or "
+                "customUI14.xml).\n\nAdding a new ribbon part is not supported yet.",
+            )
+            return
+        containers = [c for p in parts for c in rs.find_containers(p.text or "", p.path)]
+        if not containers:
+            messagebox.showinfo(
+                APP_NAME, "The ribbon XML has no custom group or menu to add a menu to."
+            )
+            return
+        # Start in the group or menu the XML cursor is in, when there is one.
+        initial = 0
+        if self._active_text_editor() is self.xml_editor and self.current_xml_part_path:
+            offset = len(self.xml_editor.text.get("1.0", "insert"))
+            here = rs.innermost_container(containers, self.current_xml_part_path, offset)
+            if here is not None:
+                initial = containers.index(here)
+        dialog = AddMenuDialog(
+            self.root,
+            containers=containers,
+            existing_ids={
+                value for p in rs.ribbon_parts(draft) for value, _o in rs.control_ids(p.text or "")
+            },
+            image_suggestions=sorted(
+                {v for p in parts for v in re.findall(r'imageMso="([^"]+)"', p.text or "")},
+                key=str.casefold,
+            ),
+            macros=rs.ribbon_ready_procedures(draft),
+            show_part=len(parts) > 1,
+            initial_container=initial,
+        )
+        spec = dialog.wait()
+        if spec is not None:
+            self.apply_ribbon_menu(spec)
+
+    def apply_ribbon_menu(self, spec) -> None:
+        draft = self.draft
+        if draft is None:
+            return
+        part = draft.xml_part_by_path(spec.container.part_path)
+        if part is None or part.text is None:
+            return
+        taken = {
+            value for p in rs.ribbon_parts(draft) for value, _o in rs.control_ids(p.text or "")
+        } | {spec.control_id}
+        children = []
+        for macro in spec.macros:
+            control_id = rs.unique_control_id(taken, macro.name)
+            taken.add(control_id)
+            children.append(
+                rs.build_button_xml(
+                    control_id=control_id,
+                    label=rs.suggested_label(macro.name),
+                    on_action=macro.name,
+                )
+            )
+        element = rs.build_menu_xml(
+            control_id=spec.control_id,
+            label=spec.label,
+            image_mso=spec.image_mso,
+            size=spec.size,
+            item_size=spec.item_size,
+            screentip=spec.screentip,
+            children=children,
+            indent=spec.container.child_indent,
+            unit=rs.child_unit(spec.container),
+        )
+        new_text, offset, _length = rs.insert_into_container(part.text, spec.container, element)
+
+        def mutate() -> None:
+            part.text = new_text
+
+        self._batch_edit(mutate)
+        line = new_text.count("\n", 0, offset) + 1
+        column = offset - (new_text.rfind("\n", 0, offset) + 1) + 1
+        self._open_xml_at(part.path, line, column, len(element.split("\n", 1)[0]))
+        count = f" with {len(children)} button(s)" if children else ""
+        self.status.config(
+            text=f'Added menu "{spec.label}"{count}. Nothing is written until Save File.'
+        )
 
     def _plan_button_callback(self, mod, proc):
         """(callback name, wrapper stub or None, note) for a button that runs proc."""

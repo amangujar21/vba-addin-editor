@@ -10,6 +10,7 @@ from vba_addin_editor.adapters.ooxml_package_adapter import (
     XML_EDITABLE_EXTENSIONS,
     OoxmlPackageAdapter,
     PackageError,
+    PackageSource,
 )
 from vba_addin_editor.adapters.pyopenvba_adapter import (
     SUPPORTED_EXTENSIONS,
@@ -36,12 +37,13 @@ class DocumentService:
             raise AdapterError("The selected add-in file could not be found.")
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
-        fp = paths.fingerprint(path)
+        data, fp = paths.read_stable(path)
         host_probe = wp.probe_host_process(path)
         snapshot = self.adapter.open_snapshot(
             path,
             fp,
             host_process_running=host_probe.corresponding_host_running,
+            data=data,
         )
         snapshot = replace(
             snapshot,
@@ -50,16 +52,18 @@ class DocumentService:
                 host_process_probe_failed=host_probe.enumeration_failed,
             ),
         )
-        snapshot = self._with_package_state(path, snapshot)
+        snapshot = self._with_package_state(data, snapshot)
         return draft_from_snapshot(snapshot)
 
-    def _with_package_state(self, path: Path, snapshot: DocumentSnapshot) -> DocumentSnapshot:
+    def _with_package_state(
+        self, source: PackageSource, snapshot: DocumentSnapshot
+    ) -> DocumentSnapshot:
         """Attach XML part snapshots and package safety for editable packages."""
-        if path.suffix.lower() not in XML_EDITABLE_EXTENSIONS:
+        if snapshot.extension not in XML_EDITABLE_EXTENSIONS:
             return snapshot
         try:
-            xml_parts = self.package_adapter.snapshot_xml_parts(path)
-            package_safety = self.package_adapter.inspect_package_signature(path)
+            xml_parts = self.package_adapter.snapshot_xml_parts(source)
+            package_safety = self.package_adapter.inspect_package_signature(source)
         except PackageError as exc:
             raise AdapterError(str(exc), exc.details) from exc
         except (OSError, zipfile.BadZipFile) as exc:

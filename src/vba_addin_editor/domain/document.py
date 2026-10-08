@@ -27,6 +27,10 @@ class FileFingerprint:
     sha256: str
     size: int
     mtime_ns: int
+    # Set only for a file this process wrote and read back: (volume, file id,
+    # size, mtime_ns). While the path still has that identity its content is
+    # known without re-reading it.
+    written_identity: tuple[int, int, int, int] | None = field(default=None, compare=False)
 
     def content_equal(self, other: FileFingerprint) -> bool:
         return self.sha256 == other.sha256 and self.size == other.size
@@ -140,6 +144,9 @@ class DocumentSnapshot:
     xml_parts: tuple[XmlPartSnapshot, ...] = ()
     package_safety: PackageSafetyInfo = PackageSafetyInfo()
     forms: tuple[FormDesignSnapshot, ...] = ()
+    # The exact package bytes file_fingerprint describes. Saves build and
+    # verify from these instead of re-reading the file.
+    package_bytes: bytes | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass
