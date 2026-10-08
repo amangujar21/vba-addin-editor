@@ -30,6 +30,7 @@ from vba_addin_editor.domain.document import (
 from vba_addin_editor.domain.history import HistoryCommand
 from vba_addin_editor.platform import windows_processes as wp
 from vba_addin_editor.platform.paths import appdata_root
+from vba_addin_editor.platform.prescan import READY, Prescan
 from vba_addin_editor.platform.settings import load_settings, save_settings
 from vba_addin_editor.services import ribbon_service as rs
 from vba_addin_editor.services.backup_service import BackupService
@@ -91,6 +92,11 @@ class MainWindow:
         self._idle_after = None
         self._max_after = None
         self._poll_after = None
+        self._prescan = Prescan()
+        self._prescan_after = None
+        self._prescan_holds_gc = False
+        self._gc_holds = 0
+        self._gc_was_enabled = False
         self._last_vba_text = ""
         self._last_xml_text = ""
         self.doc_service = DocumentService()
@@ -433,8 +439,13 @@ class MainWindow:
             self._open_module_at(mod.id, 1)
 
     def _build_statusbar(self) -> None:
-        self.status = ttk.Label(self.root, text="Ready", padding=3, anchor="w")
-        self.status.pack(fill="x", side="bottom")
+        self.statusbar = ttk.Frame(self.root)
+        self.statusbar.pack(fill="x", side="bottom")
+        # Right: whether antivirus has finished with the last saved file.
+        self.scan_status = ttk.Label(self.statusbar, text="", padding=3, anchor="e")
+        self.scan_status.pack(side="right")
+        self.status = ttk.Label(self.statusbar, text="Ready", padding=3, anchor="w")
+        self.status.pack(fill="x", side="left", expand=True)
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self.open_file())
@@ -454,7 +465,7 @@ class MainWindow:
     def _set_banner(self, text: str) -> None:
         if text:
             self.banner.config(text=text)
-            self.banner.pack(fill="x", before=self.status)
+            self.banner.pack(fill="x", before=self.statusbar)
         else:
             self.banner.pack_forget()
 
@@ -473,6 +484,11 @@ class MainWindow:
 
         def target() -> None:
             try:
+                if self._prescan.busy:
+                    # Its handle would fail the exclusive-access probe.
+                    self._progress_stage = "waiting for the antivirus scan of the last save"
+                    self._prescan.settle()
+                    self._progress_stage = None
                 outcome["result"] = work()
             except BaseException as exc:  # noqa: BLE001 - re-raised on the UI thread
                 outcome["error"] = exc
@@ -488,8 +504,7 @@ class MainWindow:
         held = self._hold_ui()
         # The same goes for garbage: a closed dialog's Tk variables must not be
         # collected by the worker, so cyclic GC waits until it has finished.
-        gc_was_enabled = gc.isenabled()
-        gc.disable()
+        self._hold_gc()
 
         def poll() -> None:
             stage = self._progress_stage
@@ -507,8 +522,7 @@ class MainWindow:
         finally:
             if thread.is_alive():
                 thread.join()
-            if gc_was_enabled:
-                gc.enable()
+            self._release_gc()
             self._release_ui(held)
             try:
                 self.root.globalunsetvar(done)
@@ -517,6 +531,44 @@ class MainWindow:
         if "error" in outcome:
             raise outcome["error"]
         return outcome["result"]
+
+    def _hold_gc(self) -> None:
+        """Pause cyclic GC while a worker thread runs; holds nest."""
+        if self._gc_holds == 0:
+            self._gc_was_enabled = gc.isenabled()
+            gc.disable()
+        self._gc_holds += 1
+
+    def _release_gc(self) -> None:
+        self._gc_holds -= 1
+        if self._gc_holds == 0 and self._gc_was_enabled:
+            gc.enable()
+
+    def _start_prescan(self, path: Path) -> None:
+        """Let antivirus scan the file just written now, not when Office loads it."""
+        self._prescan.start(path)
+        if not self._prescan_holds_gc:
+            self._hold_gc()
+            self._prescan_holds_gc = True
+        if self._prescan_after is not None:
+            self.root.after_cancel(self._prescan_after)
+        self._poll_prescan()
+
+    def _poll_prescan(self) -> None:
+        self._prescan_after = None
+        name = self._prescan.path.name if self._prescan.path is not None else ""
+        if self._prescan.busy:
+            self.scan_status.config(text=f"Antivirus scanning {name}…")
+            self._prescan_after = self.root.after(200, self._poll_prescan)
+            return
+        self._release_prescan_gc()
+        ready = self._prescan.state == READY
+        self.scan_status.config(text=f"{name} ready for Office" if ready else "")
+
+    def _release_prescan_gc(self) -> None:
+        if self._prescan_holds_gc:
+            self._prescan_holds_gc = False
+            self._release_gc()
 
     def _hold_ui(self) -> list[str]:
         """Block mouse, keyboard shortcuts and menus while a save runs."""
@@ -904,6 +956,10 @@ class MainWindow:
         self._last_result = result
         kind = result.kind
         if kind == "success":
+            if self.draft is not None:
+                self._start_prescan(
+                    Path(str(result.details.get("saved") or self.draft.baseline.path))
+                )
             warning = self.backup_service.record_success(
                 original=self.draft.baseline.path if self.draft else Path("."),
                 backup=result.backup_path,
@@ -1112,6 +1168,7 @@ class MainWindow:
             self._refresh_state()
         result.operation_type = "save_copy"
         if result.kind == "success":
+            self._start_prescan(dest)
             self.backup_service.record_success(
                 original=dest, backup=result.backup_path, operation_type="save_copy"
             )
@@ -1442,6 +1499,7 @@ class MainWindow:
         summary = "\n".join(inspect.summary_lines) or backup.name
         if not messagebox.askokcancel(APP_NAME, "Restore this backup?\n\n" + summary[:4000]):
             return
+        self._prescan.settle()  # restore needs the file free of other handles
         result = self.backup_service.restore_transaction(
             self.draft.baseline.path,
             backup,
@@ -2400,7 +2458,10 @@ class MainWindow:
             self._cancel_afters()
 
     def _cancel_afters(self) -> None:
-        for attr in ("_idle_after", "_max_after", "_poll_after", "_recovery_after"):
+        self._release_prescan_gc()
+        for attr in (
+            "_idle_after", "_max_after", "_poll_after", "_recovery_after", "_prescan_after"
+        ):
             handle = getattr(self, attr, None)
             if handle is None:
                 continue

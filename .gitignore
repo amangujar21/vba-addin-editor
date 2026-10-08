@@ -6,3 +6,4 @@ dist/
 .pytest_cache/
 tests/fixtures/
 src/vba_addin_editor/_build_info.py
+*.stackdump

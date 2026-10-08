@@ -104,9 +104,18 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
 Windows Defender scans a macro package the first time it is opened for reading
 after it was written, and for a large VBA project that takes seconds. The
 editor therefore keeps the package in memory, builds and verifies the edited
-file there, writes it once and never reads it back. The scan still happens,
-once, when Office (or anything else) next opens the saved file. The same scan
-runs if you open an add-in that nothing has read since it was last written.
+file there, writes it once and never reads it back while you wait.
+
+The scan itself cannot be skipped, so the editor starts it as soon as a save
+(or Save a Copy) returns: it opens the saved file on a background thread and
+the status bar shows **Antivirus scanning *name*…**, then ***name* ready for
+Office** when the scan is done. Start Excel or PowerPoint after that and it
+loads the add-in without waiting. If you start Office sooner, it waits for the
+scan. If you save again while a scan is still running, that save waits for it
+to finish first.
+
+The same scan runs if you open an add-in that nothing has read since it was
+last written.
 
 Decoded module source is cached under
 `%LOCALAPPDATA%\VBAAddinEditor\source-cache` so reopening an add-in does not
