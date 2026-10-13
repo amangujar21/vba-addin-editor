@@ -131,7 +131,7 @@ def xml_patch_path_for(candidate: Path) -> Path:
 
 def backup_path_for(original: Path, label: str = "backup") -> Path:
     """Visible same-extension backup name: 'Name - backup 2026-08-30 180212.ppam'."""
-    stamp = datetime.now().strftime("%Y-%m-%d %H%M%S")  # noqa: DTZ005 -- local time is intentional: user-facing backup filename
+    stamp = datetime.now().strftime("%Y-%m-%d %H%M%S")  # local time: user-facing backup filename
     base = f"{original.stem} - {label} {stamp}{original.suffix}"
     candidate = original.with_name(base)
     counter = 2

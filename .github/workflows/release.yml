@@ -1,0 +1,76 @@
+# Build the Windows one-file exe and publish it as a GitHub release.
+# Runs on a pushed tag vX.Y.Z; the release notes come from
+# .github/release-notes/vX.Y.Z.md. This is a development build
+# (build.ps1 -Onefile), not a qualified -Release: the live Office
+# fixtures are not available on the runner.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v0.4.2)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Check version matches tag
+        shell: pwsh
+        run: |
+          $version = python -c "from vba_addin_editor.version import VERSION; print(VERSION)"
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match version $version" }
+
+      - name: Tests
+        run: python -m pytest tests -q
+
+      - name: Lint
+        run: python -m ruff check src tests
+
+      - name: Synthetic smoke-test fixture
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tests/fixtures/xlam | Out-Null
+          python -c "import sys; sys.path.insert(0, 'tests'); from pathlib import Path; from conftest import build_xlam; build_xlam(Path('tests/fixtures/xlam/Demo.xlam'))"
+
+      - name: Build one-file exe
+        shell: pwsh
+        run: scripts/build.ps1 -Onefile
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/VBAAddinEditor.exe -Algorithm SHA256).Hash
+          "$hash  VBAAddinEditor.exe" | Out-File -Encoding ascii dist/VBAAddinEditor.exe.sha256
+          Compress-Archive -Path dist/VBAAddinEditor.exe, dist/VBAAddinEditor.exe.sha256 `
+            -DestinationPath "dist/VBAAddinEditor-$env:TAG-Windows.zip"
+          Write-Host "SHA-256: $hash"
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = ".github/release-notes/$env:TAG.md"
+          if (-not (Test-Path $notes)) { throw "Missing release notes: $notes" }
+          gh release create $env:TAG "dist/VBAAddinEditor-$env:TAG-Windows.zip" `
+            --title "VBA Add-in Editor $env:TAG" --notes-file $notes --verify-tag
