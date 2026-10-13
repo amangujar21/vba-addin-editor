@@ -1,5 +1,6 @@
 # Build the Windows one-file exe and publish it as a GitHub release.
-# Runs on a pushed tag vX.Y.Z; the release notes come from
+# Runs on a pushed tag vX.Y.Z, or by hand (workflow_dispatch) on a branch,
+# which creates the tag at that commit. The release notes come from
 # .github/release-notes/vX.Y.Z.md. This is a development build
 # (build.ps1 -Onefile), not a qualified -Release: the live Office
 # fixtures are not available on the runner.
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and release (e.g. v0.4.2)"
+        description: "Tag to create at this commit and release (e.g. v0.4.2)"
         required: true
 
 permissions:
@@ -24,8 +25,6 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
 
       - uses: actions/setup-python@v5
         with:
@@ -73,4 +72,4 @@ jobs:
           $notes = ".github/release-notes/$env:TAG.md"
           if (-not (Test-Path $notes)) { throw "Missing release notes: $notes" }
           gh release create $env:TAG "dist/VBAAddinEditor-$env:TAG-Windows.zip" `
-            --title "VBA Add-in Editor $env:TAG" --notes-file $notes --verify-tag
+            --title "VBA Add-in Editor $env:TAG" --notes-file $notes --target $env:GITHUB_SHA
