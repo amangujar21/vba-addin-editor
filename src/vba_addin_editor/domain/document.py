@@ -148,6 +148,18 @@ class DocumentSnapshot:
     # verify from these instead of re-reading the file.
     package_bytes: bytes | None = field(default=None, compare=False, repr=False)
 
+    def orphan_form_names(self) -> frozenset[str]:
+        """Case-folded names of UserForm layouts with no code module.
+
+        Such a layout is left behind by other tools; saves keep it
+        byte-identical, and no module may take its name (pyOpenVBA would
+        bind the new module to the stale layout).
+        """
+        modules = {m.original_name.casefold() for m in self.modules}
+        return frozenset(
+            f.name.casefold() for f in self.forms if f.name.casefold() not in modules
+        )
+
 
 @dataclass
 class ModuleDraft:

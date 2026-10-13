@@ -43,6 +43,11 @@ def validate_module_name(name: str, draft: DocumentDraft, exclude_id: str | None
         )
     if name.lower() in VBA_RESERVED:
         return f"'{name}' is a reserved VBA word and cannot be used as a module name."
+    if name.casefold() in draft.baseline.orphan_form_names():
+        return (
+            f"This add-in holds a UserForm layout named '{name}' with no code module. "
+            "Choose another name."
+        )
     for m in draft.modules:
         if (
             m.is_deleted

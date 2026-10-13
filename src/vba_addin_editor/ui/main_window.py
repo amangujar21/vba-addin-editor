@@ -387,10 +387,13 @@ class MainWindow:
         deleted = {
             (m.origin_name or m.current_name).casefold() for m in draft.deleted_original_modules()
         }
+        orphans = draft.baseline.orphan_form_names()
         for form in draft.baseline.forms:
             label = form.name
             if form.problem:
                 label += " [unreadable]"
+            elif form.name.casefold() in orphans:
+                label += " [layout only — no code module]"
             elif form.name.casefold() in deleted:
                 label += " [deleted — pending save]"
             iid = f"form::{form.name}"

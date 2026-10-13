@@ -60,6 +60,31 @@ def build_xlam_with_form(path: Path) -> Path:
     return path
 
 
+def build_xlam_with_orphan_form(path: Path) -> Path:
+    """Like build_xlam_with_form, plus a layout-only form ``StaleForm``: its
+    designer storage is left in the project with no code module, as other
+    tools sometimes leave one."""
+    from unittest import mock
+
+    import pyopenvba._host as host_mod
+
+    build_xlam_with_form(path)
+    with ExcelFile(path) as host:
+        host.add_form("StaleForm", caption="Stale").add_control("CommandButton", "cmdGo")
+        host.save()
+    real = host_mod.form_names
+    with ExcelFile(path) as host:
+        host.vba_project().delete_module("StaleForm")
+        # Delete only the code: keep the designer storage behind.
+        with mock.patch.object(
+            host_mod,
+            "form_names",
+            lambda cfb, root=(): [n for n in real(cfb, root=root) if n != "StaleForm"],
+        ):
+            host.save()
+    return path
+
+
 _SIG_REL = "http://schemas.microsoft.com/office/2006/relationships/vbaProjectSignature"
 
 
@@ -177,6 +202,11 @@ def work_pptm(tmp_path: Path, pptm_path: Path) -> Path:
 @pytest.fixture()
 def work_xlam_with_form(tmp_path: Path) -> Path:
     return build_xlam_with_form(tmp_path / "FormAddin.xlam")
+
+
+@pytest.fixture()
+def work_xlam_with_orphan_form(tmp_path: Path) -> Path:
+    return build_xlam_with_orphan_form(tmp_path / "OrphanFormAddin.xlam")
 
 
 @pytest.fixture

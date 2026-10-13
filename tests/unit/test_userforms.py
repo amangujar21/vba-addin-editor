@@ -197,6 +197,79 @@ def test_verification_rejects_changed_layout(tmp_path: Path, work_xlam_with_form
     assert any("UserForm layout changed" in p for p in result.problems)
 
 
+# -- layout-only (orphan) forms ----------------------------------------------------
+
+
+def _orphan_candidate(tmp_path: Path, path: Path, draft):
+    adapter = PyOpenVBAAdapter()
+    candidate = tmp_path / "cand.xlam"
+    adapter.build_candidate(path, draft, candidate, allow_signature_removal=False)
+    return adapter, candidate
+
+
+def test_orphan_layout_is_reported_on_open(work_xlam_with_orphan_form: Path):
+    draft = DocumentService().open(work_xlam_with_orphan_form)
+    assert "StaleForm" not in {m.current_name for m in draft.modules}
+    assert {f.name for f in draft.baseline.forms} == {"EntryForm", "StaleForm"}
+    assert draft.baseline.orphan_form_names() == frozenset({"staleform"})
+
+
+def test_orphan_layout_does_not_block_code_save(tmp_path: Path, work_xlam_with_orphan_form: Path):
+    """Regression: verification read a layout with no code module as a deleted
+    form left behind ("Deleted UserForm layout still present"), refusing every save."""
+    before = _vba_cfb(work_xlam_with_orphan_form)
+    draft = DocumentService().open(work_xlam_with_orphan_form)
+    edit_module1(draft)
+    adapter, candidate = _orphan_candidate(tmp_path, work_xlam_with_orphan_form, draft)
+    result = adapter.verify_candidate(work_xlam_with_orphan_form, candidate, draft)
+    assert result.ok, result.problems
+
+    after = _vba_cfb(candidate)
+    for name in ("StaleForm", "EntryForm"):
+        for stream in before.list_streams_at([name]):
+            assert after.get_stream_at([name], stream) == before.get_stream_at([name], stream)
+
+
+def test_deleting_another_form_keeps_orphan_layout(tmp_path: Path, work_xlam_with_orphan_form: Path):
+    draft = DocumentService().open(work_xlam_with_orphan_form)
+    _form(draft).is_deleted = True
+    adapter, candidate = _orphan_candidate(tmp_path, work_xlam_with_orphan_form, draft)
+    result = adapter.verify_candidate(work_xlam_with_orphan_form, candidate, draft)
+    assert result.ok, result.problems
+    storages = {s.casefold() for s in _vba_cfb(candidate).list_storages_at(())}
+    assert "entryform" not in storages and "staleform" in storages
+
+
+def test_verification_rejects_removed_orphan_layout(tmp_path: Path, work_xlam_with_orphan_form: Path):
+    draft = DocumentService().open(work_xlam_with_orphan_form)
+    edit_module1(draft)
+    adapter, candidate = _orphan_candidate(tmp_path, work_xlam_with_orphan_form, draft)
+    with zipfile.ZipFile(candidate) as package:
+        cfb = CFB.from_bytes(package.read("xl/vbaProject.bin"))
+    cfb.remove_storage_at((), "StaleForm")
+    adapter.package_adapter.replace_members(candidate, {"xl/vbaProject.bin": cfb.to_bytes()})
+    result = adapter.verify_candidate(work_xlam_with_orphan_form, candidate, draft)
+    assert not result.ok
+    assert any("UserForm layout missing" in p for p in result.problems)
+
+
+def test_orphan_layout_name_cannot_be_taken(tmp_path: Path, work_xlam_with_orphan_form: Path):
+    draft = DocumentService().open(work_xlam_with_orphan_form)
+    assert "no code module" in (validate_module_name("staleform", draft) or "")
+    draft.modules.append(
+        ModuleDraft(
+            id=new_module_id(), origin_name=None, current_name="StaleForm", body="",
+            kind="class", pyopenvba_kind="other", is_new=True, is_deleted=False,
+            destructive_ops_safe=True, can_delete=True, can_rename=True,
+            project_item_kind="class",
+        )
+    )
+    assert any("no code module" in p for p in validate_draft(draft))
+    # The adapter refuses independently of validation.
+    with pytest.raises(AdapterError, match="no code module"):
+        _orphan_candidate(tmp_path, work_xlam_with_orphan_form, draft)
+
+
 # -- signature parts -------------------------------------------------------------
 
 

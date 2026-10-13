@@ -934,6 +934,16 @@ def _assert_destructive_ops_against_snapshot(draft: DocumentDraft) -> None:
                 "Save the deletion before reusing the name.",
                 {"module_id": mod.id},
             )
+    # A layout with no code module: pyOpenVBA would declare a new module of
+    # that name BaseClass and bind it to the stale layout.
+    orphans = draft.baseline.orphan_form_names()
+    for mod in [*draft.new_modules(), *draft.changed_names()]:
+        if mod.current_name.casefold() in orphans:
+            raise AdapterError(
+                f"The name {mod.current_name!r} belongs to a UserForm layout with no "
+                "code module. Choose another name.",
+                {"module_id": mod.id},
+            )
     for mod in draft.changed_names():
         snap = trusted.get(mod.id)
         if snap is None or not snap.can_rename:
@@ -1040,16 +1050,21 @@ def _verify_form_storages(ref_cfb: CFB, cand_cfb: CFB, expected: DocumentDraft) 
     """Deleted forms leave no storage; every other form layout is byte-identical.
 
     The editor never writes layouts, so any designer difference is a defect.
+    "Deleted" means deleted in this draft: a layout that had no code module
+    at open (left behind by another tool) is kept like any other.
     """
     problems: list[str] = []
     surviving = {m.current_name.casefold() for m in expected.final_module_state()}
+    deleted = {
+        (m.origin_name or m.current_name).casefold() for m in expected.deleted_original_modules()
+    } - surviving
     ref_forms = {name.casefold(): name for name in _form_storage_names(ref_cfb)}
     try:
         cand_storages = {name.casefold(): name for name in cand_cfb.list_storages_at(())}
     except Exception as exc:  # noqa: BLE001 - inability to verify is failure
         return [f"Could not enumerate candidate designer storages ({type(exc).__name__})."]
     for folded, name in sorted(ref_forms.items()):
-        if folded not in surviving:
+        if folded in deleted:
             if folded in cand_storages:
                 problems.append(f"Deleted UserForm layout still present: {name!r}")
             continue

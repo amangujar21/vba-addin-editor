@@ -83,3 +83,14 @@ def test_rename_userform_refused(window: MainWindow, work_xlam_with_form: Path, 
     window.rename_module()
     assert warnings and "renaming it is disabled" in warnings[0]
     assert form.current_name == "EntryForm"
+
+
+def test_orphan_layout_is_labelled_in_forms_tab(window: MainWindow, work_xlam_with_orphan_form: Path):
+    window.load_path(work_xlam_with_orphan_form)
+    assert _group_children(window, "UserForms") == ["EntryForm"]
+    assert "no code module" in window.forms_tree.item("form::StaleForm", "text")
+    assert "no code module" not in window.forms_tree.item("form::EntryForm", "text")
+    window.forms_tree.selection_set("form::StaleForm")
+    window.forms_tree.event_generate("<<TreeviewSelect>>")
+    window.root.update()
+    assert str(window.form_code_btn.cget("state")) == "disabled"
