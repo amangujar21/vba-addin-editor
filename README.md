@@ -15,8 +15,17 @@ lets Office load the updated code the next time it starts.
 1. You can open the add-in while Excel or PowerPoint is running. Edits are kept
    in the editor; the corresponding host must still be closed before a successful
    in-place save. Close Excel for `.xlam`, or PowerPoint for `.ppam`/`.pptm`.
-   The unrelated host does not block saving. If Save is blocked, keep the window
-   open, close the host, and click **Save File** again — do not reload.
+   The unrelated host does not block saving. If you click **Save File** while
+   the host is running (or still shutting down, or another program has the file
+   open), the editor offers to wait: a bar shows it is waiting, and it saves as
+   soon as the file is free (**Cancel Auto-Save** stops waiting). Edits made
+   while it waits are reviewed again before saving. Keep the window open — do
+   not reload.
+   If Office saved the add-in itself in the meantime (an add-in that calls
+   `ThisWorkbook.Save`, Ctrl+S in the VBE), Save rebases your edits onto that
+   version: changes that do not overlap merge automatically and the save goes
+   ahead; overlapping ones open **Compare External Changes** so you choose,
+   then Save again. Nothing is overwritten until the merge is resolved.
 2. Edit code; add/rename/delete standard modules and ordinary class modules.
    UserForms can be deleted (code and layout together) but not renamed; host
    document modules and other designer components stay locked for

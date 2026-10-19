@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
 import re
 import tempfile
@@ -77,6 +78,20 @@ _FILETYPES = [
 
 _T = TypeVar("_T")
 
+# Save blocks that clear once Office closes or lets go of the file.
+_HOST_WAIT_REASONS = frozenset({"office_running", "file_in_use"})
+QUEUED_SAVE_POLL_MS = 500
+
+
+def _draft_signature(draft: DocumentDraft) -> str:
+    """Digest of everything a save would write, to tell whether a reviewed draft changed."""
+    digest = hashlib.sha256()
+    for mod in draft.modules:
+        digest.update(repr((mod.id, mod.current_name, mod.body, mod.is_deleted)).encode("utf-8", "surrogatepass"))
+    for part in draft.xml_parts:
+        digest.update(repr((part.path, part.text)).encode("utf-8", "surrogatepass"))
+    return digest.hexdigest()
+
 
 class MainWindow:
     def __init__(self, root: tk.Tk) -> None:
@@ -92,6 +107,9 @@ class MainWindow:
         self._idle_after = None
         self._max_after = None
         self._poll_after = None
+        # Draft signature a confirmed save is waiting to write once Office lets go.
+        self._queued_save: str | None = None
+        self._queue_after = None
         self._prescan = Prescan()
         self._prescan_after = None
         self._prescan_holds_gc = False
@@ -252,6 +270,14 @@ class MainWindow:
         self.banner = ttk.Label(self.root, text="", background="#fff3cd", padding=4)
         self.banner.pack(fill="x", before=self.editor_notebook)
         self.banner.pack_forget()
+        # Shown while a save waits for the Office host to release the file.
+        self.wait_bar = ttk.Frame(self.root, padding=(4, 2))
+        self.wait_label = ttk.Label(self.wait_bar, text="")
+        self.wait_label.pack(side="left", fill="x", expand=True)
+        self.wait_cancel_btn = ttk.Button(
+            self.wait_bar, text="Cancel Auto-Save", command=self.cancel_queued_save
+        )
+        self.wait_cancel_btn.pack(side="right")
         self._install_ribbon_actions()
 
     def _install_ribbon_actions(self) -> None:
@@ -614,6 +640,7 @@ class MainWindow:
 
     def _refresh_state(self) -> None:
         draft = self.draft
+        self._show_wait_bar()
         if draft is None:
             self.file_label.config(text="No add-in open")
             self.save_btn.config(state="disabled")
@@ -653,12 +680,22 @@ class MainWindow:
                 "Windows could not list running programs. Close Excel and PowerPoint "
                 "before saving; the editor will check again on the next save."
             )
-        elif self._live_host_running:
+        elif self._live_host_running and self._queued_save is None:
             self._set_banner(
                 f"Close {self._host_label} before saving this add-in."
             )
         else:
             self._set_banner("")
+
+    def _show_wait_bar(self) -> None:
+        if self._queued_save is None or self.draft is None:
+            self.wait_bar.pack_forget()
+            return
+        self.wait_label.config(
+            text=f"Waiting for {wp.corresponding_host_label(self.draft.baseline.path)} "
+            f"to close. {self.draft.baseline.path.name} will be saved automatically."
+        )
+        self.wait_bar.pack(fill="x", before=self.statusbar, side="bottom")
 
     def _refresh_tree(self) -> None:
         draft = self.draft
@@ -897,6 +934,7 @@ class MainWindow:
     def save(self) -> None:
         if self.draft is None or self._saving:
             return
+        self.cancel_queued_save()
         if self.session is not None and not self.session.original_exists:
             messagebox.showwarning(
                 APP_NAME,
@@ -921,6 +959,14 @@ class MainWindow:
             return
         if not self._review_and_confirm(operation_type="save"):
             return
+        blocked = self.save_service.host_block(self.draft.baseline.path)
+        if blocked is not None:
+            self._offer_queued_save(blocked)
+            return
+        self._save_confirmed()
+
+    def _save_confirmed(self, *, merged_external: bool = False) -> None:
+        """Run the reviewed save; recover from Office holding or rewriting the file."""
         self._saving = True
         self._refresh_state()
         result = None
@@ -939,7 +985,168 @@ class MainWindow:
             self._saving = False
             self._refresh_host_status()
             self._refresh_state()
-        self._handle_save_result(result, published=published)
+        if result.kind == "blocked" and result.reason in _HOST_WAIT_REASONS:
+            # Office started, or something grabbed the file, after the check.
+            self._offer_queued_save(result)
+            return
+        if (
+            result.kind == "blocked"
+            and result.reason == "external_change"
+            and not merged_external
+            and self.session is not None
+        ):
+            if self._adopt_external_changes():
+                self._save_confirmed(merged_external=True)
+            return
+        note = ""
+        if merged_external and result.kind == "success" and self.draft is not None:
+            note = (
+                f"{self.draft.baseline.path.name} had been saved by another program "
+                f"(such as {wp.corresponding_host_label(self.draft.baseline.path)}) "
+                "after you opened it. Your edits were applied on top of that version."
+            )
+        self._handle_save_result(result, published=published, note=note)
+
+    # -- waiting for Office / adopting its changes ---------------------------
+
+    def _offer_queued_save(self, blocked) -> None:
+        """Office (or another program) holds the file: offer to save once it is free."""
+        assert self.draft is not None
+        label = wp.corresponding_host_label(self.draft.baseline.path)
+        if blocked.reason not in _HOST_WAIT_REASONS:
+            messagebox.showwarning(APP_NAME, dialog_text(blocked))
+            return
+        text = (
+            f"{blocked.message}\n\n"
+            f"Your changes stay in the editor. The editor can save "
+            f"{self.draft.baseline.path.name} automatically as soon as {label} "
+            "has closed and the file is free.\n\n"
+            "Save automatically when it is free?"
+        )
+        if messagebox.askyesno(APP_NAME, text):
+            self._queue_save()
+
+    def _queue_save(self) -> None:
+        assert self.draft is not None
+        self._flush_all_editors()
+        self._queued_save = _draft_signature(self.draft)
+        self._refresh_state()
+        self._schedule_queued_save_poll()
+
+    def cancel_queued_save(self) -> None:
+        if self._queue_after is not None:
+            try:
+                self.root.after_cancel(self._queue_after)
+            except tk.TclError:
+                pass
+            self._queue_after = None
+        if self._queued_save is not None:
+            self._queued_save = None
+            self._refresh_state()
+
+    def _schedule_queued_save_poll(self) -> None:
+        self._queue_after = self.root.after(QUEUED_SAVE_POLL_MS, self._poll_queued_save)
+
+    def _poll_queued_save(self) -> None:
+        self._queue_after = None
+        if self._queued_save is None or self.draft is None:
+            self.cancel_queued_save()
+            return
+        if self._saving or self.save_service.host_block(self.draft.baseline.path) is not None:
+            self._schedule_queued_save_poll()
+            return
+        self._flush_all_editors()
+        reviewed = self._queued_save
+        self._queued_save = None
+        self._refresh_state()
+        if not self.draft.is_dirty():
+            return
+        if _draft_signature(self.draft) == reviewed:
+            self._save_confirmed()
+        else:
+            self.save()  # edited since the review: review again
+
+    def _adopt_external_changes(self) -> bool:
+        """Rebase the draft onto a file Office rewrote after it was opened.
+
+        Non-overlapping changes merge without asking (the three-way rules of
+        ConflictService); overlapping ones open the conflict dialog and the
+        user saves again afterwards. True when the draft now sits on the
+        current file and can be saved.
+        """
+        assert self.draft is not None and self.session is not None
+        path = self.draft.baseline.path
+        session = self.session
+        label = wp.corresponding_host_label(path)
+        self._flush_all_editors()
+
+        def work():
+            snapshot, _digest, error = self.conflict_service.snapshot_external(path)
+            if snapshot is None:
+                return None, None, error
+            return snapshot, self.conflict_service.compare(session, snapshot), None
+
+        self._saving = True
+        try:
+            snapshot, proposal, error = self._run_in_background(
+                work, f"Reading the changed {path.name}…"
+            )
+        except (AdapterError, OSError) as exc:
+            snapshot, proposal, error = None, None, str(exc)
+        finally:
+            self._saving = False
+        if snapshot is None or proposal is None:
+            messagebox.showwarning(
+                APP_NAME,
+                f"{path.name} changed on disk after you opened it, and the new "
+                f"version could not be read ({error or 'unknown'}).\n\n"
+                "Nothing was overwritten and your draft is kept. Close any program "
+                "using the file and Save again.",
+            )
+            self._refresh_state()
+            return False
+        if proposal.parse_failed or any(item.requires_choice for item in proposal.items):
+            messagebox.showinfo(
+                APP_NAME,
+                f"{path.name} was saved by another program (such as {label}) after "
+                "you opened it, and some of those changes overlap yours.\n\n"
+                "Choose which version to keep for each, then Save again.",
+            )
+            self._run_conflict_resolution(snapshot)
+            self._refresh_state()
+            return False
+        current = (
+            self.draft.module_by_id(self.current_module_id) if self.current_module_id else None
+        )
+        current_name = current.current_name if current is not None else None
+        result = self.conflict_service.commit(
+            session,
+            proposal,
+            snapshot,
+            live_external_hash=snapshot.file_fingerprint.sha256,
+            external_path=session.original_path,
+            session_service=self.session_service,
+            recovery_service=self.recovery_service,
+        )
+        if result.kind != "success":
+            messagebox.showerror(
+                APP_NAME,
+                f"{path.name} changed on disk after you opened it, and your edits "
+                "could not be applied to the new version: "
+                + (result.message or result.reason or "unknown")
+                + "\n\nNothing was overwritten and your draft is kept.",
+            )
+            self._refresh_state()
+            return False
+        self.draft = session.draft
+        self._reload_editors_from_draft()
+        if current_name is not None and (
+            self.current_module_id is None or self.draft.module_by_id(self.current_module_id) is None
+        ):
+            moved = self.draft.find_current(current_name)
+            if moved is not None:
+                self._open_module_at(moved.id, 1)
+        return True
 
     def _save_work(self):
         """Worker-thread half of save: commit, then publish the session baseline."""
@@ -955,7 +1162,7 @@ class MainWindow:
             )
         return result, published
 
-    def _handle_save_result(self, result, *, published=None) -> None:
+    def _handle_save_result(self, result, *, published=None, note: str = "") -> None:
         self._last_result = result
         kind = result.kind
         if kind == "success":
@@ -996,6 +1203,8 @@ class MainWindow:
                     self.xml_editor.set_part_info(part)
             self._refresh_state()
             msg = "Saved successfully."
+            if note:
+                msg += f"\n\n{note}"
             if result.backup_path:
                 msg += f"\n\nBackup: {result.backup_path}"
             if warning:
@@ -2463,7 +2672,8 @@ class MainWindow:
     def _cancel_afters(self) -> None:
         self._release_prescan_gc()
         for attr in (
-            "_idle_after", "_max_after", "_poll_after", "_recovery_after", "_prescan_after"
+            "_idle_after", "_max_after", "_poll_after", "_recovery_after", "_prescan_after",
+            "_queue_after",
         ):
             handle = getattr(self, attr, None)
             if handle is None:

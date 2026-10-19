@@ -290,6 +290,12 @@ class SaveService:
             win32_name=probe.win32_name,
         )
 
+    def host_block(self, original: Path) -> SaveResult | None:
+        """Why ``original`` cannot be replaced right now (Office running, file in use), or None."""
+        return self._office_block(original, stage="preflight") or self._lock_block(
+            original, stage="preflight"
+        )
+
     def _race_narrowing(self, original: Path, draft: DocumentDraft, candidate: Path) -> SaveResult | None:
         self._report("Final pre-commit checks")
         blocked = self._office_block(original, stage="pre_commit")

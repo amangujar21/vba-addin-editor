@@ -79,8 +79,8 @@ def test_blocked_save_leaves_button_retryable(work_xlam: Path, monkeypatch):
             lambda *_a, **_k: True,
         )
         monkeypatch.setattr(
-            "vba_addin_editor.ui.main_window.messagebox.showwarning",
-            lambda *_a, **_k: None,
+            "vba_addin_editor.ui.main_window.messagebox.askyesno",
+            lambda *_a, **_k: False,  # don't wait for Office to close
         )
         monkeypatch.setattr(
             "vba_addin_editor.ui.main_window.messagebox.showinfo",

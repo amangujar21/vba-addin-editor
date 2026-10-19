@@ -89,6 +89,7 @@ def test_a_second_save_waits_for_the_pre_read_then_succeeds(window, work_xlam):
 def test_a_blocked_save_starts_no_pre_read(window, work_xlam, monkeypatch):
     _, opened = _hold_scans(window)
     monkeypatch.setattr(mw.messagebox, "showwarning", lambda *a, **k: None)
+    monkeypatch.setattr(mw.messagebox, "askyesno", lambda *a, **k: False)  # don't wait for Office
     window.save_service.process_probe = lambda p: True
     module = window.draft.find_current("Module1")
     window._open_module_at(module.id, 1)
