@@ -6,7 +6,7 @@ from typing import Any
 
 APP_NAME = "VBA Add-in Editor"
 APP_EXE_BASENAME = "VBAAddinEditor"
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 
 # Pinned dependency, recorded for THIRD_PARTY_NOTICES and diagnostics.
 PYOPENVBA_PIN = "6.2.0"
