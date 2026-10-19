@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from tkinter import messagebox, ttk
 
 from vba_addin_editor.services import ribbon_service as rs
+from vba_addin_editor.ui import theme
 from vba_addin_editor.version import APP_NAME
 
 _ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
@@ -434,13 +435,14 @@ class RibbonButtonsDialog:
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.tree.tag_configure("problem", foreground="#b00020")
+        self.tree.tag_configure("problem", foreground=theme.palette().danger)
         self.tree.bind("<Double-Button-1>", lambda _e: self.goto_macro())
         self.tree.bind("<Return>", lambda _e: self.goto_macro())
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._sync_buttons())
 
         buttons = ttk.Frame(win, padding=8)
-        buttons.pack(fill="x")
+        # Ahead of the list in packing order, so a short window shrinks the list, not the buttons.
+        buttons.pack(fill="x", side="bottom", before=body)
         self.macro_btn = ttk.Button(buttons, text="Go to Macro", command=self.goto_macro)
         self.macro_btn.pack(side="left", padx=2)
         self.xml_btn = ttk.Button(buttons, text="Go to XML", command=self.goto_xml)

@@ -56,6 +56,7 @@ from vba_addin_editor.services.save_service import SaveService
 from vba_addin_editor.services.search_service import SearchService
 from vba_addin_editor.services.session_service import SessionService
 from vba_addin_editor.services.validation_service import validate_module_name
+from vba_addin_editor.ui import theme
 from vba_addin_editor.ui.code_editor import CodeEditor
 from vba_addin_editor.ui.conflict_dialog import ConflictDialog
 from vba_addin_editor.ui.ribbon_dialogs import (
@@ -81,6 +82,17 @@ _T = TypeVar("_T")
 # Save blocks that clear once Office closes or lets go of the file.
 _HOST_WAIT_REASONS = frozenset({"office_running", "file_in_use"})
 QUEUED_SAVE_POLL_MS = 500
+MAX_RECENT_FILES = 8
+MIN_CODE_SIZE, MAX_CODE_SIZE = 7, 28
+_FILE_KINDS = {".xlam": "Excel add-in", ".ppam": "PowerPoint add-in", ".pptm": "PowerPoint presentation"}
+
+
+def _shorten(text: str, limit: int = 56) -> str:
+    """Keep both ends of a long path, joined by an ellipsis."""
+    if len(text) <= limit:
+        return text
+    keep = (limit - 1) // 2
+    return text[:keep] + "…" + text[-keep:]
 
 
 def _draft_signature(draft: DocumentDraft) -> str:
@@ -149,13 +161,19 @@ class MainWindow:
             enable_source_disk_cache(appdata_root() / "source-cache" / f"pyopenvba-{PYOPENVBA_PIN}")
 
         root.title(APP_NAME)
-        root.geometry("1000x680")
+        root.geometry("1100x700")
         root.minsize(760, 480)
+        # Before any widget exists: classic Tk widgets read the option database once.
+        theme.apply_theme(root, self.settings.theme, self.settings.editor_font_size)
+        theme.set_title_bar(root)
         self._build_menu()
         self._build_toolbar()
         self._build_panes()
         self._build_statusbar()
         self._bind_shortcuts()
+        for tree in (self.tree, self.xml_tree, self.forms_tree):
+            self._configure_tree_tags(tree)
+        self._refresh_state()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<Destroy>", self._on_root_destroy, add=True)
         root.bind("<FocusIn>", self._on_focus_in, add=True)
@@ -172,10 +190,37 @@ class MainWindow:
 
     # -- construction ------------------------------------------------------
 
+    def _header_menu(self, label: str) -> tk.Menu:
+        """A header button with its drop-down menu (the dark stand-in for a Win32 menu bar)."""
+        button = ttk.Menubutton(self.header, text=label, style="Header.TMenubutton", takefocus=False)
+        button.pack(side="left")
+        menu = tk.Menu(button, tearoff=0)
+        button.configure(menu=menu)
+        self._header_buttons.append(button)
+        self._menus.append(menu)
+        # Alt+<first letter> opens it, as on a native menu bar; F10 opens the first.
+        self.root.bind(f"<Alt-KeyPress-{label[0].lower()}>", lambda _e: self._post_header_menu(button))
+        return menu
+
+    def _post_header_menu(self, button: ttk.Menubutton) -> str:
+        if str(button.cget("state")) != "disabled":
+            menu = self.root.nametowidget(button.cget("menu"))
+            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        return "break"
+
     def _build_menu(self) -> None:
-        bar = tk.Menu(self.root)
-        file_menu = tk.Menu(bar, tearoff=0)
+        self.header = ttk.Frame(self.root, style="Chrome.TFrame", padding=(6, 6, 10, 6))
+        self.header.pack(fill="x", side="top")
+        ttk.Label(self.header, text="◆", style="Logo.TLabel").pack(side="left", padx=(6, 6))
+        self._header_buttons: list[ttk.Menubutton] = []
+        self._menus: list[tk.Menu] = []
+        self.root.bind("<F10>", lambda _e: self._post_header_menu(self._header_buttons[0]))
+
+        file_menu = self._header_menu("File")
         file_menu.add_command(label="Open Office VBA File…", accelerator="Ctrl+O", command=self.open_file)
+        self.recent_menu = tk.Menu(file_menu, tearoff=0, postcommand=self._fill_recent_menu)
+        self._menus.append(self.recent_menu)
+        file_menu.add_cascade(label="Open Recent", menu=self.recent_menu)
         file_menu.add_command(label="Save File", accelerator="Ctrl+S", command=self.save)
         file_menu.add_command(label="Save a Copy…", accelerator="Ctrl+Shift+S", command=self.save_copy)
         file_menu.add_separator()
@@ -194,9 +239,8 @@ class MainWindow:
         file_menu.add_command(label="Preview Folder Changes…", command=self.preview_folder_changes)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.on_close)
-        bar.add_cascade(label="File", menu=file_menu)
 
-        edit_menu = tk.Menu(bar, tearoff=0)
+        edit_menu = self._header_menu("Edit")
         edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
         edit_menu.add_command(label="Redo", accelerator="Ctrl+Y", command=self.redo)
         edit_menu.add_separator()
@@ -208,9 +252,8 @@ class MainWindow:
             label="Find Next", accelerator="F3", command=lambda: self._active_text_editor().find_next()
         )
         edit_menu.add_command(label="Find in Project…", accelerator="Ctrl+Shift+F", command=self.project_search)
-        bar.add_cascade(label="Edit", menu=edit_menu)
 
-        module_menu = tk.Menu(bar, tearoff=0)
+        module_menu = self._header_menu("Module")
         module_menu.add_command(label="Add Standard Module…", command=lambda: self.add_module(standard=True))
         module_menu.add_command(label="Add Class Module…", command=lambda: self.add_module(standard=False))
         module_menu.add_command(label="Rename…", command=self.rename_module)
@@ -219,9 +262,8 @@ class MainWindow:
         module_menu.add_command(label="Import .bas/.cls…", command=self.import_file)
         module_menu.add_command(label="Export Current Module…", command=self.export_module)
         module_menu.add_command(label="Export All…", command=self.export_all)
-        bar.add_cascade(label="Module", menu=module_menu)
 
-        ribbon_menu = tk.Menu(bar, tearoff=0)
+        ribbon_menu = self._header_menu("Ribbon")
         ribbon_menu.add_command(label="Ribbon Buttons…", command=self.show_ribbon_buttons)
         ribbon_menu.add_command(
             label="Go to Macro / Button", accelerator="F12", command=self.goto_callback_under_cursor
@@ -232,28 +274,51 @@ class MainWindow:
         ribbon_menu.add_command(label="Add Ribbon Menu…", command=self.add_ribbon_menu)
         ribbon_menu.add_separator()
         ribbon_menu.add_command(label="Check Ribbon Callbacks", command=self.check_ribbon_callbacks)
-        bar.add_cascade(label="Ribbon", menu=ribbon_menu)
 
-        help_menu = tk.Menu(bar, tearoff=0)
+        view_menu = self._header_menu("View")
+        self.theme_var = tk.StringVar(master=self.root, value=theme.palette().name)
+        view_menu.add_radiobutton(
+            label="Dark Theme", value="dark", variable=self.theme_var, command=self._on_theme_chosen
+        )
+        view_menu.add_radiobutton(
+            label="Light Theme", value="light", variable=self.theme_var, command=self._on_theme_chosen
+        )
+        view_menu.add_separator()
+        view_menu.add_command(label="Zoom In", accelerator="Ctrl+=", command=lambda: self.zoom(1))
+        view_menu.add_command(label="Zoom Out", accelerator="Ctrl+-", command=lambda: self.zoom(-1))
+        view_menu.add_command(label="Reset Zoom", accelerator="Ctrl+0", command=lambda: self.zoom(0))
+
+        help_menu = self._header_menu("Help")
         help_menu.add_command(label="About", command=self.show_about)
         help_menu.add_command(label="Copy Diagnostic Report", command=self.copy_last_diagnostic)
-        bar.add_cascade(label="Help", menu=help_menu)
         self._last_result = None
-        self.menubar = bar
-        self.root.config(menu=bar)
 
     def _build_toolbar(self) -> None:
-        bar = ttk.Frame(self.root, padding=4)
-        bar.pack(fill="x")
-        ttk.Button(bar, text="Open", command=self.open_file).pack(side="left", padx=2)
-        self.save_btn = ttk.Button(bar, text="Save File", command=self.save, state="disabled")
-        self.save_btn.pack(side="left", padx=2)
-        self.review_btn = ttk.Button(bar, text="Review Changes", command=self.review_changes, state="disabled")
-        self.review_btn.pack(side="left", padx=2)
-        self.revert_btn = ttk.Button(bar, text="Revert All", command=self.revert_all, state="disabled")
-        self.revert_btn.pack(side="left", padx=2)
-        self.file_label = ttk.Label(bar, text="No add-in open")
-        self.file_label.pack(side="right", padx=8)
+        """File identity and the save actions, on the right of the header."""
+        bar = self.header
+        self.save_btn = ttk.Button(bar, text="Save", style="Accent.TButton", command=self.save, state="disabled")
+        self.save_btn.configure(width=8)
+        self.review_btn = ttk.Button(
+            bar, text="Review", style="Toolbar.TButton", command=self.review_changes, state="disabled"
+        )
+        self.revert_btn = ttk.Button(
+            bar, text="Revert", style="Toolbar.TButton", command=self.revert_all, state="disabled"
+        )
+        self.file_label = ttk.Label(bar, text="", style="Title.TLabel")
+        self.file_label.pack(side="left", padx=(22, 0))
+        self.dirty_label = ttk.Label(bar, text="", style="Dirty.TLabel")
+        self.dirty_label.pack(side="left", padx=(12, 0))
+
+    def _show_header_actions(self, show: bool) -> None:
+        """Save, Review and Revert appear once a file is open."""
+        buttons = (self.save_btn, self.review_btn, self.revert_btn)
+        if not show:
+            for button in buttons:
+                button.pack_forget()
+        elif not self.save_btn.winfo_manager():
+            # Packed ahead of the labels: when the header is narrow the file name gives way, not Save.
+            for button in buttons:
+                button.pack(side="right", padx=(6, 0), before=self.file_label)
 
     def _build_panes(self) -> None:
         self.editor_notebook = ttk.Notebook(self.root)
@@ -263,22 +328,142 @@ class MainWindow:
         self._build_xml_tab(self.xml_tab)
         self.forms_tab = ttk.Frame(self.editor_notebook)
         self._build_forms_tab(self.forms_tab)
-        self.editor_notebook.add(vba_tab, text="VBA")
-        self.editor_notebook.add(self.xml_tab, text="XML")
-        self.editor_notebook.add(self.forms_tab, text="Forms")
+        self.editor_notebook.add(vba_tab, text="VBA code")
+        self.editor_notebook.add(self.xml_tab, text="Ribbon & XML")
+        self.editor_notebook.add(self.forms_tab, text="UserForms")
         self.editor_notebook.pack(fill="both", expand=True)
-        self.banner = ttk.Label(self.root, text="", background="#fff3cd", padding=4)
-        self.banner.pack(fill="x", before=self.editor_notebook)
-        self.banner.pack_forget()
+        self._build_welcome()
+        self.banner = ttk.Label(self.root, text="", style="Banner.TLabel", padding=(14, 7))
         # Shown while a save waits for the Office host to release the file.
-        self.wait_bar = ttk.Frame(self.root, padding=(4, 2))
-        self.wait_label = ttk.Label(self.wait_bar, text="")
+        self.wait_bar = ttk.Frame(self.root, padding=(14, 5), style="Banner.TFrame")
+        self.wait_label = ttk.Label(self.wait_bar, text="", style="Banner.TLabel")
         self.wait_label.pack(side="left", fill="x", expand=True)
         self.wait_cancel_btn = ttk.Button(
             self.wait_bar, text="Cancel Auto-Save", command=self.cancel_queued_save
         )
         self.wait_cancel_btn.pack(side="right")
         self._install_ribbon_actions()
+
+    def _build_welcome(self) -> None:
+        """What a first-time user sees until a file is open: one clear thing to do."""
+        self.welcome = ttk.Frame(self.root)
+        inner = ttk.Frame(self.welcome)
+        inner.place(relx=0.5, rely=0.42, anchor="center")
+        ttk.Label(inner, text="Open an Office add-in", style="Hero.TLabel").pack()
+        # Text set by _show_welcome: it depends on the backup setting.
+        self.welcome_note = ttk.Label(inner, style="Muted.TLabel", justify="center", wraplength=520)
+        self.welcome_note.pack(pady=(8, 20))
+        ttk.Button(
+            inner, text="Open file…", style="Accent.TButton", padding=(24, 7), command=self.open_file
+        ).pack()
+        ttk.Label(inner, text="or press Ctrl+O", style="Faint.TLabel").pack(pady=(6, 0))
+        self.welcome_recent = ttk.Frame(inner)
+        self.welcome_recent.pack(fill="x", pady=(26, 0))
+        self.welcome.place(in_=self.editor_notebook, x=0, y=0, relwidth=1, relheight=1)
+
+    def _show_welcome(self, show: bool) -> None:
+        if not show:
+            self.welcome.place_forget()
+            return
+        backup_note = " The original is kept as a backup when you save." if self.settings.auto_backup else ""
+        self.welcome_note.config(
+            text="Edit VBA modules and ribbon XML in .xlam, .ppam and .pptm files.\n"
+            "Office does not need to be installed or running." + backup_note
+        )
+        for child in self.welcome_recent.winfo_children():
+            child.destroy()
+        recent = self._recent_files()
+        if recent:
+            ttk.Label(self.welcome_recent, text="RECENT", style="Caption.TLabel").pack(anchor="w", pady=(0, 4))
+        for path in recent[:5]:
+            row = ttk.Frame(self.welcome_recent)
+            row.pack(fill="x", pady=1)
+            link = ttk.Label(row, text=path.name, style="Link.TLabel", cursor="hand2")
+            link.pack(side="left")
+            link.bind("<Button-1>", lambda _e, p=path: self.open_recent(p))
+            ttk.Label(row, text=_shorten(str(path.parent)), style="Faint.TLabel").pack(side="left", padx=(10, 0))
+        self.welcome.place(in_=self.editor_notebook, x=0, y=0, relwidth=1, relheight=1)
+        self.welcome.lift()
+
+    # -- recent files ----------------------------------------------------------
+
+    def _recent_files(self) -> list[Path]:
+        return [Path(p) for p in self.settings.recent_files if isinstance(p, str) and p]
+
+    def _remember_recent(self, path: Path) -> None:
+        entry = str(path)
+        kept = [p for p in self.settings.recent_files if isinstance(p, str) and p.casefold() != entry.casefold()]
+        self.settings.recent_files = [entry, *kept][:MAX_RECENT_FILES]
+        save_settings(self.settings, self._settings_path)
+
+    def _forget_recent(self, path: Path) -> None:
+        entry = str(path).casefold()
+        self.settings.recent_files = [
+            p for p in self.settings.recent_files if isinstance(p, str) and p.casefold() != entry
+        ]
+        save_settings(self.settings, self._settings_path)
+
+    def _fill_recent_menu(self) -> None:
+        menu = self.recent_menu
+        menu.delete(0, "end")
+        recent = self._recent_files()
+        for path in recent:
+            menu.add_command(label=str(path), command=lambda p=path: self.open_recent(p))
+        if not recent:
+            menu.add_command(label="No recent files", state="disabled")
+
+    def open_recent(self, path: Path) -> None:
+        if not path.exists():
+            self._forget_recent(path)
+            messagebox.showinfo(APP_NAME, f"{path.name} is no longer at\n{path.parent}")
+            if self.draft is None:
+                self._show_welcome(True)
+            return
+        self.load_path(path)
+
+    # -- view ------------------------------------------------------------------
+
+    def zoom(self, step: int) -> None:
+        """Grow (1), shrink (-1) or reset (0) the code font in every editor."""
+        size = theme.CODE_SIZE if step == 0 else self.settings.editor_font_size + step
+        size = min(max(size, MIN_CODE_SIZE), MAX_CODE_SIZE)
+        if size == self.settings.editor_font_size:
+            return
+        self.settings.editor_font_size = size
+        self.root.tk.call("font", "configure", theme.code_font(self.root), "-size", size)
+        for editor in (self.editor, self.xml_editor):
+            editor._redraw_line_numbers()
+        save_settings(self.settings, self._settings_path)
+        self.status.config(text=f"Code font size {size}")
+
+    def _on_theme_chosen(self) -> None:
+        name = self.theme_var.get()
+        if name == self.settings.theme:
+            return
+        self.settings.theme = name
+        save_settings(self.settings, self._settings_path)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        """Restyle the open window: ttk widgets follow their styles; the rest is set here."""
+        colors = theme.apply_theme(self.root, self.settings.theme, self.settings.editor_font_size)
+        menu_colors = theme.menu_options(colors)
+        for menu in self._menus + [self.editor.context_menu.menu, self.xml_editor.context_menu.menu]:
+            menu.configure(**menu_colors)
+        for editor in (self.editor, self.xml_editor):
+            editor.apply_palette()
+        for tree in (self.tree, self.xml_tree, self.forms_tree):
+            self._configure_tree_tags(tree)
+        theme.set_title_bar(self.root)
+
+    def _configure_tree_tags(self, tree: ttk.Treeview) -> None:
+        colors = theme.palette()
+        tree.tag_configure("group", foreground=colors.muted, font=theme.BOLD_FONT)
+        tree.tag_configure("dirty", foreground=colors.warn)
+        tree.tag_configure("new", foreground=colors.ok)
+        tree.tag_configure("renamed", foreground=colors.info)
+        tree.tag_configure("locked", foreground=colors.muted)
+        tree.tag_configure("readonly", foreground=colors.warn)
 
     def _install_ribbon_actions(self) -> None:
         xml_menu = self.xml_editor.context_menu
@@ -309,10 +494,10 @@ class MainWindow:
         panes = ttk.Panedwindow(parent, orient="horizontal")
         panes.pack(fill="both", expand=True)
 
-        left = ttk.Frame(panes, padding=4)
+        left = ttk.Frame(panes, padding=(6, 8, 0, 6))
         self.tree = ttk.Treeview(left, show="tree", selectmode="browse")
         tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_sb.set)
+        self.tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
         self.tree.pack(side="left", fill="both", expand=True)
         tree_sb.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self.on_module_selected)
@@ -327,16 +512,16 @@ class MainWindow:
         panes = ttk.Panedwindow(parent, orient="horizontal")
         panes.pack(fill="both", expand=True)
 
-        left = ttk.Frame(panes, padding=4)
+        left = ttk.Frame(panes, padding=(6, 8, 0, 6))
         bar = ttk.Frame(left)
-        bar.pack(fill="x")
+        bar.pack(fill="x", pady=(0, 6))
         self.validate_xml_btn = ttk.Button(
             bar, text="Validate XML", command=self._validate_selected_xml, state="disabled"
         )
-        self.validate_xml_btn.pack(side="left", padx=2)
+        self.validate_xml_btn.pack(side="left")
         self.xml_tree = ttk.Treeview(left, show="tree", selectmode="browse")
         tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.xml_tree.yview)
-        self.xml_tree.configure(yscrollcommand=tree_sb.set)
+        self.xml_tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
         self.xml_tree.pack(side="left", fill="both", expand=True)
         tree_sb.pack(side="right", fill="y")
         self.xml_tree.bind("<<TreeviewSelect>>", self.on_xml_part_selected)
@@ -355,32 +540,34 @@ class MainWindow:
         panes = ttk.Panedwindow(parent, orient="horizontal")
         panes.pack(fill="both", expand=True)
 
-        left = ttk.Frame(panes, padding=4)
+        left = ttk.Frame(panes, padding=(6, 8, 0, 6))
         bar = ttk.Frame(left)
-        bar.pack(fill="x")
+        bar.pack(fill="x", pady=(0, 6))
         self.form_code_btn = ttk.Button(
             bar, text="Go to Code", command=self.goto_form_code, state="disabled"
         )
-        self.form_code_btn.pack(side="left", padx=2)
+        self.form_code_btn.pack(side="left")
         self.forms_tree = ttk.Treeview(left, show="tree", selectmode="browse")
         tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.forms_tree.yview)
-        self.forms_tree.configure(yscrollcommand=tree_sb.set)
+        self.forms_tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
         self.forms_tree.pack(side="left", fill="both", expand=True)
         tree_sb.pack(side="right", fill="y")
         self.forms_tree.bind("<<TreeviewSelect>>", self.on_form_item_selected)
         panes.add(left, weight=1)
 
-        right = ttk.Frame(panes, padding=4)
-        self.form_heading = ttk.Label(right, text="", anchor="w", wraplength=560, justify="left")
+        right = ttk.Frame(panes, padding=(12, 8))
+        self.form_heading = ttk.Label(
+            right, text="", anchor="w", wraplength=560, justify="left", style="Heading.TLabel"
+        )
         self.form_heading.pack(fill="x")
         props = ttk.Frame(right)
-        props.pack(fill="both", expand=True, pady=(4, 0))
+        props.pack(fill="both", expand=True, pady=(8, 0))
         self.form_props = ttk.Treeview(props, columns=("value",), show="tree headings", selectmode="browse")
         self.form_props.heading("#0", text="Property")
         self.form_props.heading("value", text="Value")
         self.form_props.column("#0", width=200, stretch=False)
         props_sb = ttk.Scrollbar(props, orient="vertical", command=self.form_props.yview)
-        self.form_props.configure(yscrollcommand=props_sb.set)
+        self.form_props.configure(yscrollcommand=theme.autohide(props_sb, side="right", fill="y"))
         self.form_props.pack(side="left", fill="both", expand=True)
         props_sb.pack(side="right", fill="y")
         ttk.Label(
@@ -389,10 +576,10 @@ class MainWindow:
                 "Read-only view. Only properties that differ from the control's "
                 "default are stored in the file, so only those are listed."
             ),
-            foreground="#555555",
+            style="Muted.TLabel",
             wraplength=560,
             justify="left",
-        ).pack(fill="x", pady=(4, 0))
+        ).pack(fill="x", pady=(8, 0))
         panes.add(right, weight=3)
 
         self._form_items: dict[str, tuple[str, FormDesignSnapshot | FormControlSnapshot]] = {}
@@ -468,13 +655,36 @@ class MainWindow:
             self._open_module_at(mod.id, 1)
 
     def _build_statusbar(self) -> None:
-        self.statusbar = ttk.Frame(self.root)
-        self.statusbar.pack(fill="x", side="bottom")
+        self.statusbar = ttk.Frame(self.root, style="Chrome.TFrame")
+        # Packed ahead of the tabs, so a small window shrinks the editor, not the status bar.
+        self.statusbar.pack(fill="x", side="bottom", before=self.editor_notebook)
         # Right: whether antivirus has finished with the last saved file.
-        self.scan_status = ttk.Label(self.statusbar, text="", padding=3, anchor="e")
+        self.scan_status = ttk.Label(self.statusbar, text="", padding=(10, 4), anchor="e", style="Status.TLabel")
         self.scan_status.pack(side="right")
-        self.status = ttk.Label(self.statusbar, text="Ready", padding=3, anchor="w")
+        self.cursor_label = ttk.Label(self.statusbar, text="", padding=(10, 4), style="Status.TLabel")
+        self.cursor_label.pack(side="right")
+        self.status = ttk.Label(self.statusbar, text="Ready", padding=(10, 4), anchor="w", style="Status.TLabel")
         self.status.pack(fill="x", side="left", expand=True)
+        for editor in (self.editor, self.xml_editor):
+            editor.bind("<<CursorMove>>", lambda _e: self._update_cursor_label(), add=True)
+        self.editor_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._update_cursor_label(), add=True)
+
+    def _update_cursor_label(self) -> None:
+        tab = str(self.editor_notebook.select())
+        if self.draft is None or tab == str(self.forms_tab):
+            self.cursor_label.config(text="")
+            return
+        editor = self._active_text_editor()
+        if editor is self.editor and self.current_module_id is None:
+            self.cursor_label.config(text="")
+            return
+        if editor is self.xml_editor and self.current_xml_part_path is None:
+            self.cursor_label.config(text="")
+            return
+        line, column = editor.cursor_position().split(".")
+        language = "VBA" if editor is self.editor else "XML"
+        kind = _FILE_KINDS.get(self.draft.baseline.path.suffix.lower(), "")
+        self.cursor_label.config(text=f"Ln {line}, Col {int(column) + 1}   ·   {language}   ·   {kind}")
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self.open_file())
@@ -488,13 +698,15 @@ class MainWindow:
         self.root.bind("<Control-z>", lambda _e: self.undo())
         self.root.bind("<Control-y>", lambda _e: self.redo())
         self.root.bind("<F12>", lambda _e: self.goto_callback_under_cursor())
+        for sequence, step in (("<Control-equal>", 1), ("<Control-plus>", 1), ("<Control-minus>", -1), ("<Control-0>", 0)):
+            self.root.bind(sequence, lambda _e, step=step: self.zoom(step))
 
     # -- banners / status ----------------------------------------------------
 
     def _set_banner(self, text: str) -> None:
         if text:
-            self.banner.config(text=text)
-            self.banner.pack(fill="x", before=self.statusbar)
+            self.banner.config(text=text, wraplength=max(self.root.winfo_width() - 40, 400))
+            self.banner.pack(fill="x", side="top", before=self.statusbar)
         else:
             self.banner.pack_forget()
 
@@ -631,26 +843,33 @@ class MainWindow:
         self._set_menubar_state("normal")
 
     def _set_menubar_state(self, state: str) -> None:
-        try:
-            last = self.menubar.index("end")
-            for i in range(0 if last is None else last + 1):
-                self.menubar.entryconfig(i, state=state)
-        except tk.TclError:
-            pass
+        for button in self._header_buttons:
+            try:
+                button.configure(state=state)
+            except tk.TclError:
+                pass
 
     def _refresh_state(self) -> None:
         draft = self.draft
         self._show_wait_bar()
         if draft is None:
-            self.file_label.config(text="No add-in open")
+            self.file_label.config(text="")
+            self.dirty_label.config(text="")
             self.save_btn.config(state="disabled")
             self.review_btn.config(state="disabled")
             self.revert_btn.config(state="disabled")
             self.status.config(text="Open an add-in to begin.")
+            self._show_header_actions(False)
+            self._show_welcome(True)
+            self._update_cursor_label()
             return
+        self._show_welcome(False)
+        self._show_header_actions(True)
         name = draft.baseline.path.name
         n = dirty_count(draft)
-        self.file_label.config(text=f"{name} — unsaved changes: {n}")
+        self.file_label.config(text=name)
+        self.dirty_label.config(text=f"●  {n} unsaved" if n else "")
+        self._update_cursor_label()
         inplace_ok = (
             not self._saving
             and (self.session is None or (self.session.original_exists and not self.session.conflicts_pending))
@@ -695,7 +914,7 @@ class MainWindow:
             text=f"Waiting for {wp.corresponding_host_label(self.draft.baseline.path)} "
             f"to close. {self.draft.baseline.path.name} will be saved automatically."
         )
-        self.wait_bar.pack(fill="x", before=self.statusbar, side="bottom")
+        self.wait_bar.pack(fill="x", after=self.statusbar, side="bottom")
 
     def _refresh_tree(self) -> None:
         draft = self.draft
@@ -707,18 +926,18 @@ class MainWindow:
             "Standard Modules": [],
             "Class Modules": [],
             "UserForms": [],
-            "Object / Class / Form Code": [],
+            "Document Modules": [],
         }
         for m in draft.modules:
             if m.is_deleted:
                 continue
-            marker = ""
+            marker, tags = "", ()
             if m.is_new:
-                marker = " +"
+                marker, tags = "  +", ("new",)
             elif m.origin_name and m.current_name.casefold() != m.origin_name.casefold():
-                marker = " →"
+                marker, tags = "  →", ("renamed",)
             elif m.original_body is not None and m.body != m.original_body:
-                marker = " *"
+                marker, tags = "  ●", ("dirty",)
             if m.kind == ModuleDisplayKind.CLASS:
                 group = "Class Modules"
             elif m.pyopenvba_kind == "standard":
@@ -726,16 +945,18 @@ class MainWindow:
             elif m.project_item_kind == "userform":
                 group = "UserForms"
             else:
-                group = "Object / Class / Form Code"
+                group = "Document Modules"
             locked = not (m.can_delete or m.can_rename or m.is_new)
-            label = f"{m.current_name}{marker}" + ("" if not locked else " [lock]")
-            groups[group].append((m.id, label))
+            if locked:
+                tags = tags or ("locked",)
+            label = ("🔒 " if locked else "") + m.current_name + marker
+            groups[group].append((m.id, label, tags))
         for group, items in groups.items():
             if group == "UserForms" and not items:
                 continue
-            parent = self.tree.insert("", "end", text=group, open=True)
-            for mid, label in items:
-                self.tree.insert(parent, "end", iid=mid, text=label)
+            parent = self.tree.insert("", "end", text=group, open=True, tags=("group",))
+            for mid, label, tags in items:
+                self.tree.insert(parent, "end", iid=mid, text=label, tags=tags)
 
     # -- editor plumbing ------------------------------------------------------
 
@@ -798,6 +1019,10 @@ class MainWindow:
         self.editor.set_text(mod.body)
         self.editor.text.config(state="normal")  # body editing allowed; deletion is gated
         self._refresh_state()
+        if mod.restriction_reason and not mod.is_new:
+            # Newcomers see a lock in the tree; say what it means.
+            reason = RESTRICTION_MESSAGES.get(mod.restriction_reason, mod.restriction_reason)
+            self.status.config(text=f"{mod.current_name}: {reason} Its code can still be edited.")
 
     def on_xml_part_selected(self, _event=None) -> None:
         draft = self.draft
@@ -830,10 +1055,13 @@ class MainWindow:
         if draft is None:
             return
         for part in sorted(draft.xml_parts, key=lambda p: p.path.lower()):
-            marker = " *" if part.is_dirty() else ""
+            dirty = part.is_dirty()
             iid = "xml::" + part.path
             warning = "⚠ " if not part.editable else ""
-            self.xml_tree.insert("", "end", iid=iid, text=warning + part.path + marker)
+            tags = ("readonly",) if not part.editable else ("dirty",) if dirty else ()
+            self.xml_tree.insert(
+                "", "end", iid=iid, text=warning + part.path + ("  ●" if dirty else ""), tags=tags
+            )
 
     def _active_text_editor(self):
         if str(self.editor_notebook.select()) == str(self.xml_tab):
@@ -929,6 +1157,7 @@ class MainWindow:
         if first:
             self.tree.selection_set(first)
         self._refresh_state()
+        self._remember_recent(path)
         self.status.config(text=f"Opened {path.name}")
 
     def save(self) -> None:
@@ -2687,5 +2916,9 @@ class MainWindow:
 
 def run_gui() -> None:
     root = tk.Tk()
+    # Hidden while it is built: Windows 10 paints the dark title bar only if
+    # it is set before the window first appears.
+    root.withdraw()
     MainWindow(root)
+    root.deiconify()
     root.mainloop()

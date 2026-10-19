@@ -15,7 +15,7 @@ lets Office load the updated code the next time it starts.
 1. You can open the add-in while Excel or PowerPoint is running. Edits are kept
    in the editor; the corresponding host must still be closed before a successful
    in-place save. Close Excel for `.xlam`, or PowerPoint for `.ppam`/`.pptm`.
-   The unrelated host does not block saving. If you click **Save File** while
+   The unrelated host does not block saving. If you click **Save** while
    the host is running (or still shutting down, or another program has the file
    open), the editor offers to wait: a bar shows it is waiting, and it saves as
    soon as the file is free (**Cancel Auto-Save** stops waiting). Edits made
@@ -29,10 +29,10 @@ lets Office load the updated code the next time it starts.
 2. Edit code; add/rename/delete standard modules and ordinary class modules.
    UserForms can be deleted (code and layout together) but not renamed; host
    document modules and other designer components stay locked for
-   rename/delete. The **Forms** tab shows each UserForm's controls and stored
-   properties (read-only). On `.xlam`/`.ppam`/`.pptm`, switch to the **XML**
-   tab to edit existing package parts.
-3. **Save File** reviews the current draft, verifies the original has not
+   rename/delete. The **UserForms** tab shows each UserForm's controls and stored
+   properties (read-only). On `.xlam`/`.ppam`/`.pptm`, switch to the **Ribbon &
+   XML** tab to edit existing package parts.
+3. **Save** (Ctrl+S) reviews the current draft, verifies the original has not
    changed, builds a verified candidate, and atomically replaces the original,
    keeping the old file as a same-folder backup. **File → Back Up
    Automatically on Save** turns that backup off (the choice is remembered);
@@ -53,17 +53,24 @@ lets Office load the updated code the next time it starts.
    Replace applies one undoable batch. **Restore Backup** is a verified
    replace with a pre-restore safety copy; it does not run automatically after
    a failed final verification.
+7. The window is dark by default; **View → Light Theme** switches it, and
+   **View → Zoom In / Zoom Out** (Ctrl+= / Ctrl+-, Ctrl+0 to reset) sizes the
+   code font. Both are remembered. With no file open the window offers
+   **Open file…** and your recently opened files (also under **File → Open
+   Recent**). In the module list, ● marks an edited module, + a new one, → a
+   renamed one, and 🔒 one that cannot be renamed or deleted (its code can
+   still be edited; selecting it says why). VBA and XML are syntax-coloured.
 
 ## Ribbon buttons ↔ macros
 
 For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
 
-- **Go to Macro** — in the XML tab, Ctrl+click (or right-click, or F12) any
+- **Go to Macro** — in the Ribbon & XML tab, Ctrl+click (or right-click, or F12) any
   `onAction="…"` or other callback attribute to jump to that Sub. If it does
   not exist, you are offered a stub with the right callback signature,
   placed in the module that already holds most of your ribbon callbacks.
 - **Add Ribbon Button for This Macro** — right-click inside a Sub in the VBA
-  tab. Pick the label, group or menu, icon and size. The id is generated
+  code tab. Pick the label, group or menu, icon and size. The id is generated
   and unique, the XML is inserted with matching indentation, and a small
   `…Callback(control As IRibbonControl)` wrapper is added when the Sub has
   no ribbon argument. One Undo reverts both.
@@ -72,7 +79,7 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   preselected), icon and sizes, and optionally tick the macros to add as its
   buttons. The `<menu>` block is inserted with matching indentation and
   unique ids; more buttons can be added to it later with Add Ribbon Button.
-- **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA tab.
+- **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA code tab.
 - **Ribbon → Ribbon Buttons…** lists every callback with its module and
   status; **Check Ribbon Callbacks** and **Validate XML** report callbacks
   that point to missing, ambiguous or class-module procedures, and duplicate
@@ -151,7 +158,7 @@ decompress modules that have not changed. The folder can be deleted at any time.
   byte-identical. Renaming a UserForm stays disabled (the layout storage would
   be orphaned). A deleted form's name cannot be reused until the deletion is
   saved. Folder import never deletes a UserForm.
-- UserForm layout is read-only: it can be viewed in the **Forms** tab but not
+- UserForm layout is read-only: it can be viewed in the **UserForms** tab but not
   created or edited; `.frm/.frx` import/export is not supported
   (`.bas`/`.cls` only).
 - A VBA signature is detected both inside `vbaProject.bin` and in the package

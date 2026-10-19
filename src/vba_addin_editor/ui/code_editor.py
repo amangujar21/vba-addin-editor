@@ -7,36 +7,45 @@ import re
 import tkinter as tk
 from tkinter import ttk
 
+from vba_addin_editor.ui import theme
+from vba_addin_editor.ui.highlight import TAGS, Highlighter
 from vba_addin_editor.ui.text_context_menu import install_text_context_menu
+
+LINE_SPACING = 2  # pixels above each line
 
 
 class CodeEditor(ttk.Frame):
-    def __init__(self, master, on_change=None) -> None:
-        super().__init__(master)
+    def __init__(self, master, on_change=None, language: str = "vba") -> None:
+        super().__init__(master, style="Editor.TFrame")
         self.on_change = on_change
         self._find_token = ""
-        self.linenumbers = tk.Canvas(self, width=44, highlightthickness=0, bg="#f0f0f0")
+        self._view_after = None
+        self.linenumbers = tk.Canvas(self, width=44, highlightthickness=0)
         self.text = tk.Text(
             self,
             wrap="none",
-            font=("Consolas", 11),
+            font=theme.code_font(self),
             undo=False,
             tabs=("4c",),
             blockcursor=False,
+            spacing1=LINE_SPACING,
+            insertwidth=2,
         )
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
         self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.text.xview)
-        self.text.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
+        self.text.configure(yscrollcommand=self._on_yscroll, xscrollcommand=self.hsb.set)
         self.linenumbers.grid(row=0, column=0, sticky="ns")
         self.text.grid(row=0, column=1, sticky="nsew")
         self.vsb.grid(row=0, column=2, sticky="ns")
         self.hsb.grid(row=1, column=1, sticky="ew")
         self.rowconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
+        self.highlighter = Highlighter(self.text, language)
         self.text.bind("<<Modified>>", self._on_modified, add=True)
-        self.text.bind("<KeyRelease>", lambda _e: self._redraw_line_numbers(), add=True)
-        self.text.bind("<ButtonRelease-1>", lambda _e: self._redraw_line_numbers(), add=True)
-        self.text.bind("<MouseWheel>", lambda _e: self.after_idle(self._redraw_line_numbers), add=True)
+        self.text.bind("<KeyRelease>", lambda _e: self._schedule_view_update(), add=True)
+        self.text.bind("<ButtonRelease-1>", lambda _e: self._schedule_view_update(), add=True)
+        self.text.bind("<B1-Motion>", lambda _e: self._schedule_view_update(), add=True)
+        self.text.bind("<Configure>", lambda _e: self._schedule_view_update(), add=True)
         # "break": the window binds the same keys for when focus is elsewhere,
         # and Tk's own Text bindings for them move the cursor / delete a character.
         self.text.event_add("<<Find>>", "<Control-f>")
@@ -45,10 +54,10 @@ class CodeEditor(ttk.Frame):
         self.text.bind("<<Replace>>", lambda _e: self._break(self.show_find(replace=True)))
         self.text.bind("<F3>", lambda _e: self._break(self.find_next()))
         self.text.bind("<Shift-F3>", lambda _e: self._break(self.find_next(backwards=True)))
-        self.text.tag_configure("find_match", background="#ffe58a")
+        self.apply_palette()
+        # Selection over find matches over syntax colours; the current line underneath all.
+        self.text.tag_lower("current_line")
         self.text.tag_raise("sel")
-        # Keep the current match visible while the find box has the focus.
-        self.text.configure(inactiveselectbackground=self.text.cget("selectbackground"))
         self.text.bind("<Control-z>", self._on_undo, add=True)
         self.text.bind("<Control-y>", self._on_redo, add=True)
         self.on_undo = None
@@ -57,6 +66,25 @@ class CodeEditor(ttk.Frame):
 
         self.header = None  # optional metadata label set by subclasses (XmlEditor)
         self._build_find_bar()
+
+    def apply_palette(self) -> None:
+        """Colour the parts ttk styles do not reach (also after a theme switch)."""
+        colors = theme.palette()
+        self.linenumbers.configure(background=colors.bg2)
+        self.text.configure(
+            background=colors.bg2,
+            foreground=colors.text,
+            insertbackground=colors.text,
+            selectbackground=colors.select,
+            selectforeground=colors.select_text,
+            # Keep the current match visible while the find box has the focus.
+            inactiveselectbackground=colors.select,
+        )
+        self.text.tag_configure("current_line", background=colors.current_line)
+        self.text.tag_configure("find_match", background=colors.find_match)
+        for tag in TAGS:
+            self.text.tag_configure(tag, foreground=getattr(colors, tag))
+        self._redraw_line_numbers()
 
     # -- content ---------------------------------------------------------
 
@@ -85,7 +113,7 @@ class CodeEditor(ttk.Frame):
 
     def _on_modified(self, event) -> None:
         self.text.edit_modified(False)
-        self._redraw_line_numbers()
+        self._schedule_view_update()
         if self.find_bar.winfo_manager() and self._highlight_after is None:
             self._highlight_after = self.after_idle(self._highlight_matches)
         if self.on_change is not None:
@@ -103,16 +131,49 @@ class CodeEditor(ttk.Frame):
             return "break"
         return None
 
+    def _on_yscroll(self, first, last) -> None:
+        self.vsb.set(first, last)
+        self._schedule_view_update()
+
+    def _schedule_view_update(self) -> None:
+        """Redraw gutter and colours once the pending scroll or edit has settled."""
+        if self._view_after is None:
+            self._view_after = self.after_idle(self._redraw_line_numbers)
+
     def _redraw_line_numbers(self) -> None:
+        if self._view_after is not None:
+            self.after_cancel(self._view_after)
+            self._view_after = None
+        if not self.winfo_exists():
+            return
+        colors = theme.palette()
+        text = self.text
+        font = str(text.cget("font"))
+        linespace = int(self.tk.call("font", "metrics", font, "-linespace")) + LINE_SPACING
+        total = int(text.index("end-1c").split(".")[0])
+        digit = int(self.tk.call("font", "measure", font, "0"))
+        width = digit * max(len(str(total)), 3) + 2 * digit
+        if int(self.linenumbers.cget("width")) != width:
+            self.linenumbers.configure(width=width)
+        current = int(text.index("insert").split(".")[0])
         self.linenumbers.delete("all")
-        first = int(self.text.index("@0,0").split(".")[0])
-        last = first + int(self.text.winfo_height() // 17) + 2
+        first = int(text.index("@0,0").split(".")[0])
+        last = first + text.winfo_height() // linespace + 2
         for line in range(first, last + 1):
-            dline = self.text.dlineinfo(f"{line}.0")
+            dline = text.dlineinfo(f"{line}.0")
             if dline is None:
                 continue
-            y = dline[1]
-            self.linenumbers.create_text(38, y, anchor="ne", text=str(line), font=("Consolas", 9))
+            self.linenumbers.create_text(
+                width - digit,
+                dline[1] + LINE_SPACING,
+                anchor="ne",
+                text=str(line),
+                font=font,
+                fill=colors.text if line == current else colors.faint,
+            )
+        text.tag_remove("current_line", "1.0", "end")
+        text.tag_add("current_line", f"{current}.0", f"{current + 1}.0")
+        self.highlighter.refresh()
         self.event_generate("<<CursorMove>>")
 
     def cursor_position(self) -> str:
@@ -131,31 +192,40 @@ class CodeEditor(ttk.Frame):
         self.replace_var = tk.StringVar()
         self.match_case = tk.BooleanVar(value=False)
         self.whole_word = tk.BooleanVar(value=False)
-        bar = self.find_bar = ttk.Frame(self, padding=(4, 2))
-        ttk.Label(bar, text="Find:").grid(row=0, column=0, sticky="e", padx=(0, 4))
-        self.find_entry = ttk.Entry(bar, textvariable=self.find_var, width=32)
+        bar = self.find_bar = ttk.Frame(self, padding=(8, 5), style="Chrome.TFrame")
+        ttk.Label(bar, text="Find", style="Chrome.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 6))
+        self.find_entry = ttk.Entry(bar, textvariable=self.find_var, width=24)
         self.find_entry.grid(row=0, column=1, sticky="ew")
         ttk.Button(
-            bar, text="Previous", width=9, command=lambda: self.find_next(backwards=True)
-        ).grid(row=0, column=2, padx=(4, 0))
-        ttk.Button(bar, text="Next", width=6, command=self.find_next).grid(row=0, column=3, padx=2)
+            bar, text="Previous", style="Ghost.TButton", command=lambda: self.find_next(backwards=True)
+        ).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(bar, text="Next", style="Ghost.TButton", command=self.find_next).grid(row=0, column=3)
         ttk.Checkbutton(
-            bar, text="Match case", variable=self.match_case, command=self._highlight_matches
-        ).grid(row=0, column=4, padx=4)
+            bar,
+            text="Match case",
+            variable=self.match_case,
+            command=self._highlight_matches,
+            style="Chrome.TCheckbutton",
+        ).grid(row=0, column=4, padx=(10, 4))
         ttk.Checkbutton(
-            bar, text="Whole word", variable=self.whole_word, command=self._highlight_matches
+            bar,
+            text="Whole word",
+            variable=self.whole_word,
+            command=self._highlight_matches,
+            style="Chrome.TCheckbutton",
         ).grid(row=0, column=5, padx=4)
-        self.find_status = ttk.Label(bar, text="", width=16)
-        self.find_status.grid(row=0, column=6, sticky="w", padx=4)
-        ttk.Button(bar, text="Close", width=6, command=self.hide_find).grid(row=0, column=8, sticky="e")
-        self.replace_entry = ttk.Entry(bar, textvariable=self.replace_var, width=32)
+        self.find_status = ttk.Label(bar, text="", width=12, style="Chrome.TLabel")
+        self.find_status.grid(row=0, column=6, sticky="w", padx=8)
+        ttk.Button(bar, text="✕", style="Ghost.TButton", command=self.hide_find).grid(row=0, column=7, sticky="e")
+        self.replace_entry = ttk.Entry(bar, textvariable=self.replace_var, width=24)
         self._replace_widgets = [
-            ttk.Label(bar, text="Replace:"),
+            ttk.Label(bar, text="Replace", style="Chrome.TLabel"),
             self.replace_entry,
-            ttk.Button(bar, text="Replace", width=9, command=self.replace_current),
-            ttk.Button(bar, text="Replace All", command=self.replace_all),
+            ttk.Button(bar, text="Replace", style="Ghost.TButton", command=self.replace_current),
+            ttk.Button(bar, text="Replace all", style="Ghost.TButton", command=self.replace_all),
         ]
-        bar.columnconfigure(7, weight=1)
+        # The match count takes the slack, and gives it up first when the editor is narrow.
+        bar.columnconfigure(6, weight=1)
         self.find_var.trace_add("write", lambda *_a: self._highlight_matches())
         self.find_entry.bind("<Return>", lambda _e: self._break(self.find_next()))
         self.find_entry.bind("<Shift-Return>", lambda _e: self._break(self.find_next(backwards=True)))
@@ -178,10 +248,10 @@ class CodeEditor(ttk.Frame):
         self.find_bar.grid(row=3, column=0, columnspan=3, sticky="ew")
         label, entry, one, every = self._replace_widgets
         if replace:
-            label.grid(row=1, column=0, sticky="e", padx=(0, 4), pady=(2, 0))
-            entry.grid(row=1, column=1, sticky="ew", pady=(2, 0))
-            one.grid(row=1, column=2, padx=(4, 0), pady=(2, 0))
-            every.grid(row=1, column=3, columnspan=2, sticky="w", padx=2, pady=(2, 0))
+            label.grid(row=1, column=0, sticky="e", padx=(0, 6), pady=(4, 0))
+            entry.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+            one.grid(row=1, column=2, padx=(6, 0), pady=(4, 0))
+            every.grid(row=1, column=3, columnspan=2, sticky="w", pady=(4, 0))
         else:
             for widget in self._replace_widgets:
                 widget.grid_remove()
@@ -277,7 +347,7 @@ class CodeEditor(ttk.Frame):
         self.text.tag_add("sel", index(start), index(end))
         self.text.mark_set("insert", index(end))
         self.text.see(index(start))
-        self.after_idle(self._redraw_line_numbers)  # once the view has scrolled
+        self._schedule_view_update()  # once the view has scrolled
         if self.find_bar.winfo_manager():
             self.find_status.config(text=f"{position + 1} of {len(matches)}")
         return True

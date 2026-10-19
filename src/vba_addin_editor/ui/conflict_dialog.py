@@ -51,20 +51,22 @@ class ConflictDialog:
                 ),
             )
 
+        # Everything under the list is packed ahead of it (bottom up), so a short
+        # window shrinks the list rather than hiding Apply and Cancel.
+        action = ttk.Frame(self.win)
+        action.pack(fill="x", padx=8, pady=8, side="bottom", before=self.tree)
+        self.apply_btn = ttk.Button(action, text="Apply", command=self._on_apply)
+        self.apply_btn.pack(side="right", padx=2)
+        ttk.Button(action, text="Cancel", command=self._on_cancel).pack(side="right", padx=2)
+
         btns = ttk.Frame(self.win)
-        btns.pack(fill="x", padx=8, pady=4)
         ttk.Button(btns, text="Keep Disk", command=lambda: self._choose("keep_disk")).pack(side="left", padx=2)
         ttk.Button(btns, text="Keep Draft", command=lambda: self._choose("keep_draft")).pack(side="left", padx=2)
         ttk.Button(btns, text="Edit Merged Text…", command=self._edit_merged).pack(side="left", padx=2)
 
         self.merge = tk.Text(self.win, height=8, wrap="none")
-        self.merge.pack(fill="both", expand=False, padx=8, pady=4)
-
-        action = ttk.Frame(self.win)
-        action.pack(fill="x", padx=8, pady=8)
-        self.apply_btn = ttk.Button(action, text="Apply", command=self._on_apply)
-        self.apply_btn.pack(side="right", padx=2)
-        ttk.Button(action, text="Cancel", command=self._on_cancel).pack(side="right", padx=2)
+        self.merge.pack(fill="both", expand=False, padx=8, pady=4, side="bottom", before=self.tree)
+        btns.pack(fill="x", padx=8, pady=4, side="bottom", before=self.tree)
         self._refresh_apply()
 
     def wait(self) -> str | None:

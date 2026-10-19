@@ -16,8 +16,8 @@ class XmlEditor(CodeEditor):
     """CodeEditor reuse for OOXML package parts (XML plan section 16)."""
 
     def __init__(self, master, on_change=None) -> None:
-        super().__init__(master, on_change=on_change)
-        self.header = ttk.Label(self, text="", padding=(2, 2))
+        super().__init__(master, on_change=on_change, language="xml")
+        self.header = ttk.Label(self, text="", padding=(8, 4), style="EditorInfo.TLabel")
         self.header.grid(row=2, column=0, columnspan=3, sticky="w")
         self._validate_action = None
 
