@@ -9,6 +9,7 @@ Final release (onefile):
 
 import json
 import os
+from importlib import metadata
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -45,10 +46,19 @@ identity = {
     "python_architecture": "64bit" if sys.maxsize > 2**32 else "32bit",
     "packaged_mode": mode if not dirty or not release_mode else f"{mode}-dirty",
     "pyopenvba_pin": "6.2.0",
-    "dependencies": {"pyopenvba": "6.2.0"},
+    "dependencies": {"pyopenvba": "6.2.0", "pillow": metadata.version("pillow")},
 }
 if dirty and not release_mode:
     identity["packaged_mode"] = f"{mode}-development-dirty"
+# Pillow's LICENSE also carries the licences of the image libraries it bundles.
+_pillow = metadata.distribution("pillow")
+_license = next(
+    (f for f in _pillow.files or () if f.name.upper() in ("LICENSE", "LICENSE.TXT") and "dist-info" in str(f)),
+    None,
+)
+if _license is None:
+    raise SystemExit("Pillow's licence file was not found in its installed distribution.")
+PILLOW_LICENSE = Path(str(_pillow.locate_file(_license)))
 BUILD_INFO.write_text("BUILD_INFO = " + repr(identity) + "\n", encoding="utf-8")
 manifest_dir = ROOT / "dist"
 manifest_dir.mkdir(exist_ok=True)
@@ -60,11 +70,42 @@ a = Analysis(
     ["../src/vba_addin_editor/__main__.py"],
     pathex=["../src"],
     binaries=[],
-    datas=[("../THIRD_PARTY_NOTICES.md", "."), ("../README.md", ".")],
+    datas=[
+        ("../THIRD_PARTY_NOTICES.md", "."),
+        ("../README.md", "."),
+        (str(PILLOW_LICENSE), "licenses/pillow"),
+    ],
     hiddenimports=["pyopenvba", "pyopenvba._templates"],
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter.test", "test", "unittest"],
+    # Icons only need Pillow's core, PNG/JPEG/BMP/GIF/ICO readers and ImageGrab:
+    # leave out fonts, colour management, WebP/AVIF and the Tk bridge (~2.5 MB),
+    # and the optional packages Pillow imports only if present: NumPy (~40 MB
+    # with OpenBLAS), defusedxml (XMP metadata; drags in xmlrpc, pydoc,
+    # asyncio, multiprocessing) and olefile (FlashPix/MIC formats).
+    excludes=[
+        "tkinter.test",
+        "test",
+        "unittest",
+        "numpy",
+        "yaml",
+        "defusedxml",
+        "olefile",
+        "PIL.FpxImagePlugin",
+        "PIL.MicImagePlugin",
+        "PIL.ImageFont",
+        "PIL._imagingft",
+        "PIL.ImageCms",
+        "PIL._imagingcms",
+        "PIL.WebPImagePlugin",
+        "PIL._webp",
+        "PIL.AvifImagePlugin",
+        "PIL._avif",
+        "PIL.ImageTk",
+        "PIL._imagingtk",
+        "PIL.ImageQt",
+        "PIL.ImageShow",
+    ],
     cipher=block_cipher,
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)

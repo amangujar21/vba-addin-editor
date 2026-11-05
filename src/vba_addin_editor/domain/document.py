@@ -194,9 +194,24 @@ class XmlPartDraft(_XmlPartHealth):
     is_relationships_part: bool
     is_content_types_part: bool
     open_problem: str | None = None
+    # Created by this draft: not in the package yet, added by the next save.
+    is_new: bool = False
 
     def is_dirty(self) -> bool:
-        return self.editable and self.text != self.original_text
+        return self.editable and (self.is_new or self.text != self.original_text)
+
+
+@dataclass
+class BinaryPartDraft:
+    """A non-XML package member this draft adds (a ribbon icon image).
+
+    Only new members are modelled: existing binary members are never edited
+    and stay byte-identical.
+    """
+
+    path: str  # exact ZIP member name, no leading "/"
+    data: bytes
+    content_type: str
 
 
 @dataclass
@@ -205,6 +220,7 @@ class DocumentDraft:
     modules: list[ModuleDraft] = field(default_factory=list)
     xml_parts: list[XmlPartDraft] = field(default_factory=list)
     signed_save_confirmed: bool = False
+    binary_parts: list[BinaryPartDraft] = field(default_factory=list)
 
     # -- queries -------------------------------------------------------
 
@@ -241,7 +257,25 @@ class DocumentDraft:
         return next((p for p in self.xml_parts if p.path == path), None)
 
     def changed_xml_parts(self) -> list[XmlPartDraft]:
+        """Every XML part a save writes: edited existing parts and new parts."""
         return [p for p in self.xml_parts if p.is_dirty()]
+
+    def modified_xml_parts(self) -> list[XmlPartDraft]:
+        """Edited XML parts that already exist in the package."""
+        return [p for p in self.xml_parts if p.is_dirty() and not p.is_new]
+
+    def new_xml_parts(self) -> list[XmlPartDraft]:
+        return [p for p in self.xml_parts if p.is_new]
+
+    def binary_part_by_path(self, path: str) -> BinaryPartDraft | None:
+        return next((p for p in self.binary_parts if p.path == path), None)
+
+    def added_member_paths(self) -> list[str]:
+        """Package members a save adds, in a stable order."""
+        return sorted(
+            [p.path for p in self.new_xml_parts()] + [p.path for p in self.binary_parts],
+            key=str.lower,
+        )
 
     def final_module_state(self) -> list[ModuleDraft]:
         return [
@@ -255,6 +289,7 @@ class DocumentDraft:
             or self.new_modules()
             or self.changed_existing_modules()
             or self.changed_xml_parts()
+            or self.binary_parts
         )
 
 

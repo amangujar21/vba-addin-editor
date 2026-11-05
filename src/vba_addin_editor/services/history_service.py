@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from vba_addin_editor.domain.document import DocumentDraft, ModuleDraft
+from vba_addin_editor.domain.document import (
+    BinaryPartDraft,
+    DocumentDraft,
+    ModuleDraft,
+    XmlPartDraft,
+)
 from vba_addin_editor.domain.history import HistoryCommand
 from vba_addin_editor.domain.session import DocumentSession
 
@@ -58,6 +63,9 @@ class HistoryService:
             modules = state.get("modules")
             if isinstance(modules, list):
                 draft.modules[:] = [_module_from_snapshot(item) for item in modules]
+            package = state.get("package")
+            if isinstance(package, dict):
+                restore_package(draft, package)
             xml_state = state.get("xml")
             if isinstance(xml_state, list):
                 by_path = {item.get("path"): item for item in xml_state if isinstance(item, dict)}
@@ -123,6 +131,49 @@ def _module_from_snapshot(item: dict) -> ModuleDraft:
 
 def snapshot_xml(draft: DocumentDraft) -> list[dict]:
     return [{"path": part.path, "text": part.text} for part in draft.xml_parts]
+
+
+def snapshot_package(draft: DocumentDraft) -> dict:
+    """The members a draft adds (new XML parts, images), for undo of package edits."""
+    return {
+        "new_xml": [
+            {
+                "path": part.path,
+                "text": part.text,
+                "encoding": part.encoding,
+                "bom": part.bom,
+                "newline": part.newline,
+                "is_relationships_part": part.is_relationships_part,
+                "is_content_types_part": part.is_content_types_part,
+            }
+            for part in draft.new_xml_parts()
+        ],
+        "binary": [
+            {"path": b.path, "data": b.data, "content_type": b.content_type}
+            for b in draft.binary_parts
+        ],
+    }
+
+
+def restore_package(draft: DocumentDraft, package: dict) -> None:
+    draft.xml_parts[:] = [p for p in draft.xml_parts if not p.is_new] + [
+        XmlPartDraft(
+            path=item["path"],
+            text=item.get("text"),
+            original_text=None,
+            encoding=item.get("encoding") or "utf-8",
+            bom=item.get("bom") or b"",
+            newline=item.get("newline") or "\n",
+            is_relationships_part=bool(item.get("is_relationships_part")),
+            is_content_types_part=bool(item.get("is_content_types_part")),
+            is_new=True,
+        )
+        for item in package.get("new_xml", [])
+    ]
+    draft.binary_parts[:] = [
+        BinaryPartDraft(item["path"], bytes(item["data"]), item["content_type"])
+        for item in package.get("binary", [])
+    ]
 
 
 def snapshot_modules(draft: DocumentDraft) -> list[dict]:

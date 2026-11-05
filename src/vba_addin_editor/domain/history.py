@@ -28,6 +28,8 @@ def _payload_size(value: Any) -> int:
         return 0
     if isinstance(value, str):
         return len(value.encode("utf-8"))
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
     if isinstance(value, dict):
         return sum(_payload_size(v) + _payload_size(k) for k, v in value.items())
     if isinstance(value, (list, tuple)):

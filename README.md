@@ -79,6 +79,28 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   preselected), icon and sizes, and optionally tick the macros to add as its
   buttons. The `<menu>` block is inserted with matching indentation and
   unique ids; more buttons can be added to it later with Add Ribbon Button.
+- **Move Up / Move Down** — put the cursor on a button, menu, group or tab in
+  the ribbon XML and press **Alt+Up** / **Alt+Down**, click ▲ / ▼ above the
+  part list, or right-click. The control swaps places with its neighbour;
+  comments between them stay put. Elements whose order Office fixes (the
+  dialog box launcher, the parts of a split button, items before buttons in a
+  gallery) are not moved.
+- **Group Selected into Menu** — select one or more buttons in the ribbon XML,
+  right-click and pick a label and icon. They are wrapped in a new `<menu>`
+  with matching indentation; their `size` attribute is removed, since buttons
+  in a menu have none.
+- **Custom icons** — in the browser, right-click a picture and choose **Copy
+  image**; then put the cursor on a button (or menu, group…) in the ribbon XML,
+  right-click and choose **Set Icon from Clipboard** (or **Set Icon from
+  File…**). The **Add Ribbon Button** and **Group into Menu** forms have the
+  same **Paste Image** / **Browse…** buttons with a preview. The picture is
+  trimmed, centred on a transparent square and resized to a 32×32 PNG (a few
+  KB, so the add-in loads as fast as with a built-in icon), stored as
+  `customUI/images/<id>.png`, linked from the ribbon's relationships part
+  (created if missing) and given the `image="rId…"` attribute in place of
+  `imageMso`. `[Content_Types].xml` gets a `png` entry when it lacks one. One
+  Undo reverts all of it. Mind the picture's licence when you share the
+  add-in.
 - **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA code tab.
 - **Ribbon → Ribbon Buttons…** lists every callback with its module and
   status; **Check Ribbon Callbacks** and **Validate XML** report callbacks
@@ -108,7 +130,9 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   page block the save instead of being silently replaced.
 - **XML edits stay inside their package.** Only the exact XML parts you edited
   may differ; every other payload is verified byte-identical. An XML-only save
-  never touches `vbaProject.bin`.
+  never touches `vbaProject.bin`. The only members a save may add are the ones
+  the draft adds (a ribbon icon and its relationships part); each must hold
+  exactly the draft's bytes, and none may already exist.
 - **Digitally signed projects** require explicit confirmation; saving removes
   the (now invalid) VBA signature. Files with an **OPC package digital
   signature** block XML editing entirely.
@@ -141,8 +165,10 @@ decompress modules that have not changed. The folder can be deleted at any time.
 
 - The tool validates structure, not VBA compilation. A syntax error you type
   will surface when Office runs the macro. Use a backup to roll back.
-- **XML editing** covers existing parts only: no add/delete/rename of package
-  parts, no schema validation against the full OOXML schemas (syntax and
+- **XML editing** covers existing parts. The only parts the editor adds are
+  ribbon icons and the relationships part that links them; it never deletes
+  or renames package parts (replacing a saved custom icon leaves the old
+  image in the file, unused). No schema validation against the full OOXML schemas (syntax and
   package integrity are validated; PowerPoint remains the final format
   validator), no re-signing, and no editing of binary parts such as
   `vbaProject.bin`, images, or ActiveX `.bin`.
@@ -205,4 +231,7 @@ PowerPoint opens the saved file with **no repair dialog** and runs the macro.
 ### Dependency pin
 
 - `pyopenvba==6.2.0` (MIT) — see `THIRD_PARTY_NOTICES.md`.
+- `pillow>=10.1,<13` (HPND) for custom ribbon icons; loaded only when an icon
+  is used. The packaged build leaves out its font, colour-management, WebP
+  and Tk modules.
 - Python 3.10+; build with one pinned Python minor version.

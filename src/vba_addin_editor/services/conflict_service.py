@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from vba_addin_editor.adapters.ooxml_package_adapter import package_member_names
 from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError
 from vba_addin_editor.domain.document import (
+    BinaryPartDraft,
     DocumentDraft,
     DocumentSnapshot,
     ModuleDraft,
@@ -411,6 +413,17 @@ class ConflictService:
                 continue
             self._apply_xml_item(item, old, new_draft)
 
+        # Members the draft adds survive unless the external file now has one
+        # of the same name (then the external member wins, like an external add).
+        external_names = {p.path.lower() for p in new_draft.xml_parts}
+        if external.package_bytes is not None:
+            external_names |= {n.lower() for n in package_member_names(external.package_bytes)}
+        for binary in old.binary_parts:
+            if binary.path.lower() not in external_names:
+                new_draft.binary_parts.append(
+                    BinaryPartDraft(binary.path, binary.data, binary.content_type)
+                )
+
         new_draft.signed_save_confirmed = False
         problems = validate_draft(new_draft)
         if problems:
@@ -510,6 +523,21 @@ class ConflictService:
                 )
             return
         if new_part is None:
+            if old_part is not None and old_part.is_new and item.resolution != "keep_disk":
+                text = item.merged_text if item.resolution == "merged" else old_part.text
+                new_draft.xml_parts.append(
+                    XmlPartDraft(
+                        path=old_part.path,
+                        text=text,
+                        original_text=None,
+                        encoding=old_part.encoding,
+                        bom=old_part.bom,
+                        newline=old_part.newline,
+                        is_relationships_part=old_part.is_relationships_part,
+                        is_content_types_part=old_part.is_content_types_part,
+                        is_new=True,
+                    )
+                )
             return
         if item.resolution == "keep_draft" and old_part is not None:
             new_part.text = old_part.text

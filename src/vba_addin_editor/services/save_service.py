@@ -207,6 +207,7 @@ class SaveService:
                 if changes.has_xml_changes
                 else {}
             )
+            added = self.package_adapter.added_members(draft) if changes.parts_added else {}
             if changes.has_vba_changes:
                 self._report("Building edited file")
                 # Combined saves write the XML parts in the same pass.
@@ -215,9 +216,10 @@ class SaveService:
                     draft,
                     allow_signature_removal=draft.signed_save_confirmed,
                     xml_replacements=xml,
+                    added_members=added,
                 )
             self._report("Building edited XML package")
-            return self.package_adapter.build_package(reference, dict(xml))
+            return self.package_adapter.build_package(reference, dict(xml), added)
         except AdapterError as exc:
             reason = (
                 "unsupported_component_operation"
@@ -246,6 +248,7 @@ class SaveService:
             candidate,
             draft,
             allowed_non_vba_changes=allowed_xml,
+            added_members=frozenset(c.path for c in changes.parts_added),
         )
         problems.extend(vba_verification.problems)
         # XML layer only applies to editable packages; skip for pure .xlam saves.
@@ -471,6 +474,7 @@ class SaveService:
         draft.baseline = new_snapshot
         draft.modules[:] = refreshed.modules
         draft.xml_parts[:] = refreshed.xml_parts
+        draft.binary_parts[:] = []  # now in the baseline package
         draft.signed_save_confirmed = False
 
     # -- Save a Copy (original plan 47; XML plan 12.14) -------------------

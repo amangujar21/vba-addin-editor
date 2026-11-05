@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -10,7 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
+from vba_addin_editor.adapters.ooxml_package_adapter import (
+    MAX_ADDED_MEMBER_BYTES,
+    is_safe_member_name,
+)
 from vba_addin_editor.domain.document import (
+    BinaryPartDraft,
     DocumentDraft,
     ModuleDraft,
     XmlPartDraft,
@@ -199,8 +205,12 @@ class RecoveryService:
         draft = session.draft
         restored_modules = [self._module_from_json(item) for item in data["draft"]["modules"]]
         restored_xml = [self._xml_from_json(item) for item in data["draft"].get("xml_parts", [])]
+        restored_binary = [
+            self._binary_from_json(item) for item in data["draft"].get("added_parts") or []
+        ]
         draft.modules[:] = restored_modules
         draft.xml_parts[:] = restored_xml
+        draft.binary_parts[:] = restored_binary
         draft.signed_save_confirmed = False
         session.revision = int(data["revision"])
         session.history.clear()
@@ -248,6 +258,7 @@ class RecoveryService:
                 "signed_save_confirmed": False,
                 "modules": [self._module_to_json(module) for module in draft.modules],
                 "xml_parts": [self._xml_to_json(part) for part in draft.xml_parts],
+                "added_parts": [self._binary_to_json(part) for part in draft.binary_parts],
                 "cursor": cursor or {},
             },
         }
@@ -279,7 +290,22 @@ class RecoveryService:
             "is_relationships_part": part.is_relationships_part,
             "is_content_types_part": part.is_content_types_part,
             "open_problem": part.open_problem,
+            "is_new": part.is_new,
         }
+
+    def _binary_to_json(self, part: BinaryPartDraft) -> dict:
+        return {
+            "path": part.path,
+            "content_type": part.content_type,
+            "data": base64.b64encode(part.data).decode("ascii"),
+        }
+
+    def _binary_from_json(self, item: dict) -> BinaryPartDraft:
+        return BinaryPartDraft(
+            path=item["path"],
+            data=base64.b64decode(item["data"], validate=True),
+            content_type=item["content_type"],
+        )
 
     def _module_from_json(self, item: dict) -> ModuleDraft:
         # Capabilities are revalidated from the trusted snapshot, never from JSON.
@@ -313,6 +339,7 @@ class RecoveryService:
             is_relationships_part=bool(item.get("is_relationships_part")),
             is_content_types_part=bool(item.get("is_content_types_part")),
             open_problem=item.get("open_problem"),
+            is_new=bool(item.get("is_new")),
         )
 
     def revalidate_capabilities(self, draft: DocumentDraft) -> None:
@@ -418,6 +445,30 @@ class RecoveryService:
             if bom and (not isinstance(bom, str) or len(bom) % 2 or any(c not in "0123456789abcdefABCDEF" for c in bom)):
                 _invalid("invalid BOM/encoding metadata")
         if len(xml_paths) != len(set(xml_paths)):
+            _invalid("duplicate ids")
+        added_parts = data["draft"].get("added_parts") or []
+        if not isinstance(added_parts, list):
+            _invalid("missing draft")
+        added_paths = []
+        for item in added_parts:
+            if not isinstance(item, dict):
+                _invalid("missing draft")
+            path = item.get("path")
+            if not isinstance(path, str) or not is_safe_member_name(path):
+                _invalid("path traversal")
+            if not isinstance(item.get("content_type"), str):
+                _invalid("missing draft")
+            payload = item.get("data")
+            if not isinstance(payload, str):
+                _invalid("invalid encoding")
+            try:
+                decoded = base64.b64decode(payload, validate=True)
+            except ValueError:
+                _invalid("invalid encoding")
+            if len(decoded) > MAX_ADDED_MEMBER_BYTES:
+                _invalid("wrong lengths")
+            added_paths.append(path)
+        if len(set(added_paths) | set(xml_paths)) != len(added_paths) + len(xml_paths):
             _invalid("duplicate ids")
         sha = data.get("baseline_sha256")
         if not isinstance(sha, str) or len(sha) != 64:

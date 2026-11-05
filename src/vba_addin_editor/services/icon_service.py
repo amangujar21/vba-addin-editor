@@ -1,0 +1,228 @@
+"""Custom ribbon icons: turn a picture into a small PNG and wire it into the draft.
+
+Pillow is imported on first use only, so opening the editor does not load it.
+Images become package members of the draft (``BinaryPartDraft``) and are
+written by the next save like any other change.
+"""
+
+from __future__ import annotations
+
+import io
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from vba_addin_editor.adapters.ooxml_package_adapter import (
+    CONTENT_TYPES_NAME,
+    MAX_ADDED_MEMBER_BYTES,
+    package_member_names,
+)
+from vba_addin_editor.domain.document import BinaryPartDraft, DocumentDraft, XmlPartDraft
+from vba_addin_editor.services import ribbon_service as rs
+
+ICON_SIZES = (16, 32)
+DEFAULT_ICON_SIZE = 32
+# A 32x32 PNG is a few KB; anything near this has not been shrunk.
+MAX_ICON_BYTES = 64 * 1024
+MAX_SOURCE_PIXELS = 40_000_000  # refuse decompression bombs before resizing
+PNG_CONTENT_TYPE = "image/png"
+_RELS_CONTENT_TYPE = "application/vnd.openxmlformats-package.relationships+xml"
+
+
+class IconError(ValueError):
+    """An icon could not be made or added; the message is for the user."""
+
+
+@dataclass(frozen=True)
+class IconImage:
+    png: bytes
+    size: int  # square edge in pixels
+    source: str  # where it came from, for status text
+
+    def describe(self) -> str:
+        return f"{self.size}×{self.size} PNG, {len(self.png) / 1024:.1f} KB"
+
+
+# -- making the PNG ---------------------------------------------------------------
+
+
+def _pil():
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - Pillow is a declared dependency
+        raise IconError("Custom icons need the Pillow package, which is not installed.") from exc
+    return Image
+
+
+def make_icon(image, size: int = DEFAULT_ICON_SIZE, source: str = "") -> IconImage:
+    """A square, transparent-padded PNG of ``image`` (a PIL image) at ``size``."""
+    Image = _pil()
+    if size not in ICON_SIZES:
+        raise IconError(f"Icon size must be one of {ICON_SIZES}.")
+    width, height = image.size
+    if width < 1 or height < 1:
+        raise IconError("The image is empty.")
+    if width * height > MAX_SOURCE_PIXELS:
+        raise IconError("The image is too large to use as an icon.")
+    picture = image.convert("RGBA")
+    # Trim fully transparent borders so the visible shape fills the icon.
+    box = picture.getchannel("A").getbbox()
+    if box is not None:
+        picture = picture.crop(box)
+    width, height = picture.size
+    edge = max(width, height)
+    square = Image.new("RGBA", (edge, edge), (0, 0, 0, 0))
+    square.paste(picture, ((edge - width) // 2, (edge - height) // 2))
+    icon = square.resize((size, size), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    icon.save(out, format="PNG", optimize=True)
+    data = out.getvalue()
+    if len(data) > MAX_ICON_BYTES:  # pragma: no cover - a 32x32 PNG cannot get this big
+        raise IconError("The icon came out larger than expected; try a simpler image.")
+    return IconImage(png=data, size=size, source=source)
+
+
+def icon_from_bytes(data: bytes, size: int = DEFAULT_ICON_SIZE, source: str = "") -> IconImage:
+    Image = _pil()
+    Image.MAX_IMAGE_PIXELS = MAX_SOURCE_PIXELS
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            return make_icon(image, size, source)
+    except IconError:
+        raise
+    except Exception as exc:  # PIL raises many types for unreadable input
+        raise IconError(f"That file is not an image this editor can read ({exc}).") from exc
+
+
+def icon_from_file(path: Path, size: int = DEFAULT_ICON_SIZE) -> IconImage:
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise IconError(f"The image could not be read: {exc}") from exc
+    return icon_from_bytes(data, size, source=Path(path).name)
+
+
+def icon_from_clipboard(size: int = DEFAULT_ICON_SIZE) -> IconImage:
+    """The image on the clipboard: a copied picture, or a copied image file."""
+    _pil()
+    from PIL import ImageGrab
+
+    try:
+        grabbed = ImageGrab.grabclipboard()
+    except Exception as exc:  # pragma: no cover - depends on clipboard owner
+        raise IconError(f"The clipboard could not be read ({exc}).") from exc
+    if isinstance(grabbed, list):
+        files = [Path(name) for name in grabbed if name]
+        if not files:
+            raise IconError("The clipboard holds no image.")
+        return icon_from_file(files[0], size)
+    if grabbed is None:
+        raise IconError(
+            "The clipboard holds no image. In your browser, right-click a picture "
+            "and choose Copy image, then try again."
+        )
+    grabbed.load()
+    return make_icon(grabbed, size, source="clipboard")
+
+
+# -- adding it to the draft ------------------------------------------------------------
+
+
+def existing_member_names(draft: DocumentDraft) -> set[str]:
+    """Lower-cased names of every member in the package as opened, plus draft additions."""
+    source = draft.baseline.package_bytes
+    names = set(package_member_names(source if source is not None else draft.baseline.path))
+    names |= {p.path for p in draft.xml_parts}
+    names |= {p.path for p in draft.binary_parts}
+    return {name.lower() for name in names}
+
+
+def _image_path(folder: str, control_id: str, taken: set[str]) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "", control_id).strip(".") or "icon"
+    prefix = f"{folder}/images/" if folder else "images/"
+    candidate, n = f"{prefix}{stem}.png", 2
+    while candidate.lower() in taken:
+        candidate, n = f"{prefix}{stem}{n}.png", n + 1
+    return candidate
+
+
+def set_custom_icon(
+    draft: DocumentDraft, part_path: str, control_start: int, icon: IconImage
+) -> str:
+    """Make the control whose tag starts at ``control_start`` show ``icon``.
+
+    Edits the ribbon part, its relationships part (created when missing) and
+    [Content_Types].xml in the draft, and adds the image. Returns the image's
+    package path. Raises IconError (draft untouched) when it cannot be done.
+    """
+    if len(icon.png) > min(MAX_ICON_BYTES, MAX_ADDED_MEMBER_BYTES):
+        raise IconError("The icon is too large.")
+    ribbon = draft.xml_part_by_path(part_path)
+    if ribbon is None or ribbon.text is None or not ribbon.editable:
+        raise IconError("The ribbon XML part is not editable.")
+    element = next(
+        (e for e in rs.element_tree(ribbon.text) if e.start == control_start and e.complete), None
+    )
+    if element is None or element.name.rsplit(":", 1)[-1] not in rs.IMAGE_ELEMENTS:
+        raise IconError("Put the cursor on a button, menu or other control that can show an icon.")
+    if draft.baseline.package_safety.opc_signature_present:
+        raise IconError(
+            "This file has a package digital signature; adding an icon would break it."
+        )
+    types = draft.xml_part_by_path(CONTENT_TYPES_NAME)
+    if types is None or types.text is None or not types.editable:
+        raise IconError("[Content_Types].xml is missing or not editable, so no image can be added.")
+
+    rels_path = rs.relationships_path(part_path)
+    rels = draft.xml_part_by_path(rels_path)
+    if rels is not None and (rels.text is None or not rels.editable):
+        raise IconError(f"{rels_path} is not editable, so no image can be linked to the ribbon.")
+    rels_text = rels.text if rels is not None and rels.text is not None else rs.new_relationships_text()
+    folder = part_path.rpartition("/")[0]
+
+    # Replacing an icon this draft added: overwrite the image, keep the link.
+    current = element.attr("image")
+    if current:
+        targets = {rid: target for rid, kind, target in rs.relationships(rels_text) if kind == rs.IMAGE_REL_TYPE}
+        target = targets.get(current)
+        if target is not None:
+            path = f"{folder}/{target}" if folder else target
+            added = draft.binary_part_by_path(path)
+            if added is not None:
+                added.data = icon.png
+                return path
+
+    try:
+        types_text = rs.ensure_default_content_type(types.text, "png", PNG_CONTENT_TYPE)
+        if rels is None:
+            types_text = rs.ensure_default_content_type(types_text, "rels", _RELS_CONTENT_TYPE)
+        control_id = element.attr("id") or element.attr("idQ") or "icon"
+        path = _image_path(folder, control_id.rsplit(":", 1)[-1], existing_member_names(draft))
+        target = path[len(folder) + 1 :] if folder else path
+        rels_text, rid = rs.add_relationship(rels_text, rs.IMAGE_REL_TYPE, target)
+        ribbon_text = rs.set_control_image(ribbon.text, element, rid)
+    except rs.RibbonEditError as exc:
+        raise IconError(str(exc)) from exc
+
+    ribbon.text = ribbon_text
+    types.text = types_text
+    if rels is None:
+        draft.xml_parts.append(
+            XmlPartDraft(
+                path=rels_path,
+                text=rels_text,
+                original_text=None,
+                encoding="utf-8",
+                bom=b"",
+                newline="\n",
+                is_relationships_part=True,
+                is_content_types_part=False,
+                is_new=True,
+            )
+        )
+    else:
+        rels.text = rels_text
+    draft.binary_parts.append(BinaryPartDraft(path, icon.png, PNG_CONTENT_TYPE))
+    return path
+

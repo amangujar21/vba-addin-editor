@@ -122,6 +122,26 @@ class ReviewService:
                     unified_diff=_diff(old_text, new_text, xml.path),
                 )
             )
+        for added in changes.parts_added:
+            part = draft.xml_part_by_path(added.path)
+            if part is not None:
+                new_text = part.text
+            else:
+                binary = draft.binary_part_by_path(added.path)
+                size = len(binary.data) if binary is not None else 0
+                new_text = f"(new {binary.content_type if binary else 'binary'} part, {size:,} bytes)\n"
+            review_items.append(
+                ReviewItem(
+                    target_id=added.path,
+                    category="XML",
+                    operations=("add",),
+                    old_name=None,
+                    new_name=added.path,
+                    old_text=None,
+                    new_text=new_text,
+                    unified_diff=_diff(None, new_text, added.path),
+                )
+            )
         vba_count = sum(1 for item in review_items if item.category == "VBA")
         xml_count = sum(1 for item in review_items if item.category == "XML")
         signature = bool(

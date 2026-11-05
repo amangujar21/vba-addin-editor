@@ -33,6 +33,7 @@ from vba_addin_editor.platform import windows_processes as wp
 from vba_addin_editor.platform.paths import appdata_root
 from vba_addin_editor.platform.prescan import READY, Prescan
 from vba_addin_editor.platform.settings import load_settings, save_settings
+from vba_addin_editor.services import icon_service
 from vba_addin_editor.services import ribbon_service as rs
 from vba_addin_editor.services.backup_service import BackupService
 from vba_addin_editor.services.conflict_service import ConflictService
@@ -42,6 +43,7 @@ from vba_addin_editor.services.folder_sync_service import FolderSyncService
 from vba_addin_editor.services.history_service import (
     HistoryService,
     snapshot_modules,
+    snapshot_package,
     snapshot_xml,
 )
 from vba_addin_editor.services.import_export_service import ImportExportService
@@ -62,7 +64,9 @@ from vba_addin_editor.ui.conflict_dialog import ConflictDialog
 from vba_addin_editor.ui.ribbon_dialogs import (
     AddButtonDialog,
     AddMenuDialog,
+    GroupMenuDialog,
     RibbonButtonsDialog,
+    ask_image_file,
     choose,
 )
 from vba_addin_editor.ui.search_dialog import ProjectSearchDialog
@@ -101,7 +105,9 @@ def _draft_signature(draft: DocumentDraft) -> str:
     for mod in draft.modules:
         digest.update(repr((mod.id, mod.current_name, mod.body, mod.is_deleted)).encode("utf-8", "surrogatepass"))
     for part in draft.xml_parts:
-        digest.update(repr((part.path, part.text)).encode("utf-8", "surrogatepass"))
+        digest.update(repr((part.path, part.text, part.is_new)).encode("utf-8", "surrogatepass"))
+    for binary in draft.binary_parts:
+        digest.update(repr((binary.path, hashlib.sha256(binary.data).hexdigest())).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -272,6 +278,22 @@ class MainWindow:
             label="Add Ribbon Button for This Macro…", command=self.add_ribbon_button
         )
         ribbon_menu.add_command(label="Add Ribbon Menu…", command=self.add_ribbon_menu)
+        ribbon_menu.add_separator()
+        ribbon_menu.add_command(
+            label="Move Control Up", accelerator="Alt+Up", command=lambda: self.move_ribbon_control(-1)
+        )
+        ribbon_menu.add_command(
+            label="Move Control Down",
+            accelerator="Alt+Down",
+            command=lambda: self.move_ribbon_control(1),
+        )
+        ribbon_menu.add_command(
+            label="Group Selected into Menu…", command=self.group_selection_into_menu
+        )
+        ribbon_menu.add_command(
+            label="Set Icon from Clipboard", command=self.set_ribbon_icon_from_clipboard
+        )
+        ribbon_menu.add_command(label="Set Icon from File…", command=self.set_ribbon_icon_from_file)
         ribbon_menu.add_separator()
         ribbon_menu.add_command(label="Check Ribbon Callbacks", command=self.check_ribbon_callbacks)
 
@@ -477,6 +499,25 @@ class MainWindow:
             self.add_ribbon_menu,
             lambda: rs.is_ribbon_part(self.current_xml_part_path or ""),
         )
+        xml_menu.add_extra(
+            "Move Up (Alt+Up)", lambda: self.move_ribbon_control(-1), self._ribbon_edit_enabled
+        )
+        xml_menu.add_extra(
+            "Move Down (Alt+Down)", lambda: self.move_ribbon_control(1), self._ribbon_edit_enabled
+        )
+        xml_menu.add_extra(
+            "Group Selected into Menu…", self.group_selection_into_menu, self._ribbon_edit_enabled
+        )
+        xml_menu.add_extra(
+            "Set Icon from Clipboard", self.set_ribbon_icon_from_clipboard, self._ribbon_edit_enabled
+        )
+        xml_menu.add_extra(
+            "Set Icon from File…", self.set_ribbon_icon_from_file, self._ribbon_edit_enabled
+        )
+        for key, direction in (("<Alt-Up>", -1), ("<Alt-Down>", 1)):
+            self.xml_editor.text.bind(
+                key, lambda _e, d=direction: (self.move_ribbon_control(d), "break")[1]
+            )
         vba_menu = self.editor.context_menu
         vba_menu.add_extra(
             "Add Ribbon Button for This Macro…",
@@ -519,6 +560,12 @@ class MainWindow:
             bar, text="Validate XML", command=self._validate_selected_xml, state="disabled"
         )
         self.validate_xml_btn.pack(side="left")
+        ttk.Button(
+            bar, text="▼", width=3, command=lambda: self.move_ribbon_control(1)
+        ).pack(side="right")
+        ttk.Button(
+            bar, text="▲", width=3, command=lambda: self.move_ribbon_control(-1)
+        ).pack(side="right", padx=(6, 2))
         self.xml_tree = ttk.Treeview(left, show="tree", selectmode="browse")
         tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.xml_tree.yview)
         self.xml_tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
@@ -2282,12 +2329,20 @@ class MainWindow:
         if draft is None:
             return
         self._flush_all_editors()
-        before = {"modules": snapshot_modules(draft), "xml": snapshot_xml(draft)}
+        before = {
+            "modules": snapshot_modules(draft),
+            "xml": snapshot_xml(draft),
+            "package": snapshot_package(draft),
+        }
         mutate()
         # Reload before checkpointing: a checkpoint flushes the (stale) editors.
         self._reload_editors_from_draft()
         if self.session is not None:
-            after = {"modules": snapshot_modules(draft), "xml": snapshot_xml(draft)}
+            after = {
+                "modules": snapshot_modules(draft),
+                "xml": snapshot_xml(draft),
+                "package": snapshot_package(draft),
+            }
             self.history_service.record_structural(
                 self.session,
                 HistoryCommand(op="replace_all", target_id="*", before=before, after=after),
@@ -2559,12 +2614,23 @@ class MainWindow:
         )
         new_text, offset, length = rs.insert_into_container(part.text, spec.container, element)
         new_body = rs.append_procedure(mod.body, wrapper)[0] if wrapper else mod.body
+        icon = getattr(spec, "icon", None)
+        icon_problems: list[str] = []
 
         def mutate() -> None:
             part.text = new_text
             mod.body = new_body
+            if icon is not None:
+                try:
+                    icon_service.set_custom_icon(draft, part.path, offset, icon)
+                except icon_service.IconError as exc:
+                    icon_problems.append(str(exc))
 
         self._batch_edit(mutate)
+        if icon_problems:
+            messagebox.showwarning(
+                APP_NAME, "The button was added without its icon:\n\n" + icon_problems[0]
+            )
         line = new_text.count("\n", 0, offset) + 1
         column = offset - (new_text.rfind("\n", 0, offset) + 1) + 1
         self._open_xml_at(part.path, line, column, length)
@@ -2572,6 +2638,204 @@ class MainWindow:
         self.status.config(
             text=f'Added button "{spec.label}"{extra}. Nothing is written until Save File.'
         )
+
+    # -- ribbon structure: move, group into menu, custom icons ----------------------
+
+    def _ribbon_edit_enabled(self) -> bool:
+        path = self.current_xml_part_path
+        if self.draft is None or path is None or not rs.is_ribbon_part(path):
+            return False
+        part = self.draft.xml_part_by_path(path)
+        return part is not None and part.editable
+
+    def _ribbon_xml_context(self):
+        """(draft, part, part text, cursor offset) for a structural ribbon edit, or None."""
+        path = self.current_xml_part_path
+        if path is None or not self._ribbon_edit_enabled():
+            self.status.config(
+                text="Open the ribbon XML (customUI) and put the cursor on a control first."
+            )
+            return None
+        self._flush_all_editors()
+        draft = self.draft
+        part = draft.xml_part_by_path(path) if draft else None
+        if draft is None or part is None or part.text is None:
+            return None
+        return draft, part, part.text, len(self.xml_editor.text.get("1.0", "insert"))
+
+    def _xml_selection_offsets(self, fallback: int) -> tuple[int, int]:
+        text = self.xml_editor.text
+        try:
+            return len(text.get("1.0", "sel.first")), len(text.get("1.0", "sel.last"))
+        except tk.TclError:
+            return fallback, fallback
+
+    def _select_xml_range(self, part_path: str, offset: int, length: int) -> None:
+        part = self.draft.xml_part_by_path(part_path) if self.draft else None
+        if part is None or part.text is None:
+            return
+        text = part.text
+        line = text.count("\n", 0, offset) + 1
+        column = offset - (text.rfind("\n", 0, offset) + 1) + 1
+        self._open_xml_at(part_path, line, column, length)
+
+    def _ribbon_ids(self, draft) -> set[str]:
+        return {value for p in rs.ribbon_parts(draft) for value, _o in rs.control_ids(p.text or "")}
+
+    def _image_suggestions(self, draft) -> list[str]:
+        return sorted(
+            {
+                v
+                for p in rs.ribbon_parts(draft)
+                for v in re.findall(r'imageMso="([^"]+)"', p.text or "")
+            },
+            key=str.casefold,
+        )
+
+    def move_ribbon_control(self, direction: int) -> bool:
+        """Swap the control at the XML cursor with the one before (-1) or after (+1) it."""
+        context = self._ribbon_xml_context()
+        if context is None:
+            return False
+        _draft, part, text, offset = context
+        try:
+            new_text, moved = rs.move_element(text, offset, direction)
+        except rs.RibbonEditError as exc:
+            self.status.config(text=str(exc))
+            return False
+
+        def mutate() -> None:
+            part.text = new_text
+
+        self._batch_edit(mutate)
+        self._select_xml_range(part.path, moved.start, moved.end - moved.start)
+        self.status.config(
+            text=f"Moved {moved.describe()} {'up' if direction < 0 else 'down'}. "
+            "Nothing is written until Save File."
+        )
+        return True
+
+    def group_selection_into_menu(self) -> None:
+        """Ask for a menu label, then wrap the selected controls in a new <menu>."""
+        context = self._ribbon_xml_context()
+        if context is None:
+            return
+        draft, part, text, offset = context
+        start, end = self._xml_selection_offsets(offset)
+        try:
+            parent, run = rs.selected_siblings(text, start, end)
+            rs.group_into_menu(text, start, end, control_id="mnuCheck", label="Check")
+        except rs.RibbonEditError as exc:
+            messagebox.showinfo(APP_NAME, str(exc))
+            return
+        dialog = GroupMenuDialog(
+            self.root,
+            controls=[element.describe() for element in run],
+            existing_ids=self._ribbon_ids(draft),
+            image_suggestions=self._image_suggestions(draft),
+            in_group=parent.name.rsplit(":", 1)[-1] == "group",
+        )
+        spec = dialog.wait()
+        if spec is not None:
+            self.apply_group_into_menu(part.path, start, end, spec)
+
+    def apply_group_into_menu(self, part_path: str, start: int, end: int, spec) -> bool:
+        draft = self.draft
+        if draft is None:
+            return False
+        self._flush_all_editors()
+        part = draft.xml_part_by_path(part_path)
+        if part is None or part.text is None or not part.editable:
+            return False
+        try:
+            new_text, offset, length = rs.group_into_menu(
+                part.text,
+                start,
+                end,
+                control_id=spec.control_id,
+                label=spec.label,
+                image_mso=spec.image_mso,
+                size=spec.size,
+                item_size=spec.item_size,
+            )
+        except rs.RibbonEditError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return False
+        icon_problems: list[str] = []
+
+        def mutate() -> None:
+            part.text = new_text
+            if spec.icon is not None:
+                try:
+                    icon_service.set_custom_icon(draft, part.path, offset, spec.icon)
+                except icon_service.IconError as exc:
+                    icon_problems.append(str(exc))
+
+        self._batch_edit(mutate)
+        self._select_xml_range(part.path, offset, length)
+        self.status.config(
+            text=f'Grouped into menu "{spec.label}". Nothing is written until Save File.'
+        )
+        if icon_problems:
+            messagebox.showwarning(
+                APP_NAME, "The menu was created without its icon:\n\n" + icon_problems[0]
+            )
+        return True
+
+    def set_ribbon_icon_from_clipboard(self) -> None:
+        self._set_ribbon_icon(icon_service.icon_from_clipboard)
+
+    def set_ribbon_icon_from_file(self) -> None:
+        if not self._ribbon_edit_enabled():
+            self._ribbon_xml_context()  # explains what to do
+            return
+        name = ask_image_file(self.root)
+        if name:
+            self._set_ribbon_icon(lambda: icon_service.icon_from_file(Path(name)))
+
+    def _set_ribbon_icon(self, make_icon) -> None:
+        context = self._ribbon_xml_context()
+        if context is None:
+            return
+        _draft, part, text, offset = context
+        element = rs.image_control_at(text, offset)
+        if element is None:
+            self.status.config(
+                text="Put the cursor on a button, menu or other control that can show an icon."
+            )
+            return
+        try:
+            icon = make_icon()
+        except icon_service.IconError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self.apply_ribbon_icon(part.path, element.start, icon)
+
+    def apply_ribbon_icon(self, part_path: str, control_start: int, icon) -> bool:
+        """Give the control whose tag starts at ``control_start`` a custom picture."""
+        draft = self.draft
+        if draft is None:
+            return False
+        self._flush_all_editors()
+
+        def mutate() -> None:
+            icon_service.set_custom_icon(draft, part_path, control_start, icon)
+
+        try:
+            self._batch_edit(mutate)
+        except icon_service.IconError as exc:  # raised before the draft changed
+            messagebox.showerror(APP_NAME, str(exc))
+            return False
+        part = draft.xml_part_by_path(part_path)
+        element = rs.element_at(part.text or "", control_start) if part is not None else None
+        if element is not None:
+            self._select_xml_range(part_path, element.start, element.open_end - element.start)
+        what = element.describe() if element is not None else "the control"
+        self.status.config(
+            text=f"Set a custom icon on {what} ({icon.describe()}). "
+            "Nothing is written until Save File."
+        )
+        return True
 
     def show_buttons_for_macro(self) -> None:
         if self.draft is None:

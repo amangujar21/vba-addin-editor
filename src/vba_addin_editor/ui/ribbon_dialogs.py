@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import re
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
+from vba_addin_editor.services import icon_service
 from vba_addin_editor.services import ribbon_service as rs
 from vba_addin_editor.ui import theme
 from vba_addin_editor.version import APP_NAME
@@ -48,6 +51,73 @@ def choose(root, title: str, prompt: str, options: list[str], initial: int = 0) 
     return result[0]
 
 
+IMAGE_FILE_TYPES = [
+    ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.ico *.tif *.tiff"),
+    ("All files", "*.*"),
+]
+
+
+def ask_image_file(parent) -> str:
+    return filedialog.askopenfilename(
+        parent=parent, title="Choose an icon image", filetypes=IMAGE_FILE_TYPES
+    )
+
+
+class IconPicker:
+    """Built-in icon (imageMso) box, or a custom picture pasted or chosen from a file."""
+
+    def __init__(self, parent, image_suggestions: list[str]) -> None:
+        self.frame = ttk.Frame(parent)
+        self.icon: icon_service.IconImage | None = None
+        self._photo: tk.PhotoImage | None = None
+        self.image_var = tk.StringVar()
+        self.mso_box = ttk.Combobox(
+            self.frame, textvariable=self.image_var, values=image_suggestions, width=28
+        )
+        self.mso_box.pack(side="left")
+        ttk.Button(self.frame, text="Paste Image", command=self.paste).pack(side="left", padx=(6, 0))
+        ttk.Button(self.frame, text="Browse…", command=self.browse).pack(side="left", padx=(4, 0))
+        self.clear_button = ttk.Button(self.frame, text="Clear", command=self.clear)
+        self.preview = ttk.Label(self.frame)
+        self.info = ttk.Label(self.frame, style="Muted.TLabel")
+
+    @property
+    def image_mso(self) -> str:
+        return "" if self.icon is not None else self.image_var.get().strip()
+
+    def set_icon(self, icon: icon_service.IconImage) -> None:
+        self.icon = icon
+        self._photo = tk.PhotoImage(master=self.frame, data=base64.b64encode(icon.png).decode("ascii"))
+        self.preview.config(image=self._photo)
+        self.info.config(text=icon.describe())
+        self.mso_box.config(state="disabled")
+        self.preview.pack(side="left", padx=(8, 0))
+        self.info.pack(side="left", padx=(4, 0))
+        self.clear_button.pack(side="left", padx=(6, 0))
+
+    def clear(self) -> None:
+        self.icon = None
+        self._photo = None
+        self.preview.config(image="")
+        self.mso_box.config(state="normal")
+        for widget in (self.preview, self.info, self.clear_button):
+            widget.pack_forget()
+
+    def _load(self, make) -> None:
+        try:
+            self.set_icon(make())
+        except icon_service.IconError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.frame.winfo_toplevel())
+
+    def paste(self) -> None:
+        self._load(icon_service.icon_from_clipboard)
+
+    def browse(self) -> None:
+        name = ask_image_file(self.frame.winfo_toplevel())
+        if name:
+            self._load(lambda: icon_service.icon_from_file(Path(name)))
+
+
 @dataclass(frozen=True)
 class ButtonSpec:
     container: rs.RibbonContainer
@@ -57,6 +127,7 @@ class ButtonSpec:
     size: str
     screentip: str
     supertip: str
+    icon: icon_service.IconImage | None = None  # custom picture; wins over image_mso
 
 
 class AddButtonDialog:
@@ -118,11 +189,10 @@ class AddButtonDialog:
         self.container_box.bind("<<ComboboxSelected>>", lambda _e: self._sync_size())
 
         row += 1
-        ttk.Label(frame, text="Icon (imageMso):").grid(row=row, column=0, sticky="e", padx=4, pady=3)
-        self.image_var = tk.StringVar()
-        ttk.Combobox(frame, textvariable=self.image_var, values=image_suggestions, width=40).grid(
-            row=row, column=1, sticky="w", padx=4
-        )
+        ttk.Label(frame, text="Icon:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        self.icon_picker = IconPicker(frame, image_suggestions)
+        self.icon_picker.frame.grid(row=row, column=1, sticky="w", padx=4)
+        self.image_var = self.icon_picker.image_var
 
         row += 1
         ttk.Label(frame, text="Size:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
@@ -191,10 +261,11 @@ class AddButtonDialog:
             container=container,
             control_id=self.id_var.get().strip(),
             label=self.label_var.get().strip(),
-            image_mso=self.image_var.get().strip(),
+            image_mso=self.icon_picker.image_mso,
             size=self.size_var.get() if container.element == "group" else "",
             screentip=self.screentip_var.get().strip(),
             supertip=self.supertip_var.get().strip(),
+            icon=self.icon_picker.icon,
         )
         self.win.destroy()
 
@@ -390,6 +461,140 @@ class AddMenuDialog:
         self.win.destroy()
 
     def wait(self) -> MenuSpec | None:
+        self.win.grab_set()
+        self.root.wait_window(self.win)
+        return self.result
+
+
+@dataclass(frozen=True)
+class GroupMenuSpec:
+    control_id: str
+    label: str
+    image_mso: str
+    size: str
+    item_size: str
+    icon: icon_service.IconImage | None = None
+
+
+class GroupMenuDialog:
+    """Label, icon and id for a new menu that will hold the selected controls."""
+
+    def __init__(
+        self,
+        root,
+        *,
+        controls: list[str],
+        existing_ids: set[str],
+        image_suggestions: list[str],
+        in_group: bool,
+    ) -> None:
+        self.root = root
+        self._taken = set(existing_ids)
+        self.existing_ids = {item.casefold() for item in existing_ids}
+        self.in_group = in_group
+        self.result: GroupMenuSpec | None = None
+        win = self.win = tk.Toplevel(root)
+        win.title("Group into Menu")
+        win.transient(root)
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        row = 0
+        shown = ", ".join(controls[:6]) + (f" and {len(controls) - 6} more" if len(controls) > 6 else "")
+        ttk.Label(frame, text="Puts in a menu:").grid(row=row, column=0, sticky="ne", padx=4, pady=3)
+        ttk.Label(frame, text=shown, wraplength=460).grid(row=row, column=1, sticky="w", padx=4, pady=3)
+
+        row += 1
+        ttk.Label(frame, text="Menu label:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        self.label_var = tk.StringVar(value="Menu")
+        self.label_entry = ttk.Entry(frame, textvariable=self.label_var, width=50)
+        self.label_entry.grid(row=row, column=1, sticky="ew", padx=4)
+
+        row += 1
+        ttk.Label(frame, text="Icon:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        self.icon_picker = IconPicker(frame, image_suggestions)
+        self.icon_picker.frame.grid(row=row, column=1, sticky="w", padx=4)
+
+        row += 1
+        ttk.Label(frame, text="Size:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        sizes = ttk.Frame(frame)
+        sizes.grid(row=row, column=1, sticky="w", padx=4)
+        self.size_var = tk.StringVar(value="large")
+        ttk.Combobox(
+            sizes,
+            textvariable=self.size_var,
+            values=["large", "normal"],
+            state="readonly" if in_group else "disabled",
+            width=10,
+        ).pack(side="left")
+        ttk.Label(sizes, text="   Items:").pack(side="left")
+        self.item_size_var = tk.StringVar(value="normal")
+        ttk.Combobox(
+            sizes,
+            textvariable=self.item_size_var,
+            values=["normal", "large"],
+            state="readonly",
+            width=10,
+        ).pack(side="left", padx=4)
+
+        row += 1
+        ttk.Label(frame, text="Control id:").grid(row=row, column=0, sticky="e", padx=4, pady=3)
+        self.id_var = tk.StringVar(value=rs.unique_control_id(self._taken, "Menu", "mnu"))
+        self._auto_id = self.id_var.get()
+        ttk.Entry(frame, textvariable=self.id_var, width=40).grid(row=row, column=1, sticky="w", padx=4)
+        self.label_var.trace_add("write", lambda *_a: self._sync_id())
+
+        row += 1
+        ttk.Label(
+            frame,
+            text="Buttons in a menu have no size of their own, so their size attribute is removed.",
+            style="Muted.TLabel",
+            wraplength=460,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
+
+        row += 1
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=4)
+        ttk.Button(buttons, text="Create Menu", command=self.confirm).pack(side="right")
+        win.bind("<Return>", lambda _e: self.confirm())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self.label_entry.focus_set()
+        self.label_entry.select_range(0, "end")
+
+    def _sync_id(self) -> None:
+        if self.id_var.get() != self._auto_id:
+            return
+        self._auto_id = rs.unique_control_id(self._taken, self.label_var.get() or "Menu", "mnu")
+        self.id_var.set(self._auto_id)
+
+    def validate(self) -> str | None:
+        if not self.label_var.get().strip():
+            return "Enter a label for the menu."
+        control_id = self.id_var.get().strip()
+        if not _ID_RE.match(control_id):
+            return "Control id must start with a letter or underscore and use letters, digits, _ . -"
+        if control_id.casefold() in self.existing_ids:
+            return f'A control with id "{control_id}" already exists.'
+        return None
+
+    def confirm(self) -> None:
+        problem = self.validate()
+        if problem:
+            messagebox.showerror(APP_NAME, problem, parent=self.win)
+            return
+        self.result = GroupMenuSpec(
+            control_id=self.id_var.get().strip(),
+            label=self.label_var.get().strip(),
+            image_mso=self.icon_picker.image_mso,
+            size=self.size_var.get() if self.in_group else "",
+            item_size="large" if self.item_size_var.get() == "large" else "",
+            icon=self.icon_picker.icon,
+        )
+        self.win.destroy()
+
+    def wait(self) -> GroupMenuSpec | None:
         self.win.grab_set()
         self.root.wait_window(self.win)
         return self.result

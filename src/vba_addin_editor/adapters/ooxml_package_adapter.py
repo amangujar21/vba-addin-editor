@@ -65,6 +65,22 @@ def open_package(source: PackageSource) -> zipfile.ZipFile:
     return zipfile.ZipFile(Path(source))
 
 
+MAX_ADDED_MEMBER_BYTES = 1024 * 1024
+_ADDED_MEMBER_DATE = (1980, 1, 1, 0, 0, 0)  # Office writes this date on every entry
+
+
+def is_safe_member_name(name: str) -> bool:
+    """A ZIP member name this editor may create: relative, '/'-separated, no '..'."""
+    if not name or name.startswith("/") or "\\" in name or name.endswith("/"):
+        return False
+    return all(seg and seg not in (".", "..") and ":" not in seg for seg in name.split("/"))
+
+
+def package_member_names(source: PackageSource) -> list[str]:
+    with open_package(source) as zf:
+        return zf.namelist()
+
+
 def _check_duplicates(zf: zipfile.ZipFile, path: object = None) -> None:
     names = zf.namelist()
     if len(names) != len(set(names)):
@@ -170,20 +186,33 @@ class OoxmlPackageAdapter:
         return validate_xml_draft(part)
 
     def build_package(
-        self, source: PackageSource, replacements: dict[str, bytes | None]
+        self,
+        source: PackageSource,
+        replacements: dict[str, bytes | None],
+        additions: dict[str, bytes] | None = None,
     ) -> bytes:
         """The package with the given members replaced (None drops one), in memory.
 
-        Every other entry keeps its bytes and ZIP metadata.
+        ``additions`` are new members, appended after the existing entries;
+        none may exist yet. Every other entry keeps its bytes and ZIP metadata.
         """
-        if not replacements:
+        additions = dict(additions or {})
+        if not replacements and not additions:
             raise PackageError("No package members to replace.")
         out = io.BytesIO()
         with open_package(source) as src:
             _check_duplicates(src)
-            missing = sorted(set(replacements) - set(src.namelist()))
+            names = src.namelist()
+            missing = sorted(set(replacements) - set(names))
             if missing:
                 raise PackageError(f"Package members missing from the file: {missing}")
+            lowered = {n.lower() for n in names}
+            clashing = sorted(n for n in additions if n.lower() in lowered)
+            if clashing:
+                raise PackageError(f"New package members already exist in the file: {clashing}")
+            unsafe = sorted(n for n in additions if not is_safe_member_name(n))
+            if unsafe:
+                raise PackageError(f"New package member names are not allowed: {unsafe}")
             with zipfile.ZipFile(out, "w") as dst:
                 if src.comment:
                     dst.comment = src.comment
@@ -203,6 +232,11 @@ class OoxmlPackageAdapter:
                     new_info.create_system = info.create_system
                     new_info.create_version = info.create_version
                     dst.writestr(new_info, data)
+                for name in sorted(additions, key=str.lower):
+                    new_info = zipfile.ZipInfo(name, date_time=_ADDED_MEMBER_DATE)
+                    new_info.compress_type = zipfile.ZIP_DEFLATED
+                    new_info.create_system = 0  # MS-DOS, as Office writes it
+                    dst.writestr(new_info, additions[name])
         built = out.getvalue()
         with open_package(built) as check:
             bad = check.testzip()
@@ -231,12 +265,33 @@ class OoxmlPackageAdapter:
     # -- candidate rewrite (plan 9.6, 12.8) -----------------------------------
 
     def xml_replacements(self, changed_parts: list) -> dict[str, bytes]:
-        """Encoded bytes of every changed XML part, validated as they will be written."""
-        if not changed_parts:
-            raise PackageError("No XML changes to write.")
+        """Encoded bytes of every changed XML part, validated as they will be written.
+
+        New parts (``is_new``) are additions, not replacements: see ``added_members``.
+        """
+        return self._encoded_parts([p for p in changed_parts if not getattr(p, "is_new", False)])
+
+    def added_members(self, draft: DocumentDraft) -> dict[str, bytes]:
+        """Bytes of every member the draft adds: new XML parts (validated) and images."""
+        added = self._encoded_parts(draft.new_xml_parts())
+        for binary in draft.binary_parts:
+            if binary.path in added:
+                raise PackageError(f"Package member {binary.path!r} is added twice.")
+            if len(binary.data) > MAX_ADDED_MEMBER_BYTES:
+                raise PackageError(
+                    f"{binary.path} is {len(binary.data):,} bytes; an added image may be "
+                    f"at most {MAX_ADDED_MEMBER_BYTES:,} bytes."
+                )
+            added[binary.path] = binary.data
+        unsafe = sorted(name for name in added if not is_safe_member_name(name))
+        if unsafe:
+            raise PackageError(f"New package member names are not allowed: {unsafe}")
+        return added
+
+    def _encoded_parts(self, parts: list) -> dict[str, bytes]:
         replacements: dict[str, bytes] = {}
         # Validate all changed parts first (plan 12.7): no candidate on failure.
-        for part in changed_parts:
+        for part in parts:
             raw = encode_xml(
                 part.text, encoding=part.encoding, bom=part.bom, newline=part.newline
             )
@@ -255,6 +310,8 @@ class OoxmlPackageAdapter:
         changed_parts: list,
     ) -> None:
         """Rebuild the package into dest_path with exactly the given XML parts replaced."""
+        if not changed_parts:
+            raise PackageError("No XML changes to write.")
         replacements = self.xml_replacements(changed_parts)
         with open_package(source_path) as src:
             missing = sorted(set(replacements) - set(src.namelist()))
@@ -277,6 +334,10 @@ class OoxmlPackageAdapter:
         signature_edits = signature_edits or {}
         removed = {path for path, data in signature_edits.items() if data is None}
         try:
+            added = self.added_members(draft)
+        except PackageError as exc:
+            return CandidateVerificationResult(False, (str(exc),))
+        try:
             with open_package(reference_path) as ref, open_package(candidate_path) as cand:
                 _check_duplicates(ref)
                 _check_duplicates(cand)
@@ -284,14 +345,23 @@ class OoxmlPackageAdapter:
                     problems.append("Candidate ZIP has a corrupt entry.")
                 ref_names = set(ref.namelist()) - removed
                 cand_names = set(cand.namelist())
-                if ref_names != cand_names:
+                expected_names = ref_names | set(added)
+                if expected_names != cand_names or ref_names & set(added):
                     problems.append(
-                        f"ZIP entry set changed: only-in-reference={sorted(ref_names - cand_names)} "
-                        f"only-in-candidate={sorted(cand_names - ref_names)}"
+                        f"ZIP entry set changed: only-in-reference={sorted(expected_names - cand_names)} "
+                        f"only-in-candidate={sorted(cand_names - expected_names)}"
                     )
                     return CandidateVerificationResult(False, tuple(problems))
 
-                changed = {p.path for p in draft.changed_xml_parts()}
+                # Each added member holds exactly the bytes the draft adds.
+                for path, data in sorted(added.items()):
+                    actual = cand.read(path)
+                    if actual != data:
+                        problems.append(f"Added package member {path!r} does not match the draft.")
+                    elif _is_editable_xml_part(path):
+                        problems.extend(validate_xml_bytes(actual, part_path=path))
+
+                changed = {p.path for p in draft.modified_xml_parts()}
                 for path in sorted(changed):
                     if path not in cand_names:
                         problems.append(f"Changed XML part missing from candidate: {path!r}")

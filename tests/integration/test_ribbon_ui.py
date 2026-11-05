@@ -218,3 +218,133 @@ def test_add_menu_dialog_defaults_to_the_container_under_the_cursor(window, monk
         "            </menu>\n"
         "          </menu>"
     ) in text
+
+
+def _png_icon():
+    import io
+
+    from PIL import Image
+
+    from vba_addin_editor.services import icon_service
+
+    out = io.BytesIO()
+    Image.new("RGBA", (64, 40), (10, 160, 90, 255)).save(out, "PNG")
+    return icon_service.icon_from_bytes(out.getvalue())
+
+
+def test_alt_up_moves_control_and_undo_restores(window):
+    part = window.draft.xml_part_by_path(PART)
+    before = part.text
+    _cursor_on(window, 'id="btnMissing"')
+    assert window.xml_editor.text.bind("<Alt-Up>")  # the shortcut is bound on the editor
+    assert window.move_ribbon_control(-1)
+    window.root.update()
+    assert part.text.index('id="btnMissing"') < part.text.index('id="btnHello"')
+    assert window.xml_editor.get_text() == part.text
+    assert window.xml_editor.text.get("sel.first", "sel.last").startswith('<button id="btnMissing"')
+    # The cursor stays on the moved control, so it can go up again: it is first now.
+    assert not window.move_ribbon_control(-1)
+    assert "already the first" in window.status.cget("text")
+    window.undo()
+    assert part.text == before
+
+
+def test_move_buttons_need_ribbon_xml(window):
+    window._open_xml_at("[Content_Types].xml", 1)
+    assert not window.move_ribbon_control(1)
+    assert "ribbon XML" in window.status.cget("text")
+
+
+def test_context_menu_has_structure_actions(window):
+    xml_menu = window.xml_editor.text._vbaae_context_menu
+    labels = [
+        xml_menu.menu.entrycget(i, "label")
+        for i in range(xml_menu.menu.index("end") + 1)
+        if xml_menu.menu.type(i) == "command"
+    ]
+    for label in (
+        "Move Up (Alt+Up)",
+        "Move Down (Alt+Down)",
+        "Group Selected into Menu…",
+        "Set Icon from Clipboard",
+        "Set Icon from File…",
+    ):
+        assert label in labels
+
+
+def test_group_selection_into_menu_with_icon_saves(window, monkeypatch):
+    from vba_addin_editor.ui.ribbon_dialogs import GroupMenuSpec
+
+    part = window.draft.xml_part_by_path(PART)
+    before = part.text
+    window._open_xml_at(PART, 1)
+    text = window.xml_editor.get_text()
+    start = text.index('<button id="btnHello"')
+    end = text.index("NoSuchMacro")
+    window.xml_editor.text.tag_add("sel", f"1.0+{start}c", f"1.0+{end}c")
+    window.xml_editor.text.mark_set("insert", f"1.0+{end}c")
+    seen = {}
+
+    class FakeDialog:
+        def __init__(self, _root, **kwargs):
+            seen.update(kwargs)
+
+        def wait(self):
+            return GroupMenuSpec("mnuTools", "Tools", "", "large", "", _png_icon())
+
+    monkeypatch.setattr(mw, "GroupMenuDialog", FakeDialog)
+    window.group_selection_into_menu()
+    window.root.update()
+    assert seen["controls"] == ['button "Say Hello"', 'button "Broken"']
+    assert seen["in_group"] is True
+    assert '<menu id="mnuTools" label="Tools" size="large" image="rIdImg1">' in part.text
+    assert 'label="Say Hello" onAction="Hello" />' in part.text  # size dropped inside the menu
+    assert window.xml_tree.exists("xml::customUI/_rels/customUI14.xml.rels")
+
+    window.undo()
+    assert part.text == before
+    assert window.draft.binary_parts == [] and window.draft.new_xml_parts() == []
+    window.redo()
+    assert len(window.draft.binary_parts) == 1
+
+    result = make_service().save_addin(window.draft)
+    assert result.kind == "success", result
+    with zipfile.ZipFile(window.draft.baseline.path) as package:
+        assert "customUI/images/mnuTools.png" in package.namelist()
+
+
+def test_set_icon_from_clipboard_on_cursor_control(window, monkeypatch):
+    from vba_addin_editor.services import icon_service
+
+    errors = []
+    monkeypatch.setattr(mw.messagebox, "showerror", lambda _t, msg, **k: errors.append(msg))
+    monkeypatch.setattr(icon_service, "icon_from_clipboard", _png_icon)
+    _cursor_on(window, 'id="btnHello"')
+    window.set_ribbon_icon_from_clipboard()
+    window.root.update()
+    assert not errors
+    part = window.draft.xml_part_by_path(PART)
+    assert 'onAction="Hello" image="rIdImg1"' in part.text
+    assert "Set a custom icon on button" in window.status.cget("text")
+    assert window.xml_editor.text.get("sel.first", "sel.last").startswith('<button id="btnHello"')
+
+    # Nothing on the clipboard: an error, and the draft is unchanged.
+    def empty():
+        raise icon_service.IconError("The clipboard holds no image.")
+
+    monkeypatch.setattr(icon_service, "icon_from_clipboard", empty)
+    text = part.text
+    window.set_ribbon_icon_from_clipboard()
+    assert errors == ["The clipboard holds no image."]
+    assert part.text == text
+
+
+def test_add_button_with_custom_icon(window):
+    m1 = window.draft.find_current("Module1")
+    part = window.draft.xml_part_by_path(PART)
+    group = next(c for c in rs.find_containers(part.text, PART) if c.control_id == "grpMain")
+    spec = ButtonSpec(group, "btnPic", "Picture", "", "large", "", "", _png_icon())
+    window.apply_ribbon_button(m1.id, "Hello", None, spec)
+    window.root.update()
+    assert '<button id="btnPic" label="Picture" size="large" onAction="Hello" image="rIdImg1" />' in part.text
+    assert [b.path for b in window.draft.binary_parts] == ["customUI/images/btnPic.png"]
