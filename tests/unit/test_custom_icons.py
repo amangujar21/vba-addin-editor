@@ -212,3 +212,67 @@ def test_added_part_size_limit(ribbon_xlam: Path):
     result = make_service().save_addin(draft)
     assert result.kind != "success"
     assert "at most" in (result.message or "")
+
+
+# Office only shows a custom ribbon image linked with this exact type (checked in
+# Excel: the 0.6.0 type below left the button blank). Spelled out, not rs.*,
+# so a change to the constant cannot pass by changing the test with it.
+OFFICE_IMAGE_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+V060_IMAGE_TYPE = "http://schemas.microsoft.com/office/2006/relationships/images"
+
+
+def _with_legacy_icon(ribbon_xlam: Path) -> Path:
+    """The file as 0.6.0 saved it: an icon linked with the type Office ignores."""
+    draft = DocumentService().open(ribbon_xlam)
+    ic.set_custom_icon(draft, PART, _start(draft, "btnHello"), ic.icon_from_bytes(_png(40, 40)))
+    rels = draft.xml_part_by_path(RELS)
+    rels.text = rels.text.replace(OFFICE_IMAGE_TYPE, V060_IMAGE_TYPE)
+    assert make_service().save_addin(draft).kind == "success"
+    return ribbon_xlam
+
+
+def test_icon_is_linked_with_the_type_office_reads(ribbon_xlam: Path):
+    draft = DocumentService().open(ribbon_xlam)
+    ic.set_custom_icon(draft, PART, _start(draft, "btnHello"), ic.icon_from_bytes(_png(40, 40)))
+    assert make_service().save_addin(draft).kind == "success"
+    with zipfile.ZipFile(ribbon_xlam) as package:
+        rels = package.read(RELS).decode("utf-8")
+    assert f'Type="{OFFICE_IMAGE_TYPE}"' in rels
+    assert V060_IMAGE_TYPE not in rels
+
+
+def test_icons_saved_by_060_are_detected_and_repaired(ribbon_xlam: Path):
+    _with_legacy_icon(ribbon_xlam)
+    draft = DocumentService().open(ribbon_xlam)
+    assert [p.path for p in rs.broken_image_link_parts(draft)] == [RELS]
+    issues = [i for i in rs.check_ribbon(draft) if i.part_path == RELS]
+    assert issues and "Repair Custom Icons" in issues[0].message
+    # Already broken when opened: not a new problem, so saving is not nagged.
+    assert not [i for i in rs.new_issues(draft) if i.part_path == RELS]
+
+    assert rs.repair_image_links(draft) == [RELS]
+    assert not rs.broken_image_link_parts(draft)
+    assert [c.path for c in compute_changes(draft).xml_modified] == [RELS]
+    assert make_service().save_addin(draft).kind == "success"
+    with zipfile.ZipFile(ribbon_xlam) as package:
+        rels = package.read(RELS).decode("utf-8")
+    assert f'Type="{OFFICE_IMAGE_TYPE}"' in rels and V060_IMAGE_TYPE not in rels
+
+
+def test_new_icon_also_repairs_older_links_in_the_same_part(ribbon_xlam: Path):
+    _with_legacy_icon(ribbon_xlam)
+    draft = DocumentService().open(ribbon_xlam)
+    ic.set_custom_icon(draft, PART, _start(draft, "btnMissing"), ic.icon_from_bytes(_png(40, 40)))
+    rels = draft.xml_part_by_path(RELS).text
+    assert rels.count(OFFICE_IMAGE_TYPE) == 2 and V060_IMAGE_TYPE not in rels
+
+
+def test_replacing_a_legacy_icon_reuses_and_repairs_its_link(ribbon_xlam: Path):
+    draft = DocumentService().open(ribbon_xlam)
+    start = _start(draft, "btnHello")
+    ic.set_custom_icon(draft, PART, start, ic.icon_from_bytes(_png(40, 40)))
+    rels = draft.xml_part_by_path(RELS)
+    rels.text = rels.text.replace(OFFICE_IMAGE_TYPE, V060_IMAGE_TYPE)
+    path = ic.set_custom_icon(draft, PART, _start(draft, "btnHello"), ic.icon_from_bytes(_png(50, 20)))
+    assert path == "customUI/images/btnHello.png" and len(draft.binary_parts) == 1
+    assert V060_IMAGE_TYPE not in rels.text and OFFICE_IMAGE_TYPE in rels.text

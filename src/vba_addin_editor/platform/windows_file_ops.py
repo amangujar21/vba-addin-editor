@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -127,21 +128,30 @@ def exclusive_access_error(path: Path) -> str | None:
     return probe.message or "The file is not available for exclusive write access."
 
 
-def probe_exclusive_access(path: Path, *, write: bool = True) -> AccessProbe:
+LOCK_RETRY_INTERVAL = 0.25
+
+
+def probe_exclusive_access(path: Path, *, write: bool = True, wait: float = 0.0) -> AccessProbe:
     """Distinguish in-use, access denied, read-only, and missing files.
 
     No sharing flags, so any other open handle is a sharing violation. Asks
     for write and delete access, never read: opening for read makes antivirus
     scan a package nobody has read since it was written, which takes seconds.
+
+    ``wait`` > 0 retries a file that is in use for up to that many seconds:
+    antivirus, search indexing and cloud sync hold a file only briefly.
     """
     access = (GENERIC_WRITE | DELETE) if write else GENERIC_READ
-    handle = _CREATEFILEW(
-        str(path), access, 0, None, OPEN_EXISTING, 0, None
-    )
-    if handle != INVALID_HANDLE_VALUE:
-        _CLOSEHANDLE(handle)
-        return AccessProbe(ok=True)
-    err = ctypes.get_last_error()
+    deadline = time.monotonic() + max(wait, 0.0)
+    while True:
+        handle = _CREATEFILEW(str(path), access, 0, None, OPEN_EXISTING, 0, None)
+        if handle != INVALID_HANDLE_VALUE:
+            _CLOSEHANDLE(handle)
+            return AccessProbe(ok=True)
+        err = ctypes.get_last_error()
+        if err not in _IN_USE_ERRORS or time.monotonic() >= deadline:
+            break
+        time.sleep(LOCK_RETRY_INTERVAL)
     name = describe_win32_error(err)
     reason, message = _classify_createfile_error(path, err)
     return AccessProbe(
@@ -153,12 +163,95 @@ def probe_exclusive_access(path: Path, *, write: bool = True) -> AccessProbe:
     )
 
 
+_IN_USE_ERRORS = frozenset({ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION})
+
+
+# -- who holds a file (Restart Manager; no admin rights needed) -------------------
+
+
+class _RM_UNIQUE_PROCESS(ctypes.Structure):
+    _fields_ = [("dwProcessId", wt.DWORD), ("ProcessStartTime", wt.FILETIME)]
+
+
+class _RM_PROCESS_INFO(ctypes.Structure):
+    _fields_ = [
+        ("Process", _RM_UNIQUE_PROCESS),
+        ("strAppName", wt.WCHAR * 256),
+        ("strServiceShortName", wt.WCHAR * 64),
+        ("ApplicationType", ctypes.c_int),
+        ("AppStatus", wt.ULONG),
+        ("TSSessionId", wt.DWORD),
+        ("bRestartable", wt.BOOL),
+    ]
+
+
+_ERROR_MORE_DATA = 234
+
+
+def file_holders(path: Path) -> list[str]:
+    """Names of the other programs that have ``path`` open; [] when unknown.
+
+    Asks the Restart Manager, which reports user programs and services but not
+    kernel-mode drivers (some antivirus), so an empty list proves nothing.
+    Never opens the file's contents.
+    """
+    try:
+        rm = ctypes.WinDLL("rstrtmgr")
+        session = wt.DWORD()
+        key = ctypes.create_unicode_buffer(64)
+        if rm.RmStartSession(ctypes.byref(session), 0, key):
+            return []
+        try:
+            files = (wt.LPCWSTR * 1)(str(path))
+            if rm.RmRegisterResources(session, 1, files, 0, None, 0, None):
+                return []
+            needed, count, reasons = wt.UINT(0), wt.UINT(0), wt.DWORD()
+            info = None
+            for _attempt in range(3):  # the list can grow between the two calls
+                rc = rm.RmGetList(
+                    session, ctypes.byref(needed), ctypes.byref(count), info, ctypes.byref(reasons)
+                )
+                if rc == 0:
+                    break
+                if rc != _ERROR_MORE_DATA:
+                    return []
+                info = (_RM_PROCESS_INFO * needed.value)()
+                count = wt.UINT(needed.value)
+            else:
+                return []
+            if info is None:
+                return []
+            names: list[str] = []
+            own = os.getpid()
+            for entry in info[: count.value]:
+                if entry.Process.dwProcessId == own:
+                    continue
+                name = entry.strAppName or entry.strServiceShortName or f"process {entry.Process.dwProcessId}"
+                if name not in names:
+                    names.append(name)
+            return names
+        finally:
+            rm.RmEndSession(session)
+    except (OSError, AttributeError, ValueError):
+        return []
+
+
+def in_use_message(path: Path) -> str:
+    holders = file_holders(path)
+    if holders:
+        who = ", ".join(holders)
+        verb = "is" if len(holders) == 1 else "are"
+        return f"{who} {verb} using this add-in file. Close it and try again."
+    return (
+        "Another program is using this add-in file. Close it and try again. "
+        "On a PC with OneDrive, antivirus or Explorer's preview pane, wait a few "
+        "seconds, or close the Explorer window showing the file."
+    )
+
+
 def _classify_createfile_error(path: Path, err: int) -> tuple[str, str]:
-    if err in {ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION}:
-        return (
-            "file_in_use",
-            "Another program is using this add-in file. Close it and try again.",
-        )
+    if err in _IN_USE_ERRORS:
+        return ("file_in_use", in_use_message(path))
     if err in {ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND}:
         return (
             "source_missing",

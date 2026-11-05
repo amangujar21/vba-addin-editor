@@ -15,6 +15,7 @@ from pathlib import Path
 from vba_addin_editor.adapters.ooxml_package_adapter import (
     CONTENT_TYPES_NAME,
     MAX_ADDED_MEMBER_BYTES,
+    is_removable_member,
     package_member_names,
 )
 from vba_addin_editor.domain.document import BinaryPartDraft, DocumentDraft, XmlPartDraft
@@ -138,6 +139,96 @@ def existing_member_names(draft: DocumentDraft) -> set[str]:
     return {name.lower() for name in names}
 
 
+@dataclass(frozen=True)
+class ImageLink:
+    ribbon_path: str
+    rels_path: str
+    rid: str
+    member: str  # package member the relationship points at
+    used: bool  # some control in the ribbon part has image="rid"
+
+
+def image_links(draft: DocumentDraft) -> list[ImageLink]:
+    """Every image relationship of every ribbon part, as the draft has them."""
+    links: list[ImageLink] = []
+    for part in rs.ribbon_parts(draft):
+        rels = draft.xml_part_by_path(rs.relationships_path(part.path))
+        if rels is None or rels.text is None:
+            continue
+        used_ids = {
+            e.attr("image") for e in rs.element_tree(part.text or "") if e.attr("image")
+        }
+        for rid, kind, target in rs.relationships(rels.text):
+            if kind not in rs.IMAGE_REL_TYPES:
+                continue
+            member = rs.relationship_target_path(part.path, target)
+            if member is not None:
+                links.append(ImageLink(part.path, rels.path, rid, member, rid in used_ids))
+    return links
+
+
+def linked_image_paths(draft: DocumentDraft) -> set[str]:
+    """Image members some ribbon control still shows."""
+    return {link.member for link in image_links(draft) if link.used}
+
+
+def _drop_unused_link(draft: DocumentDraft, link: ImageLink, keep: set[str]) -> str | None:
+    """Remove ``link``'s relationship, and its image when nothing else shows it.
+
+    Returns the image member dropped, if any. ``keep`` = members still shown.
+    """
+    rels = draft.xml_part_by_path(link.rels_path)
+    if rels is None or rels.text is None or not rels.editable:
+        return None
+    rels.text = rs.remove_relationship(rels.text, link.rid)
+    if link.member in keep or not is_removable_member(link.member):
+        return None
+    if any(l.member == link.member for l in image_links(draft)):
+        return None  # another relationship still points at it
+    pending = draft.binary_part_by_path(link.member)
+    if pending is not None:
+        draft.binary_parts.remove(pending)
+        return link.member
+    source = draft.baseline.package_bytes
+    present = set(package_member_names(source if source is not None else draft.baseline.path))
+    if link.member in present and link.member not in draft.removed_parts:
+        draft.removed_parts.append(link.member)
+        return link.member
+    return None
+
+
+def remove_unused_images(draft: DocumentDraft) -> list[str]:
+    """Drop image relationships no control uses, and images nothing shows any more.
+
+    Returns the image members removed. Signed packages and read-only parts are
+    left alone.
+    """
+    if draft.baseline.package_safety.opc_signature_present:
+        return []
+    removed: list[str] = []
+    while True:
+        keep = linked_image_paths(draft)
+        unused = [
+            link for link in image_links(draft)
+            if not link.used and (p := draft.xml_part_by_path(link.rels_path)) is not None
+            and p.editable
+        ]
+        if not unused:
+            return removed
+        dropped = _drop_unused_link(draft, unused[0], keep)
+        if dropped is not None:
+            removed.append(dropped)
+
+
+def _release_image(draft: DocumentDraft, ribbon_path: str, rid: str) -> None:
+    """After a control stopped using ``rid``: drop it if no other control uses it."""
+    link = next(
+        (l for l in image_links(draft) if l.ribbon_path == ribbon_path and l.rid == rid), None
+    )
+    if link is not None and not link.used:
+        _drop_unused_link(draft, link, linked_image_paths(draft))
+
+
 def _image_path(folder: str, control_id: str, taken: set[str]) -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]", "", control_id).strip(".") or "icon"
     prefix = f"{folder}/images/" if folder else "images/"
@@ -179,18 +270,21 @@ def set_custom_icon(
     if rels is not None and (rels.text is None or not rels.editable):
         raise IconError(f"{rels_path} is not editable, so no image can be linked to the ribbon.")
     rels_text = rels.text if rels is not None and rels.text is not None else rs.new_relationships_text()
+    rels_text = rs.repair_image_relationships(rels_text)  # links an older version wrote
     folder = part_path.rpartition("/")[0]
 
     # Replacing an icon this draft added: overwrite the image, keep the link.
     current = element.attr("image")
     if current:
-        targets = {rid: target for rid, kind, target in rs.relationships(rels_text) if kind == rs.IMAGE_REL_TYPE}
+        targets = {rid: target for rid, kind, target in rs.relationships(rels_text) if kind in rs.IMAGE_REL_TYPES}
         target = targets.get(current)
         if target is not None:
             path = f"{folder}/{target}" if folder else target
             added = draft.binary_part_by_path(path)
             if added is not None:
                 added.data = icon.png
+                if rels is not None:
+                    rels.text = rels_text
                 return path
 
     try:
@@ -224,5 +318,8 @@ def set_custom_icon(
     else:
         rels.text = rels_text
     draft.binary_parts.append(BinaryPartDraft(path, icon.png, PNG_CONTENT_TYPE))
+    if current:
+        # The old picture: gone from the file too, unless another control shows it.
+        _release_image(draft, part_path, current)
     return path
 

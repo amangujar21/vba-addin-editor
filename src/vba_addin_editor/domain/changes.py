@@ -34,6 +34,8 @@ class ChangeSet:
     xml_modified: tuple[XmlPartChange, ...] = ()
     # New package members (XML parts and images), not in the file yet.
     parts_added: tuple[XmlPartChange, ...] = ()
+    # Existing package members dropped (ribbon images nothing links to).
+    parts_removed: tuple[XmlPartChange, ...] = ()
 
     @property
     def is_empty(self) -> bool:
@@ -44,6 +46,7 @@ class ChangeSet:
             or self.deleted
             or self.xml_modified
             or self.parts_added
+            or self.parts_removed
         )
 
     @property
@@ -53,7 +56,7 @@ class ChangeSet:
     @property
     def has_xml_changes(self) -> bool:
         """Any package-level (non-VBA) change: edited or added members."""
-        return bool(self.xml_modified or self.parts_added)
+        return bool(self.xml_modified or self.parts_added or self.parts_removed)
 
     def summary_lines(self) -> list[str]:
         lines: list[str] = []
@@ -75,6 +78,9 @@ class ChangeSet:
         if self.parts_added:
             lines.append("Package — Added")
             lines.extend(f"  • {c.path}" for c in self.parts_added)
+        if self.parts_removed:
+            lines.append("Package — Removed")
+            lines.extend(f"  • {c.path}" for c in self.parts_removed)
         return lines
 
 
@@ -98,9 +104,10 @@ def compute_changes(draft: DocumentDraft) -> ChangeSet:
         XmlPartChange(path=p.path) for p in draft.modified_xml_parts()
     )
     parts_added = tuple(XmlPartChange(path=path) for path in draft.added_member_paths())
+    parts_removed = tuple(XmlPartChange(path=path) for path in draft.removed_member_paths())
     return ChangeSet(
         modified=modified, added=added, renamed=renamed, deleted=deleted,
-        xml_modified=xml_modified, parts_added=parts_added,
+        xml_modified=xml_modified, parts_added=parts_added, parts_removed=parts_removed,
     )
 
 
@@ -113,6 +120,7 @@ def dirty_count(draft: DocumentDraft) -> int:
         + len(cs.deleted)
         + len(cs.xml_modified)
         + len(cs.parts_added)
+        + len(cs.parts_removed)
     )
 
 

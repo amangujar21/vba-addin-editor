@@ -142,6 +142,20 @@ class ReviewService:
                     unified_diff=_diff(None, new_text, added.path),
                 )
             )
+        for removed in changes.parts_removed:
+            old_text = f"(unused image {removed.path}, removed from the file)\n"
+            review_items.append(
+                ReviewItem(
+                    target_id=removed.path,
+                    category="XML",
+                    operations=("delete",),
+                    old_name=removed.path,
+                    new_name=None,
+                    old_text=old_text,
+                    new_text=None,
+                    unified_diff=_diff(old_text, None, removed.path),
+                )
+            )
         vba_count = sum(1 for item in review_items if item.category == "VBA")
         xml_count = sum(1 for item in review_items if item.category == "XML")
         signature = bool(

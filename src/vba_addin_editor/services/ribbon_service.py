@@ -618,6 +618,19 @@ def check_ribbon(draft: DocumentDraft) -> list[RibbonIssue]:
                     )
                 )
             seen[key] = offset
+    for rels in broken_image_link_parts(draft):
+        text = rels.text or ""
+        offset = text.find(LEGACY_IMAGE_REL_TYPE)
+        issues.append(
+            RibbonIssue(
+                rels.path,
+                _line_col(text, offset)[0],
+                "Custom icons are linked with a relationship type Office ignores, so they "
+                "show blank. Use Ribbon → Repair Custom Icons.",
+                offset,
+                len(LEGACY_IMAGE_REL_TYPE),
+            )
+        )
     return sorted(issues, key=lambda i: (i.part_path, i.line))
 
 
@@ -906,8 +919,42 @@ def group_into_menu(
 
 # -- custom images ---------------------------------------------------------------------
 
-IMAGE_REL_TYPE = "http://schemas.microsoft.com/office/2006/relationships/images"
+# The relationship type Office reads for a ribbon control's image="rId…".
+IMAGE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+# Written by version 0.6.0. Office ignores it, so the control shows a blank icon.
+LEGACY_IMAGE_REL_TYPE = "http://schemas.microsoft.com/office/2006/relationships/images"
+IMAGE_REL_TYPES = frozenset({IMAGE_REL_TYPE, LEGACY_IMAGE_REL_TYPE})
 _RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def repair_image_relationships(text: str) -> str:
+    """A ribbon .rels part with every legacy image type changed to the one Office reads."""
+    return text.replace(LEGACY_IMAGE_REL_TYPE, IMAGE_REL_TYPE)
+
+
+def broken_image_link_parts(draft: DocumentDraft) -> list[XmlPartDraft]:
+    """Editable ribbon .rels parts whose image links Office ignores (legacy type)."""
+    found: list[XmlPartDraft] = []
+    for part in ribbon_parts(draft):
+        rels = draft.xml_part_by_path(relationships_path(part.path))
+        if (
+            rels is not None
+            and rels.text is not None
+            and rels.editable
+            and LEGACY_IMAGE_REL_TYPE in rels.text
+            and rels not in found
+        ):
+            found.append(rels)
+    return found
+
+
+def repair_image_links(draft: DocumentDraft) -> list[str]:
+    """Fix every broken image link in the draft; returns the .rels paths changed."""
+    changed: list[str] = []
+    for rels in broken_image_link_parts(draft):
+        rels.text = repair_image_relationships(rels.text or "")
+        changed.append(rels.path)
+    return changed
 
 
 def relationships_path(part_path: str) -> str:
@@ -927,6 +974,55 @@ def relationships(text: str) -> list[tuple[str, str, str]]:
         for tag in _scan_tags(text)
         if not tag.closing and _local_name(tag.name) == "Relationship"
     ]
+
+
+def relationship_target_path(source_part: str, target: str) -> str | None:
+    """Package member a relative (or /absolute) Target of ``source_part``'s .rels names."""
+    if not target or "://" in target:
+        return None
+    if target.startswith("/"):
+        segments = target[1:].split("/")
+    else:
+        folder = source_part.rpartition("/")[0]
+        segments = (folder.split("/") if folder else []) + target.split("/")
+    out: list[str] = []
+    for seg in segments:
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if not out:
+                return None
+            out.pop()
+        else:
+            out.append(seg)
+    return "/".join(out) or None
+
+
+def remove_relationship(text: str, rid: str) -> str:
+    """The .rels text without the Relationship whose Id is ``rid`` (and its own line)."""
+    for tag in _scan_tags(text):
+        if tag.closing or _local_name(tag.name) != "Relationship":
+            continue
+        if _unescape(tag.attrs.get("Id", ("", 0))[0]) != rid:
+            continue
+        start, end = tag.start, tag.end
+        if not tag.self_closing:
+            close = next(
+                (t for t in _scan_tags(text) if t.closing and t.start >= end
+                 and _local_name(t.name) == "Relationship"),
+                None,
+            )
+            if close is None:
+                return text
+            end = close.end
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        if text[line_start:start].strip() == "" and (
+            line_end == -1 or text[end:line_end].strip() == ""
+        ):
+            start, end = line_start, (len(text) if line_end == -1 else line_end + 1)
+        return text[:start] + text[end:]
+    return text
 
 
 def new_relationships_text() -> str:

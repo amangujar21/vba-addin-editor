@@ -221,6 +221,9 @@ class DocumentDraft:
     xml_parts: list[XmlPartDraft] = field(default_factory=list)
     signed_save_confirmed: bool = False
     binary_parts: list[BinaryPartDraft] = field(default_factory=list)
+    # Existing package members the next save drops: today only ribbon images
+    # nothing links to any more (icon_service decides; it never lists others).
+    removed_parts: list[str] = field(default_factory=list)
 
     # -- queries -------------------------------------------------------
 
@@ -277,6 +280,10 @@ class DocumentDraft:
             key=str.lower,
         )
 
+    def removed_member_paths(self) -> list[str]:
+        """Existing package members a save drops, in a stable order."""
+        return sorted(set(self.removed_parts), key=str.lower)
+
     def final_module_state(self) -> list[ModuleDraft]:
         return [
             m for m in self.modules if not m.is_deleted
@@ -290,6 +297,7 @@ class DocumentDraft:
             or self.changed_existing_modules()
             or self.changed_xml_parts()
             or self.binary_parts
+            or self.removed_parts
         )
 
 

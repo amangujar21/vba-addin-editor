@@ -424,6 +424,17 @@ class ConflictService:
                     BinaryPartDraft(binary.path, binary.data, binary.content_type)
                 )
 
+        # Images the draft drops are dropped from the external file only if it
+        # still has them and nothing there links to them any more.
+        if old.removed_parts and external.package_bytes is not None:
+            from vba_addin_editor.services import icon_service
+
+            present = set(package_member_names(external.package_bytes))
+            still_used = icon_service.linked_image_paths(new_draft)
+            new_draft.removed_parts[:] = [
+                p for p in old.removed_member_paths() if p in present and p not in still_used
+            ]
+
         new_draft.signed_save_confirmed = False
         problems = validate_draft(new_draft)
         if problems:

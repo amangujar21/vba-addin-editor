@@ -134,7 +134,7 @@ def snapshot_xml(draft: DocumentDraft) -> list[dict]:
 
 
 def snapshot_package(draft: DocumentDraft) -> dict:
-    """The members a draft adds (new XML parts, images), for undo of package edits."""
+    """The members a draft adds (new XML parts, images) or drops, for undo of package edits."""
     return {
         "new_xml": [
             {
@@ -152,6 +152,7 @@ def snapshot_package(draft: DocumentDraft) -> dict:
             {"path": b.path, "data": b.data, "content_type": b.content_type}
             for b in draft.binary_parts
         ],
+        "removed": list(draft.removed_parts),
     }
 
 
@@ -174,6 +175,7 @@ def restore_package(draft: DocumentDraft, package: dict) -> None:
         BinaryPartDraft(item["path"], bytes(item["data"]), item["content_type"])
         for item in package.get("binary", [])
     ]
+    draft.removed_parts[:] = list(package.get("removed", []))
 
 
 def snapshot_modules(draft: DocumentDraft) -> list[dict]:

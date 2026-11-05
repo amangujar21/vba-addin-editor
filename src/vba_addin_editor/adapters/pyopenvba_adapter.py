@@ -640,14 +640,14 @@ class PyOpenVBAAdapter:
         draft: DocumentDraft,
         *,
         allow_signature_removal: bool,
-        xml_replacements: dict[str, bytes] | None = None,
+        xml_replacements: dict[str, bytes | None] | None = None,
         added_members: dict[str, bytes] | None = None,
     ) -> bytes:
         """Replay the draft onto a fresh parse of ``source``; return the new package.
 
         ``xml_replacements`` (member name -> encoded bytes) and ``added_members``
-        (new member name -> bytes) are written in the same pass. Nothing is
-        written to disk.
+        (new member name -> bytes) are written in the same pass; a None
+        replacement drops that member. Nothing is written to disk.
         """
         _assert_destructive_ops_against_snapshot(draft)
         host_path = draft.baseline.path if isinstance(source, bytes) else Path(source)
@@ -738,11 +738,13 @@ class PyOpenVBAAdapter:
         *,
         allowed_non_vba_changes: frozenset[str] = frozenset(),
         added_members: frozenset[str] = frozenset(),
+        removed_members: frozenset[str] = frozenset(),
     ) -> CandidateVerificationResult:
         """Verify the candidate against a reference package.
 
         ``added_members`` may exist only in the candidate; their content is
-        checked by the package adapter's XML verification.
+        checked by the package adapter's XML verification. ``removed_members``
+        exist only in the reference.
 
         Either may be a path or the package bytes; the save pipeline passes
         bytes so nothing it wrote is read back from disk.
@@ -777,8 +779,12 @@ class PyOpenVBAAdapter:
                 # Office does. Exactly those edits are allowed; nothing else.
                 sig_edits = _signature_removal_edits(ref, entry, expected)
                 removed = {name for name, data in sig_edits.items() if data is None}
-                expected_names = (ref_names - removed) | added_members
-                if cand_names != expected_names or ref_names & added_members:
+                expected_names = (ref_names - removed - removed_members) | added_members
+                if (
+                    cand_names != expected_names
+                    or ref_names & added_members
+                    or not removed_members <= ref_names
+                ):
                     problems.append(
                         f"ZIP entry set changed: only-in-original={sorted(expected_names - cand_names)} "
                         f"only-in-candidate={sorted(cand_names - expected_names)}"

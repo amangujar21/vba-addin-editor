@@ -49,6 +49,9 @@ class SaveService:
     exclusive_probe: Callable[[Path], str | None] | None = None
     progress: Callable[[str], None] | None = None  # stage label callback
     auto_backup: bool = True  # keep the replaced file as a same-folder backup
+    # Seconds a save waits for a file another program holds briefly (antivirus,
+    # indexing, cloud sync) before reporting it in use. Only off the Tk thread.
+    lock_wait_seconds: float = 3.0
 
     def _report(self, stage: str) -> None:
         if self.progress is not None:
@@ -76,13 +79,13 @@ class SaveService:
             return None
         return result.message
 
-    def _exclusive_probe(self, path: Path) -> wfo.AccessProbe | None:
+    def _exclusive_probe(self, path: Path, *, wait: float = 0.0) -> wfo.AccessProbe | None:
         if self.exclusive_probe is not None:
             message = self.exclusive_probe(path)
             if message:
                 return wfo.AccessProbe(ok=False, reason="file_in_use", message=message)
             return wfo.AccessProbe(ok=True)
-        return wfo.probe_exclusive_access(path)
+        return wfo.probe_exclusive_access(path, wait=wait)
 
     def _fingerprint_block(self, original: Path, draft: DocumentDraft, *, stage: str) -> SaveResult | None:
         status = paths.fingerprint_status(original, draft.baseline.file_fingerprint)
@@ -208,6 +211,10 @@ class SaveService:
                 else {}
             )
             added = self.package_adapter.added_members(draft) if changes.parts_added else {}
+            replacements: dict[str, bytes | None] = {
+                **xml,
+                **(self.package_adapter.removed_members(draft) if changes.parts_removed else {}),
+            }
             if changes.has_vba_changes:
                 self._report("Building edited file")
                 # Combined saves write the XML parts in the same pass.
@@ -215,11 +222,11 @@ class SaveService:
                     reference,
                     draft,
                     allow_signature_removal=draft.signed_save_confirmed,
-                    xml_replacements=xml,
+                    xml_replacements=replacements,
                     added_members=added,
                 )
             self._report("Building edited XML package")
-            return self.package_adapter.build_package(reference, dict(xml), added)
+            return self.package_adapter.build_package(reference, replacements, added)
         except AdapterError as exc:
             reason = (
                 "unsupported_component_operation"
@@ -249,6 +256,7 @@ class SaveService:
             draft,
             allowed_non_vba_changes=allowed_xml,
             added_members=frozenset(c.path for c in changes.parts_added),
+            removed_members=frozenset(c.path for c in changes.parts_removed),
         )
         problems.extend(vba_verification.problems)
         # XML layer only applies to editable packages; skip for pure .xlam saves.
@@ -281,8 +289,8 @@ class SaveService:
             )
         return None
 
-    def _lock_block(self, original: Path, *, stage: str) -> SaveResult | None:
-        probe = self._exclusive_probe(original)
+    def _lock_block(self, original: Path, *, stage: str, wait: float = 0.0) -> SaveResult | None:
+        probe = self._exclusive_probe(original, wait=wait)
         if probe is None or probe.ok:
             return None
         return SaveResult.blocked(
@@ -293,10 +301,14 @@ class SaveService:
             win32_name=probe.win32_name,
         )
 
-    def host_block(self, original: Path) -> SaveResult | None:
-        """Why ``original`` cannot be replaced right now (Office running, file in use), or None."""
+    def host_block(self, original: Path, *, wait: float = 0.0) -> SaveResult | None:
+        """Why ``original`` cannot be replaced right now (Office running, file in use), or None.
+
+        ``wait`` gives a briefly held file that long to come free; keep it 0 on
+        the Tk thread.
+        """
         return self._office_block(original, stage="preflight") or self._lock_block(
-            original, stage="preflight"
+            original, stage="preflight", wait=wait
         )
 
     def _race_narrowing(self, original: Path, draft: DocumentDraft, candidate: Path) -> SaveResult | None:
@@ -309,7 +321,7 @@ class SaveService:
         if blocked is not None:
             _discard(candidate)
             return blocked
-        blocked = self._lock_block(original, stage="pre_commit")
+        blocked = self._lock_block(original, stage="pre_commit", wait=self.lock_wait_seconds)
         if blocked is not None:
             _discard(candidate)
             return blocked
@@ -323,7 +335,7 @@ class SaveService:
         if blocked is not None:
             return blocked
         self._report("Checking the file is not in use")
-        blocked = self._lock_block(original, stage="preflight")
+        blocked = self._lock_block(original, stage="preflight", wait=self.lock_wait_seconds)
         if blocked is not None:
             return blocked
         self._report("Checking the original file")
@@ -475,6 +487,7 @@ class SaveService:
         draft.modules[:] = refreshed.modules
         draft.xml_parts[:] = refreshed.xml_parts
         draft.binary_parts[:] = []  # now in the baseline package
+        draft.removed_parts[:] = []  # gone from it
         draft.signed_save_confirmed = False
 
     # -- Save a Copy (original plan 47; XML plan 12.14) -------------------

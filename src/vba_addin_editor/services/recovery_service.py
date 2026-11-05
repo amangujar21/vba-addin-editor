@@ -13,6 +13,7 @@ from typing import NoReturn
 
 from vba_addin_editor.adapters.ooxml_package_adapter import (
     MAX_ADDED_MEMBER_BYTES,
+    is_removable_member,
     is_safe_member_name,
 )
 from vba_addin_editor.domain.document import (
@@ -211,6 +212,7 @@ class RecoveryService:
         draft.modules[:] = restored_modules
         draft.xml_parts[:] = restored_xml
         draft.binary_parts[:] = restored_binary
+        draft.removed_parts[:] = list(data["draft"].get("removed_parts") or [])
         draft.signed_save_confirmed = False
         session.revision = int(data["revision"])
         session.history.clear()
@@ -259,6 +261,7 @@ class RecoveryService:
                 "modules": [self._module_to_json(module) for module in draft.modules],
                 "xml_parts": [self._xml_to_json(part) for part in draft.xml_parts],
                 "added_parts": [self._binary_to_json(part) for part in draft.binary_parts],
+                "removed_parts": draft.removed_member_paths(),
                 "cursor": cursor or {},
             },
         }
@@ -470,6 +473,12 @@ class RecoveryService:
             added_paths.append(path)
         if len(set(added_paths) | set(xml_paths)) != len(added_paths) + len(xml_paths):
             _invalid("duplicate ids")
+        removed_parts = data["draft"].get("removed_parts") or []
+        if not isinstance(removed_parts, list):
+            _invalid("missing draft")
+        for path in removed_parts:
+            if not isinstance(path, str) or not is_removable_member(path):
+                _invalid("path traversal")
         sha = data.get("baseline_sha256")
         if not isinstance(sha, str) or len(sha) != 64:
             _invalid("wrong hashes")

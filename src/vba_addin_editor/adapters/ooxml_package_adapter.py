@@ -76,6 +76,16 @@ def is_safe_member_name(name: str) -> bool:
     return all(seg and seg not in (".", "..") and ":" not in seg for seg in name.split("/"))
 
 
+# The only kind of existing member a draft may drop: an image (an unused ribbon icon).
+REMOVABLE_MEMBER_EXTENSIONS = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tif", ".tiff", ".emf", ".wmf"}
+)
+
+
+def is_removable_member(name: str) -> bool:
+    return is_safe_member_name(name) and Path(name).suffix.lower() in REMOVABLE_MEMBER_EXTENSIONS
+
+
 def package_member_names(source: PackageSource) -> list[str]:
     with open_package(source) as zf:
         return zf.namelist()
@@ -288,6 +298,17 @@ class OoxmlPackageAdapter:
             raise PackageError(f"New package member names are not allowed: {unsafe}")
         return added
 
+    def removed_members(self, draft: DocumentDraft) -> dict[str, None]:
+        """Existing members the draft drops, as ``build_package`` replacements (None)."""
+        removed = draft.removed_member_paths()
+        refused = sorted(name for name in removed if not is_removable_member(name))
+        if refused:
+            raise PackageError(f"Only unused images may be removed from the package: {refused}")
+        clash = sorted(set(removed) & {p.path for p in draft.changed_xml_parts()})
+        if clash:
+            raise PackageError(f"Package members are both edited and removed: {clash}")
+        return {name: None for name in removed}
+
     def _encoded_parts(self, parts: list) -> dict[str, bytes]:
         replacements: dict[str, bytes] = {}
         # Validate all changed parts first (plan 12.7): no candidate on failure.
@@ -335,6 +356,7 @@ class OoxmlPackageAdapter:
         removed = {path for path, data in signature_edits.items() if data is None}
         try:
             added = self.added_members(draft)
+            dropped = set(self.removed_members(draft))
         except PackageError as exc:
             return CandidateVerificationResult(False, (str(exc),))
         try:
@@ -343,7 +365,12 @@ class OoxmlPackageAdapter:
                 _check_duplicates(cand)
                 if cand.testzip() is not None:
                     problems.append("Candidate ZIP has a corrupt entry.")
-                ref_names = set(ref.namelist()) - removed
+                all_ref_names = set(ref.namelist())
+                missing = sorted(dropped - all_ref_names)
+                if missing:
+                    problems.append(f"Members to remove are not in the file: {missing}")
+                    return CandidateVerificationResult(False, tuple(problems))
+                ref_names = all_ref_names - removed - dropped
                 cand_names = set(cand.namelist())
                 expected_names = ref_names | set(added)
                 if expected_names != cand_names or ref_names & set(added):

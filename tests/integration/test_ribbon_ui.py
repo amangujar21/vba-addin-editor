@@ -348,3 +348,58 @@ def test_add_button_with_custom_icon(window):
     window.root.update()
     assert '<button id="btnPic" label="Picture" size="large" onAction="Hello" image="rIdImg1" />' in part.text
     assert [b.path for b in window.draft.binary_parts] == ["customUI/images/btnPic.png"]
+
+
+def test_set_icon_explains_in_a_dialog_when_it_cannot_run(window, monkeypatch):
+    from vba_addin_editor.services import icon_service
+
+    infos = []
+    monkeypatch.setattr(mw.messagebox, "showinfo", lambda _t, msg, **k: infos.append(msg))
+    monkeypatch.setattr(icon_service, "icon_from_clipboard", _png_icon)
+    before = window.draft.xml_part_by_path(PART).text
+
+    # Cursor on the root element, not on a control that can show an icon.
+    _cursor_on(window, "<customUI")
+    window.set_ribbon_icon_from_clipboard()
+    assert len(infos) == 1 and "Put the cursor inside" in infos[0]
+
+    # A VBA module is showing instead of the ribbon XML.
+    window.current_xml_part_path = None
+    window.set_ribbon_icon_from_clipboard()
+    assert len(infos) == 2 and "Open the ribbon XML" in infos[1]
+    assert window.draft.xml_part_by_path(PART).text == before
+
+
+def test_opening_a_file_with_060_icon_links_offers_the_repair(window, monkeypatch):
+    window.apply_ribbon_icon(PART, window.draft.xml_part_by_path(PART).text.index("<button"), _png_icon())
+    rels_path = "customUI/_rels/customUI14.xml.rels"
+    rels = window.draft.xml_part_by_path(rels_path)
+    rels.text = rels.text.replace(rs.IMAGE_REL_TYPE, rs.LEGACY_IMAGE_REL_TYPE)
+    assert window.save_service.save_addin(window.draft).kind == "success"
+
+    asked = []
+    monkeypatch.setattr(mw.messagebox, "askyesno", lambda _t, msg, **k: asked.append(msg) or True)
+    window.load_path(window.draft.baseline.path)
+    assert len(asked) == 1 and "shows blank" in asked[0]
+    assert rs.LEGACY_IMAGE_REL_TYPE not in window.draft.xml_part_by_path(rels_path).text
+    assert window.draft.is_dirty()  # repaired in the draft; written only on save
+
+
+def test_remove_unused_icons_command(window, monkeypatch):
+    infos = []
+    monkeypatch.setattr(mw.messagebox, "showinfo", lambda _t, msg, **k: infos.append(msg))
+    assert not window.remove_unused_ribbon_icons()
+    assert infos == ["There are no unused icons in this file."]
+
+    start = window.draft.xml_part_by_path(PART).text.index("<button")
+    window.apply_ribbon_icon(PART, start, _png_icon())
+    assert window.save_service.save_addin(window.draft).kind == "success"
+    ribbon = window.draft.xml_part_by_path(PART)
+    ribbon.text = ribbon.text.replace(' image="rIdImg1"', "")
+    window._reload_editors_from_draft()
+
+    assert window.remove_unused_ribbon_icons()
+    assert window.draft.removed_member_paths() == ["customUI/images/btnHello.png"]
+    assert "Removed 1 unused image" in window.status.cget("text")
+    window.undo()
+    assert window.draft.removed_parts == []

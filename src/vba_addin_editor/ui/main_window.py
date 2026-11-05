@@ -108,6 +108,7 @@ def _draft_signature(draft: DocumentDraft) -> str:
         digest.update(repr((part.path, part.text, part.is_new)).encode("utf-8", "surrogatepass"))
     for binary in draft.binary_parts:
         digest.update(repr((binary.path, hashlib.sha256(binary.data).hexdigest())).encode("utf-8"))
+    digest.update(repr(("removed", draft.removed_member_paths())).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -294,6 +295,8 @@ class MainWindow:
             label="Set Icon from Clipboard", command=self.set_ribbon_icon_from_clipboard
         )
         ribbon_menu.add_command(label="Set Icon from File…", command=self.set_ribbon_icon_from_file)
+        ribbon_menu.add_command(label="Repair Custom Icons", command=self.repair_ribbon_icons)
+        ribbon_menu.add_command(label="Remove Unused Icons", command=self.remove_unused_ribbon_icons)
         ribbon_menu.add_separator()
         ribbon_menu.add_command(label="Check Ribbon Callbacks", command=self.check_ribbon_callbacks)
 
@@ -1206,6 +1209,68 @@ class MainWindow:
         self._refresh_state()
         self._remember_recent(path)
         self.status.config(text=f"Opened {path.name}")
+        self._offer_icon_repair()
+
+    def _offer_icon_repair(self) -> None:
+        """Version 0.6.0 linked custom icons so that Office shows them blank: offer the fix."""
+        if self.draft is None or not rs.broken_image_link_parts(self.draft):
+            return
+        if messagebox.askyesno(
+            APP_NAME,
+            f"{self.draft.baseline.path.name} has custom ribbon icons that Office shows "
+            "blank (an earlier version of this editor linked them wrongly).\n\n"
+            "Repair them now? Nothing is written until you save.",
+        ):
+            self.repair_ribbon_icons()
+
+    def repair_ribbon_icons(self) -> bool:
+        """Relink custom icons an earlier version saved with a type Office ignores."""
+        draft = self.draft
+        if draft is None:
+            return False
+        self._flush_all_editors()
+        if not rs.broken_image_link_parts(draft):
+            messagebox.showinfo(APP_NAME, "No custom icons need repairing.")
+            return False
+        changed: list[str] = []
+
+        def mutate() -> None:
+            changed.extend(rs.repair_image_links(draft))
+
+        self._batch_edit(mutate)
+        self.status.config(
+            text=f"Repaired the icon links in {', '.join(changed)}. "
+            "Nothing is written until Save File."
+        )
+        return True
+
+    def remove_unused_ribbon_icons(self) -> bool:
+        """Drop images (and their links) that no ribbon control shows any more."""
+        draft = self.draft
+        if draft is None:
+            return False
+        self._flush_all_editors()
+        if draft.baseline.package_safety.opc_signature_present:
+            messagebox.showinfo(
+                APP_NAME, "This file has a package digital signature; removing images would break it."
+            )
+            return False
+        if not any(not link.used for link in icon_service.image_links(draft)):
+            messagebox.showinfo(APP_NAME, "There are no unused icons in this file.")
+            return False
+        removed: list[str] = []
+
+        def mutate() -> None:
+            removed.extend(icon_service.remove_unused_images(draft))
+
+        self._batch_edit(mutate)
+        what = (
+            f"{len(removed)} unused image(s): {', '.join(removed)}"
+            if removed
+            else "unused icon links (their images are still shown elsewhere)"
+        )
+        self.status.config(text=f"Removed {what}. Nothing is written until Save File.")
+        return True
 
     def save(self) -> None:
         if self.draft is None or self._saving:
@@ -1235,11 +1300,28 @@ class MainWindow:
             return
         if not self._review_and_confirm(operation_type="save"):
             return
-        blocked = self.save_service.host_block(self.draft.baseline.path)
+        path = self.draft.baseline.path
+        blocked = self.save_service.host_block(path)
+        if blocked is not None and blocked.reason == "file_in_use":
+            blocked = self._wait_for_free_file(path)
         if blocked is not None:
             self._offer_queued_save(blocked)
             return
         self._save_confirmed()
+
+    def _wait_for_free_file(self, path: Path):
+        """Give a briefly held file (antivirus, sync, indexing) a few seconds, off the Tk thread."""
+        wait = self.save_service.lock_wait_seconds
+        self._saving = True
+        self._refresh_state()
+        try:
+            return self._run_in_background(
+                lambda: self.save_service.host_block(path, wait=wait),
+                f"Waiting for {path.name} to be free…",
+            )
+        finally:
+            self._saving = False
+            self._refresh_state()
 
     def _save_confirmed(self, *, merged_external: bool = False) -> None:
         """Run the reviewed save; recover from Office holding or rewriting the file."""
@@ -2648,12 +2730,18 @@ class MainWindow:
         part = self.draft.xml_part_by_path(path)
         return part is not None and part.editable
 
-    def _ribbon_xml_context(self):
-        """(draft, part, part text, cursor offset) for a structural ribbon edit, or None."""
+    def _ribbon_xml_context(self, *, dialog: bool = False):
+        """(draft, part, part text, cursor offset) for a structural ribbon edit, or None.
+
+        ``dialog`` explains a refusal in a message box instead of the status
+        bar, for menu commands whose silence would look like a success.
+        """
         path = self.current_xml_part_path
         if path is None or not self._ribbon_edit_enabled():
-            self.status.config(
-                text="Open the ribbon XML (customUI) and put the cursor on a control first."
+            self._ribbon_hint(
+                "Open the ribbon XML (customUI) on the XML tab and put the cursor "
+                "on a control first.",
+                dialog=dialog,
             )
             return None
         self._flush_all_editors()
@@ -2662,6 +2750,11 @@ class MainWindow:
         if draft is None or part is None or part.text is None:
             return None
         return draft, part, part.text, len(self.xml_editor.text.get("1.0", "insert"))
+
+    def _ribbon_hint(self, text: str, *, dialog: bool) -> None:
+        self.status.config(text=text)
+        if dialog:
+            messagebox.showinfo(APP_NAME, text)
 
     def _xml_selection_offsets(self, fallback: int) -> tuple[int, int]:
         text = self.xml_editor.text
@@ -2717,7 +2810,7 @@ class MainWindow:
 
     def group_selection_into_menu(self) -> None:
         """Ask for a menu label, then wrap the selected controls in a new <menu>."""
-        context = self._ribbon_xml_context()
+        context = self._ribbon_xml_context(dialog=True)
         if context is None:
             return
         draft, part, text, offset = context
@@ -2787,21 +2880,23 @@ class MainWindow:
 
     def set_ribbon_icon_from_file(self) -> None:
         if not self._ribbon_edit_enabled():
-            self._ribbon_xml_context()  # explains what to do
+            self._ribbon_xml_context(dialog=True)  # explains what to do
             return
         name = ask_image_file(self.root)
         if name:
             self._set_ribbon_icon(lambda: icon_service.icon_from_file(Path(name)))
 
     def _set_ribbon_icon(self, make_icon) -> None:
-        context = self._ribbon_xml_context()
+        context = self._ribbon_xml_context(dialog=True)
         if context is None:
             return
         _draft, part, text, offset = context
         element = rs.image_control_at(text, offset)
         if element is None:
-            self.status.config(
-                text="Put the cursor on a button, menu or other control that can show an icon."
+            self._ribbon_hint(
+                "Put the cursor inside the <button …> (or menu or other control) "
+                "that should show the icon, then try again.",
+                dialog=True,
             )
             return
         try:

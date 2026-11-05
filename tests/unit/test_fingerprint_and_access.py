@@ -63,3 +63,59 @@ def test_same_file_identity_is_case_insensitive(tmp_path: Path):
     target = tmp_path / "AddIn.xlam"
     target.write_bytes(b"x")
     assert paths.paths_are_same_file(target, tmp_path / "addin.xlam")
+
+
+def _hold_in_child(target: Path, seconds: float):
+    """A separate process that keeps ``target`` open for ``seconds``, then exits."""
+    import subprocess
+    import sys
+    import time
+
+    code = (
+        "import sys, time\n"
+        "f = open(sys.argv[1], 'rb')\n"
+        "print('held', flush=True)\n"
+        "time.sleep(float(sys.argv[2]))\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(target), str(seconds)],
+        stdout=subprocess.PIPE, text=True,
+    )
+    assert child.stdout is not None and child.stdout.readline().strip() == "held"
+    time.sleep(0.05)
+    return child
+
+
+def test_in_use_message_names_the_program_holding_the_file(tmp_path: Path):
+    target = tmp_path / "Held.xlam"
+    target.write_bytes(b"x")
+    child = _hold_in_child(target, 30)
+    try:
+        assert wfo.file_holders(target), "Restart Manager should see the child process"
+        probe = wfo.probe_exclusive_access(target)
+        assert probe.reason == "file_in_use"
+        assert "Another program" not in (probe.message or "")
+        assert "is using this add-in file" in (probe.message or "")
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_file_holders_ignores_this_process(tmp_path: Path):
+    target = tmp_path / "Mine.xlam"
+    target.write_bytes(b"x")
+    with open(target, "rb"):
+        assert wfo.file_holders(target) == []
+        assert "Another program" in (wfo.probe_exclusive_access(target).message or "")
+
+
+def test_probe_waits_for_a_brief_lock(tmp_path: Path):
+    target = tmp_path / "Brief.xlam"
+    target.write_bytes(b"x")
+    child = _hold_in_child(target, 0.8)
+    try:
+        assert not wfo.probe_exclusive_access(target).ok
+        assert wfo.probe_exclusive_access(target, wait=10).ok
+    finally:
+        child.kill()
+        child.wait()
