@@ -17,7 +17,9 @@ lets Office load the updated code the next time it starts.
    in-place save. Close Excel for `.xlam`, or PowerPoint for `.ppam`/`.pptm`.
    The unrelated host does not block saving. If you click **Save** while
    the host is running (or still shutting down, or another program has the file
-   open), the editor offers to wait: a bar shows it is waiting, and it saves as
+   open), the editor first gives a briefly held file (antivirus, cloud sync,
+   indexing) a few seconds, and names the program holding it when Windows can
+   tell. Otherwise it offers to wait: a bar shows it is waiting, and it saves as
    soon as the file is free (**Cancel Auto-Save** stops waiting). Edits made
    while it waits are reviewed again before saving. Keep the window open — do
    not reload.
@@ -99,8 +101,12 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   `customUI/images/<id>.png`, linked from the ribbon's relationships part
   (created if missing) and given the `image="rId…"` attribute in place of
   `imageMso`. `[Content_Types].xml` gets a `png` entry when it lacks one. One
-  Undo reverts all of it. Mind the picture's licence when you share the
-  add-in.
+  Undo reverts all of it. Replacing a saved icon removes the old image unless
+  another control still shows it; **Ribbon → Remove Unused Icons** removes
+  images no control shows. Icons saved by 0.6.0 show blank in Office (wrong
+  relationship type); opening such a file offers to repair them, as does
+  **Ribbon → Repair Custom Icons**. Mind the picture's licence when you share
+  the add-in.
 - **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA code tab.
 - **Ribbon → Ribbon Buttons…** lists every callback with its module and
   status; **Check Ribbon Callbacks** and **Validate XML** report callbacks
@@ -132,7 +138,9 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   may differ; every other payload is verified byte-identical. An XML-only save
   never touches `vbaProject.bin`. The only members a save may add are the ones
   the draft adds (a ribbon icon and its relationships part); each must hold
-  exactly the draft's bytes, and none may already exist.
+  exactly the draft's bytes, and none may already exist. The only members a
+  save may remove are images no ribbon control shows any more; nothing else is
+  ever removed.
 - **Digitally signed projects** require explicit confirmation; saving removes
   the (now invalid) VBA signature. Files with an **OPC package digital
   signature** block XML editing entirely.
@@ -166,9 +174,9 @@ decompress modules that have not changed. The folder can be deleted at any time.
 - The tool validates structure, not VBA compilation. A syntax error you type
   will surface when Office runs the macro. Use a backup to roll back.
 - **XML editing** covers existing parts. The only parts the editor adds are
-  ribbon icons and the relationships part that links them; it never deletes
-  or renames package parts (replacing a saved custom icon leaves the old
-  image in the file, unused). No schema validation against the full OOXML schemas (syntax and
+  ribbon icons and the relationships part that links them, and the only parts
+  it removes are icon images nothing shows; it never renames package parts.
+  No schema validation against the full OOXML schemas (syntax and
   package integrity are validated; PowerPoint remains the final format
   validator), no re-signing, and no editing of binary parts such as
   `vbaProject.bin`, images, or ActiveX `.bin`.
