@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -131,7 +132,7 @@ def xml_patch_path_for(candidate: Path) -> Path:
 
 def backup_path_for(original: Path, label: str = "backup") -> Path:
     """Visible same-extension backup name: 'Name - backup 2026-08-30 180212.ppam'."""
-    stamp = datetime.now().strftime("%Y-%m-%d %H%M%S")  # noqa: DTZ005 - local time: user-facing backup filename
+    stamp = time.strftime("%Y-%m-%d %H%M%S")  # local time: user-facing backup filename
     base = f"{original.stem} - {label} {stamp}{original.suffix}"
     candidate = original.with_name(base)
     counter = 2
