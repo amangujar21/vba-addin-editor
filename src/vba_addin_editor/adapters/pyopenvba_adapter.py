@@ -55,6 +55,8 @@ from vba_addin_editor.adapters.ooxml_package_adapter import (
     open_package,
 )
 from vba_addin_editor.adapters.source_codec import (
+    join_header_body,
+    replace_vb_name,
     split_attribute_header,
     to_editor_text,
     to_vba_crlf,
@@ -74,6 +76,7 @@ from vba_addin_editor.domain.document import (
     FormDesignSnapshot,
     HostKind,
     ModuleDisplayKind,
+    ModuleDraft,
     ModuleSnapshot,
     ProjectSafetyInfo,
 )
@@ -680,7 +683,7 @@ class PyOpenVBAAdapter:
                         if item.pyopenvba_kind == "standard"
                         else VBAModuleKind.other
                     )
-                    project.add_module(item.current_name, to_vba_crlf(item.body), kind=kind)
+                    project.add_module(item.current_name, _new_module_source(item), kind=kind)
 
                 # 4. Body changes on surviving originals.
                 for item in draft.changed_existing_modules():
@@ -883,6 +886,25 @@ class PyOpenVBAAdapter:
         except (zipfile.BadZipFile, OSError):
             return {}
 
+    # -- project references ---------------------------------------------------
+
+    def project_references(self, path: Path, data: bytes | None = None) -> list[tuple[str, str]]:
+        """(name, GUID or libid) of each library the VBA project references.
+
+        Read-only; returns [] when the project cannot be read.
+        """
+        try:
+            host = _open_host(Path(path), data)
+            with host:
+                references = list(host.vba_project().references)
+        except Exception:  # noqa: BLE001 - advisory only
+            return []
+        out: list[tuple[str, str]] = []
+        for ref in references:
+            name = ref.name_unicode or ref.name
+            out.append((name, ref.guid or ref.libid or name))
+        return out
+
     # -- import/export -----------------------------------------------------
 
     def export_module_source(self, snapshot: DocumentSnapshot, module_name: str) -> str:
@@ -904,6 +926,19 @@ class PyOpenVBAAdapter:
         is_class = "VERSION 1.0 CLASS" in header
         name = path.stem
         return name, text, is_class
+
+
+def _new_module_source(item: ModuleDraft) -> str:
+    """Source handed to pyOpenVBA for a module the draft adds.
+
+    A class copied from another project (its stream-form header, recognised by
+    ``VB_Base``) keeps its attributes such as ``VB_PredeclaredId``; everything
+    else is the bare body and pyOpenVBA writes the default header.
+    """
+    header = item.hidden_header or ""
+    if item.pyopenvba_kind != "standard" and "attribute vb_base" in header.casefold():
+        return to_vba_crlf(join_header_body(replace_vb_name(header, item.current_name), item.body))
+    return to_vba_crlf(item.body)
 
 
 def allow_removal_expected(draft: DocumentDraft) -> bool:

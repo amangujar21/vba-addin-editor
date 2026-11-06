@@ -34,6 +34,7 @@ from vba_addin_editor.platform.paths import appdata_root
 from vba_addin_editor.platform.prescan import READY, Prescan
 from vba_addin_editor.platform.settings import load_settings, save_settings
 from vba_addin_editor.services import icon_service
+from vba_addin_editor.services import port_service as ps
 from vba_addin_editor.services import ribbon_service as rs
 from vba_addin_editor.services.backup_service import BackupService
 from vba_addin_editor.services.conflict_service import ConflictService
@@ -65,6 +66,7 @@ from vba_addin_editor.ui.ribbon_dialogs import (
     AddButtonDialog,
     AddMenuDialog,
     GroupMenuDialog,
+    ImportControlDialog,
     RibbonButtonsDialog,
     ask_image_file,
     choose,
@@ -279,6 +281,9 @@ class MainWindow:
             label="Add Ribbon Button for This Macro…", command=self.add_ribbon_button
         )
         ribbon_menu.add_command(label="Add Ribbon Menu…", command=self.add_ribbon_menu)
+        ribbon_menu.add_command(
+            label="Import Button from Another Add-in…", command=self.import_ribbon_control
+        )
         ribbon_menu.add_separator()
         ribbon_menu.add_command(
             label="Move Control Up", accelerator="Alt+Up", command=lambda: self.move_ribbon_control(-1)
@@ -2720,6 +2725,115 @@ class MainWindow:
         self.status.config(
             text=f'Added button "{spec.label}"{extra}. Nothing is written until Save File.'
         )
+
+    # -- import a button (and its macros) from another add-in ------------------------
+
+    def import_ribbon_control(self) -> None:
+        """Copy a ribbon control and the VBA it runs from another add-in into this one."""
+        draft = self.draft
+        if draft is None or self._saving:
+            return
+        self._flush_all_editors()
+        if draft.baseline.safety.password_protected:
+            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
+            return
+        if draft.baseline.package_safety.opc_signature_present:
+            messagebox.showinfo(
+                APP_NAME,
+                "This file has a package digital signature; editing its ribbon would break it.",
+            )
+            return
+        if not any(p.editable for p in rs.ribbon_parts(draft)):
+            messagebox.showinfo(
+                APP_NAME,
+                "This file has no editable ribbon XML (customUI/customUI.xml or customUI14.xml) "
+                "to put a button in.\n\nAdding a new ribbon part is not supported yet.",
+            )
+            return
+        path = filedialog.askopenfilename(
+            title="Import Button from Another Add-in", filetypes=_FILETYPES
+        )
+        if not path:
+            return
+        source = self.load_port_source(Path(path))
+        if source is None:
+            return
+        plan = self.choose_port(source)
+        if plan is not None:
+            self.apply_port_plan(plan)
+
+    def load_port_source(self, path: Path) -> DocumentDraft | None:
+        """Read another add-in (read-only) to import from; None after an error message."""
+        if self.draft is not None and path.resolve() == Path(self.draft.baseline.path).resolve():
+            messagebox.showinfo(
+                APP_NAME, "Choose a different add-in: this is the file that is open."
+            )
+            return None
+        self._saving = True  # keeps autosave and close away while the worker runs
+        try:
+            return self._run_in_background(
+                lambda: self.doc_service.open(path), f"Reading {path.name}…"
+            )
+        except (AdapterError, OSError, ValueError) as exc:
+            messagebox.showerror(
+                APP_NAME,
+                str(exc)
+                if isinstance(exc, AdapterError)
+                else f"{path.name} could not be read.\n\n{exc}",
+            )
+            return None
+        finally:
+            self._saving = False
+            self._refresh_state()
+
+    def choose_port(self, source: DocumentDraft) -> ps.PortPlan | None:
+        """Ask which control of ``source`` to import, and where; returns its plan."""
+        draft = self.draft
+        if draft is None:
+            return None
+        controls = ps.portable_controls(source)
+        if not controls:
+            messagebox.showinfo(
+                APP_NAME, f"{source.baseline.path.name} has no ribbon controls that run macros."
+            )
+            return None
+        dialog = ImportControlDialog(
+            self.root,
+            source_name=str(source.baseline.path),
+            controls=controls,
+            targets_for=lambda control: ps.port_targets(draft, control),
+            plan=lambda control, where, suffix, label: ps.plan_port(
+                source, draft, control, where, suffix=suffix, group_label=label
+            ),
+            suffix=ps.default_suffix(draft),
+            show_part=len([p for p in rs.ribbon_parts(draft) if p.editable]) > 1,
+        )
+        return dialog.wait()
+
+    def apply_port_plan(self, plan: ps.PortPlan) -> bool:
+        """Apply a computed import as one undoable edit."""
+        draft = self.draft
+        if draft is None or not plan.ok:
+            return False
+
+        def mutate() -> None:
+            ps.apply_port(draft, plan)
+
+        self._batch_edit(mutate)
+        if plan.part_path:
+            self._select_xml_range(plan.part_path, plan.element_offset, plan.element_length)
+        added = len(plan.new_module_ids)
+        modules = f" and {added} module(s)" if added else ""
+        self.status.config(
+            text=f"Imported the control{modules}. Nothing is written until Save File."
+        )
+        if plan.warnings:
+            messagebox.showinfo(
+                APP_NAME,
+                "Imported. Nothing is written until Save File. Please check:\n\n"
+                + "\n".join(f"• {w}" for w in plan.warnings),
+            )
+        return True
 
     # -- ribbon structure: move, group into menu, custom icons ----------------------
 

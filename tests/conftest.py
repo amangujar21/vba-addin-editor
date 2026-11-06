@@ -159,6 +159,130 @@ def build_pptm_with_class(path: Path) -> Path:
     return path
 
 
+_IMAGE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+PORT_RIBBON_CODE = """Option Explicit
+Private gRibbon As IRibbonUI
+Public Const APP_TITLE As String = "Tools"
+
+Public Sub OnLoadRibbon(ribbon As IRibbonUI)
+    Set gRibbon = ribbon
+End Sub
+
+' Runs the report.
+Public Sub RunReport(control As IRibbonControl)
+    BuildReport APP_TITLE
+    gRibbon.InvalidateControl "btnReport"
+    gRibbon.InvalidateControl "btnOther"
+    Application.OnTime Now, "AfterReport"
+    Application.Run "'Source.xlam'!RibbonCode.AfterReport"
+    Helpers.BuildReport "x"
+End Sub
+
+Public Sub AfterReport()
+    MsgBox "done"
+End Sub
+
+Public Sub Unrelated(control As IRibbonControl)
+    MsgBox "unrelated"
+End Sub
+"""
+
+PORT_HELPERS = """Option Explicit
+#If VBA7 Then
+Private Declare PtrSafe Function GetTickCount Lib "kernel32" () As Long
+#Else
+Private Declare Function GetTickCount Lib "kernel32" () As Long
+#End If
+
+Public Type ReportRow
+    Name As String
+    Total As Double
+End Type
+
+Public Enum ReportKind
+    rkDaily = 1
+    rkWeekly
+End Enum
+
+Public Sub BuildReport(title As String)
+    Dim r As ReportRow
+    Dim c As New Counter
+    r.Name = title
+    c.Bump
+    Debug.Print GetTickCount, rkWeekly, ReportKind.rkDaily, Utility()
+End Sub
+
+Public Function Utility() As Long
+    Utility = 42
+End Function
+
+Public Function NotNeeded() As Long
+End Function
+"""
+
+PORT_COUNTER = """Private n As Long
+
+Public Sub Bump()
+    n = n + 1
+End Sub
+"""
+
+PORT_SOURCE_RIBBON = """<customUI xmlns="http://schemas.microsoft.com/office/2009/07/customui" onLoad="OnLoadRibbon">
+  <ribbon>
+    <tabs>
+      <tab id="tabSrc" label="Source">
+        <group id="grpReports" label="Reports">
+          <button id="btnReport" label="Run Report" size="large" onAction="RunReport" image="rIdImg1" />
+          <button id="btnOther" label="Other" onAction="Unrelated" imageMso="Help" />
+          <menu id="mnuMore" label="More">
+            <button id="btnMenuItem" label="In menu" description="A menu item" onAction="RunReport" />
+          </menu>
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>
+"""
+
+_PORT_SOURCE_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    f'<Relationship Id="rIdImg1" Type="{_IMAGE_REL_TYPE}" Target="images/report.png"/>'
+    "</Relationships>"
+)
+
+
+def _port_icon() -> bytes:
+    import io
+
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGBA", (32, 32), (0, 128, 255, 255)).save(out, "PNG")
+    return out.getvalue()
+
+
+PORT_ICON_PNG = _port_icon()
+
+
+def build_port_source(path: Path, ribbon: str = PORT_SOURCE_RIBBON, *, powerpoint: bool = False) -> Path:
+    """A source add-in for Import Button: ribbon, three modules (one a class), an icon."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    host_cls = PowerPointFile if powerpoint else ExcelFile
+    with host_cls.create_new(path) as host:
+        project = host.vba_project()
+        project.add_module("RibbonCode", PORT_RIBBON_CODE.replace("\n", "\r\n"))
+        project.add_module("Helpers", PORT_HELPERS.replace("\n", "\r\n"))
+        project.add_module("Counter", PORT_COUNTER.replace("\n", "\r\n"), kind=VBAModuleKind.other)
+        host.save()
+    with zipfile.ZipFile(path, "a") as package:
+        package.writestr("customUI/customUI14.xml", ribbon.encode("utf-8"))
+        package.writestr("customUI/_rels/customUI14.xml.rels", _PORT_SOURCE_RELS.encode("utf-8"))
+        package.writestr("customUI/images/report.png", PORT_ICON_PNG)
+    return path
+
+
 @pytest.fixture()
 def xlam_path(tmp_path: Path) -> Path:
     return build_xlam(tmp_path / "TestAddin.xlam")

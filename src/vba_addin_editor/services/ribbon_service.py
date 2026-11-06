@@ -184,6 +184,16 @@ def _unescape(value: str) -> str:
     )
 
 
+def unescape(value: str) -> str:
+    """An attribute value as written in the XML, with its entities decoded."""
+    return _unescape(value)
+
+
+def xml_attr(value: str) -> str:
+    """``value`` escaped for a double-quoted XML attribute."""
+    return _attr(value)
+
+
 def find_callbacks(text: str, part_path: str = "") -> list[RibbonCallback]:
     found: list[RibbonCallback] = []
     for tag in _scan_tags(text):
@@ -214,6 +224,10 @@ def find_callbacks(text: str, part_path: str = "") -> list[RibbonCallback]:
                 )
             )
     return found
+
+
+def is_callback_attribute(name: str) -> bool:
+    return bool(_CALLBACK_ATTR_RE.fullmatch(name))
 
 
 def callback_at(text: str, offset: int, part_path: str = "") -> RibbonCallback | None:
@@ -851,6 +865,81 @@ def _remove_attrs(tag_text: str, names: set[str]) -> str:
     return re.sub(
         r"\s+(?P<name>[A-Za-z_][\w:.-]*)\s*=\s*(?:\"[^\"]*\"|'[^']*')", drop, tag_text
     )
+
+
+def remove_tag_attrs(tag_text: str, names: set[str]) -> str:
+    """``tag_text`` (one opening tag) without the attributes in ``names``."""
+    return _remove_attrs(tag_text, names)
+
+
+def line_indent(text: str, offset: int) -> str:
+    """Indentation of the line holding ``offset``."""
+    return _line_indent(text, offset)[0]
+
+
+def root_element(text: str) -> RibbonElement | None:
+    """The <customUI> element (any prefix), or None."""
+    return next(
+        (e for e in element_tree(text) if e.parent < 0 and _local_name(e.name) == "customUI"),
+        None,
+    )
+
+
+def element_prefix(name: str) -> str:
+    """'mso:button' -> 'mso'; 'button' -> ''."""
+    return name.rpartition(":")[0]
+
+
+def element_path(elements: list[RibbonElement], element: RibbonElement) -> str:
+    """'Tab › Group › Control' for ``element`` (labels, else ids)."""
+    names: list[str] = []
+    current: RibbonElement | None = element
+    while current is not None:
+        if _local_name(current.name) in ("tab", "group", "menu", "box", "buttonGroup", "splitButton") or (
+            current is element
+        ):
+            raw = current.attr("label") or current.attr("id") or current.attr("idQ") or current.attr("idMso")
+            if raw:
+                names.append(_unescape(raw))
+        current = elements[current.parent] if current.parent >= 0 else None
+    return " › ".join(reversed(names))
+
+
+def find_tabs(text: str, part_path: str = "") -> list[RibbonContainer]:
+    """Tabs (custom or built-in, by idMso) a new group can be added to."""
+    elements = element_tree(text)
+    found: list[RibbonContainer] = []
+    for e in elements:
+        if _local_name(e.name) != "tab" or not e.complete or e.end == e.open_end:
+            continue
+        control_id = e.attr("id") or e.attr("idMso") or e.attr("idQ")
+        if not control_id:
+            continue
+        close_start = text.rfind("<", e.open_end, e.end)
+        indent = _line_indent(text, e.start)[0]
+        child_indent = None
+        for child in _children(elements, e.index):
+            child_line_indent, first = _line_indent(text, child.start)
+            if first:
+                child_indent = child_line_indent
+                break
+        if child_indent is None:
+            parent_indent = _line_indent(text, elements[e.parent].start)[0] if e.parent >= 0 else ""
+            unit = indent[len(parent_indent):] if indent.startswith(parent_indent) else ""
+            child_indent = indent + (unit or "  ")
+        found.append(
+            RibbonContainer(
+                part_path=part_path,
+                element="tab",
+                control_id=_unescape(control_id),
+                display=_unescape(e.attr("label") or control_id),
+                close_start=close_start,
+                indent=indent,
+                child_indent=child_indent,
+                open_start=e.start,
+            )
+        )
+    return found
 
 
 def set_tag_attr(tag_text: str, name: str, value: str) -> str:

@@ -107,6 +107,40 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   relationship type); opening such a file offers to repair them, as does
   **Ribbon → Repair Custom Icons**. Mind the picture's licence when you share
   the add-in.
+- **Import Button from Another Add-in** — **Ribbon → Import Button from
+  Another Add-in…**, then pick another `.xlam`/`.ppam`/`.pptm`. It is only
+  read (it may stay loaded in Office). Choose one of its buttons (or toggles,
+  menus, whole groups…), and choose where it goes in this file: a group,
+  menu or tab of yours, or a new group on one of your tabs. The preview lists
+  everything that will be added and renamed. Imported along with the control:
+  - every procedure its callbacks call, followed through the whole call
+    chain. That includes constants, module variables, `Declare` statements
+    (with their `#If VBA7` blocks), Types and Enums, and macros run by name
+    (`Application.Run`, `OnTime`, `OnKey`, `OnAction`). Each source module
+    becomes one new module here, keeping its `Option` lines, and Private
+    names keep their meaning. Class modules it uses are copied whole, with
+    their attributes;
+  - its icon, if it has a custom one.
+
+  So that it works with both add-ins loaded at once, the button's macros (and
+  macros run by name) always get a new name: the **name suffix**, `_<this
+  file's name>` by default. Any other module, procedure, variable or control
+  id that this file already uses is renamed with the same suffix. Every
+  reference follows the renames: calls, `Module.Proc`, control ids in strings
+  (`InvalidateControl "btnX"`), and `"'Other.xlam'!Proc"` strings, which then
+  name this file. Code this file already has, character for character, is
+  reused rather than copied again. If the code keeps the ribbon in an
+  `IRibbonUI` variable, a small `RibbonLoaded…` Sub that sets it is added and
+  called from this ribbon's `onLoad` (or becomes the `onLoad`). Attributes
+  that are not valid in the new place are dropped: `size` outside a group,
+  `description` outside a menu, and `insertAfter…`/`insertBefore…`. One Undo
+  reverts it all; nothing is written until Save File.
+
+  The import is refused if the code uses a UserForm this file does not have
+  (import the form in the VBA editor first), or if either project is
+  password-protected. The summary lists what to check afterwards:
+  references this file lacks (Tools → References), sheets of the other
+  add-in the code reads, and a cross-host import (Excel ↔ PowerPoint).
 - **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA code tab.
 - **Ribbon → Ribbon Buttons…** lists every callback with its module and
   status; **Check Ribbon Callbacks** and **Validate XML** report callbacks
@@ -137,7 +171,8 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
 - **XML edits stay inside their package.** Only the exact XML parts you edited
   may differ; every other payload is verified byte-identical. An XML-only save
   never touches `vbaProject.bin`. The only members a save may add are the ones
-  the draft adds (a ribbon icon and its relationships part); each must hold
+  the draft adds (ribbon icons, made or imported with a button, and their
+  relationships part); each must hold
   exactly the draft's bytes, and none may already exist. The only members a
   save may remove are images no ribbon control shows any more; nothing else is
   ever removed.
@@ -174,7 +209,8 @@ decompress modules that have not changed. The folder can be deleted at any time.
 - The tool validates structure, not VBA compilation. A syntax error you type
   will surface when Office runs the macro. Use a backup to roll back.
 - **XML editing** covers existing parts. The only parts the editor adds are
-  ribbon icons and the relationships part that links them, and the only parts
+  ribbon icons (made, or imported with a button) and the relationships part
+  that links them, and the only parts
   it removes are icon images nothing shows; it never renames package parts.
   No schema validation against the full OOXML schemas (syntax and
   package integrity are validated; PowerPoint remains the final format
@@ -192,6 +228,10 @@ decompress modules that have not changed. The folder can be deleted at any time.
   byte-identical. Renaming a UserForm stays disabled (the layout storage would
   be orphaned). A deleted form's name cannot be reused until the deletion is
   saved. Folder import never deletes a UserForm.
+- **Import Button** follows calls lexically (no VBA compiler): a macro whose
+  name is only built at run time (`Application.Run "Do" & n`) is not found,
+  and library references are reported but not added. Sheets, names and other
+  workbook content of the other add-in are never copied.
 - UserForm layout is read-only: it can be viewed in the **UserForms** tab but not
   created or edited; `.frm/.frx` import/export is not supported
   (`.bas`/`.cls` only).

@@ -229,13 +229,86 @@ def _release_image(draft: DocumentDraft, ribbon_path: str, rid: str) -> None:
         _drop_unused_link(draft, link, linked_image_paths(draft))
 
 
-def _image_path(folder: str, control_id: str, taken: set[str]) -> str:
+IMAGE_CONTENT_TYPES = {
+    "png": PNG_CONTENT_TYPE,
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "ico": "image/x-icon",
+    "tif": "image/tiff",
+    "tiff": "image/tiff",
+    "emf": "image/x-emf",
+    "wmf": "image/x-wmf",
+}
+
+
+def _image_path(folder: str, control_id: str, taken: set[str], extension: str = "png") -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]", "", control_id).strip(".") or "icon"
     prefix = f"{folder}/images/" if folder else "images/"
-    candidate, n = f"{prefix}{stem}.png", 2
+    candidate, n = f"{prefix}{stem}.{extension}", 2
     while candidate.lower() in taken:
-        candidate, n = f"{prefix}{stem}{n}.png", n + 1
+        candidate, n = f"{prefix}{stem}{n}.{extension}", n + 1
     return candidate
+
+
+def add_image_member(
+    draft: DocumentDraft, part_path: str, data: bytes, *, extension: str, stem: str
+) -> tuple[str, str]:
+    """Add ``data`` as an image of ribbon part ``part_path``; returns (member path, rId).
+
+    Edits the part's relationships (created when missing) and
+    [Content_Types].xml and adds the image; the ribbon part itself is not
+    touched: the caller points a control's image= at the returned rId.
+    Raises IconError (draft untouched) when it cannot be done.
+    """
+    extension = extension.lower().lstrip(".")
+    content_type = IMAGE_CONTENT_TYPES.get(extension)
+    if content_type is None:
+        raise IconError(f"A .{extension} file cannot be used as a ribbon image.")
+    if len(data) > MAX_ADDED_MEMBER_BYTES:
+        raise IconError("The image is too large.")
+    if draft.baseline.package_safety.opc_signature_present:
+        raise IconError("This file has a package digital signature; adding an image would break it.")
+    types = draft.xml_part_by_path(CONTENT_TYPES_NAME)
+    if types is None or types.text is None or not types.editable:
+        raise IconError("[Content_Types].xml is missing or not editable, so no image can be added.")
+    rels_path = rs.relationships_path(part_path)
+    rels = draft.xml_part_by_path(rels_path)
+    if rels is not None and (rels.text is None or not rels.editable):
+        raise IconError(f"{rels_path} is not editable, so no image can be linked to the ribbon.")
+    rels_text = rels.text if rels is not None and rels.text is not None else rs.new_relationships_text()
+    rels_text = rs.repair_image_relationships(rels_text)  # links an older version wrote
+    folder = part_path.rpartition("/")[0]
+    try:
+        types_text = rs.ensure_default_content_type(types.text, extension, content_type)
+        if rels is None:
+            types_text = rs.ensure_default_content_type(types_text, "rels", _RELS_CONTENT_TYPE)
+        path = _image_path(folder, stem, existing_member_names(draft), extension)
+        target = path[len(folder) + 1 :] if folder else path
+        rels_text, rid = rs.add_relationship(rels_text, rs.IMAGE_REL_TYPE, target)
+    except rs.RibbonEditError as exc:
+        raise IconError(str(exc)) from exc
+
+    types.text = types_text
+    if rels is None:
+        draft.xml_parts.append(
+            XmlPartDraft(
+                path=rels_path,
+                text=rels_text,
+                original_text=None,
+                encoding="utf-8",
+                bom=b"",
+                newline="\n",
+                is_relationships_part=True,
+                is_content_types_part=False,
+                is_new=True,
+            )
+        )
+    else:
+        rels.text = rels_text
+    draft.binary_parts.append(BinaryPartDraft(path, data, content_type))
+    return path, rid
 
 
 def set_custom_icon(
@@ -269,13 +342,12 @@ def set_custom_icon(
     rels = draft.xml_part_by_path(rels_path)
     if rels is not None and (rels.text is None or not rels.editable):
         raise IconError(f"{rels_path} is not editable, so no image can be linked to the ribbon.")
-    rels_text = rels.text if rels is not None and rels.text is not None else rs.new_relationships_text()
-    rels_text = rs.repair_image_relationships(rels_text)  # links an older version wrote
     folder = part_path.rpartition("/")[0]
 
     # Replacing an icon this draft added: overwrite the image, keep the link.
     current = element.attr("image")
-    if current:
+    if current and rels is not None and rels.text is not None:
+        rels_text = rs.repair_image_relationships(rels.text)
         targets = {rid: target for rid, kind, target in rs.relationships(rels_text) if kind in rs.IMAGE_REL_TYPES}
         target = targets.get(current)
         if target is not None:
@@ -283,43 +355,15 @@ def set_custom_icon(
             added = draft.binary_part_by_path(path)
             if added is not None:
                 added.data = icon.png
-                if rels is not None:
-                    rels.text = rels_text
+                rels.text = rels_text
                 return path
 
-    try:
-        types_text = rs.ensure_default_content_type(types.text, "png", PNG_CONTENT_TYPE)
-        if rels is None:
-            types_text = rs.ensure_default_content_type(types_text, "rels", _RELS_CONTENT_TYPE)
-        control_id = element.attr("id") or element.attr("idQ") or "icon"
-        path = _image_path(folder, control_id.rsplit(":", 1)[-1], existing_member_names(draft))
-        target = path[len(folder) + 1 :] if folder else path
-        rels_text, rid = rs.add_relationship(rels_text, rs.IMAGE_REL_TYPE, target)
-        ribbon_text = rs.set_control_image(ribbon.text, element, rid)
-    except rs.RibbonEditError as exc:
-        raise IconError(str(exc)) from exc
-
-    ribbon.text = ribbon_text
-    types.text = types_text
-    if rels is None:
-        draft.xml_parts.append(
-            XmlPartDraft(
-                path=rels_path,
-                text=rels_text,
-                original_text=None,
-                encoding="utf-8",
-                bom=b"",
-                newline="\n",
-                is_relationships_part=True,
-                is_content_types_part=False,
-                is_new=True,
-            )
-        )
-    else:
-        rels.text = rels_text
-    draft.binary_parts.append(BinaryPartDraft(path, icon.png, PNG_CONTENT_TYPE))
+    control_id = element.attr("id") or element.attr("idQ") or "icon"
+    path, rid = add_image_member(
+        draft, part_path, icon.png, extension="png", stem=control_id.rsplit(":", 1)[-1]
+    )
+    ribbon.text = rs.set_control_image(ribbon.text, element, rid)
     if current:
         # The old picture: gone from the file too, unless another control shows it.
         _release_image(draft, part_path, current)
     return path
-

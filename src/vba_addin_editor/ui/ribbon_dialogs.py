@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from vba_addin_editor.services import icon_service
+from vba_addin_editor.services import icon_service, port_service
 from vba_addin_editor.services import ribbon_service as rs
 from vba_addin_editor.ui import theme
 from vba_addin_editor.version import APP_NAME
@@ -723,3 +723,167 @@ class RibbonButtonsDialog:
         entry = self._selected()
         if entry is not None and self.window.create_callback(entry.callback):
             self.refresh()
+
+
+class ImportControlDialog:
+    """Pick a ribbon control of another add-in, where it goes here, and preview the import.
+
+    ``plan`` is called as plan(control, target, suffix, group_label) -> PortPlan
+    each time the choice changes; the dialog itself never edits anything.
+    ``wait()`` returns the plan of the confirmed choice, or None.
+    """
+
+    def __init__(
+        self,
+        root,
+        *,
+        source_name: str,
+        controls: list[port_service.PortableControl],
+        targets_for,
+        plan,
+        suffix: str,
+        show_part: bool,
+    ) -> None:
+        self.root = root
+        self.controls = controls
+        self.targets_for = targets_for
+        self.planner = plan
+        self.show_part = show_part
+        self.targets: list[port_service.PortTarget] = []
+        self.plan: port_service.PortPlan | None = None
+        self.result: port_service.PortPlan | None = None
+        self._pending: str | None = None
+        win = self.win = tk.Toplevel(root)
+        win.title("Import Button from Another Add-in")
+        win.transient(root)
+        win.geometry("860x640")
+        frame = ttk.Frame(win, padding=10)
+        frame.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(win, padding=(10, 0, 10, 10))
+        # Ahead of the form in packing order, so a short window shrinks the preview, not these.
+        buttons.pack(fill="x", side="bottom")
+        frame.pack(fill="both", expand=True)
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=4)
+        self.import_btn = ttk.Button(buttons, text="Import", command=self.confirm)
+        self.import_btn.pack(side="right")
+
+        ttk.Label(frame, text="From:").grid(row=0, column=0, sticky="ne", padx=4, pady=3)
+        ttk.Label(frame, text=source_name, font=theme.BOLD_FONT).grid(row=0, column=1, sticky="w", padx=4)
+
+        ttk.Label(frame, text="Control:").grid(row=1, column=0, sticky="ne", padx=4, pady=3)
+        lists = ttk.Frame(frame)
+        lists.grid(row=1, column=1, sticky="nsew", padx=4)
+        self.listbox = tk.Listbox(lists, height=8, exportselection=False, activestyle="none")
+        sb = ttk.Scrollbar(lists, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for control in controls:
+            self.listbox.insert("end", control.describe())
+        self.listbox.bind("<<ListboxSelect>>", lambda _e: self._control_changed())
+
+        ttk.Label(frame, text="Put it in:").grid(row=2, column=0, sticky="e", padx=4, pady=3)
+        self.target_box = ttk.Combobox(frame, state="readonly", width=70)
+        self.target_box.grid(row=2, column=1, sticky="ew", padx=4)
+        self.target_box.bind("<<ComboboxSelected>>", lambda _e: self._sync())
+
+        ttk.Label(frame, text="New group label:").grid(row=3, column=0, sticky="e", padx=4, pady=3)
+        self.group_var = tk.StringVar()
+        self.group_entry = ttk.Entry(frame, textvariable=self.group_var, width=40)
+        self.group_entry.grid(row=3, column=1, sticky="w", padx=4)
+        self.group_var.trace_add("write", lambda *_a: self._schedule())
+
+        ttk.Label(frame, text="Name suffix:").grid(row=4, column=0, sticky="e", padx=4, pady=3)
+        suffix_row = ttk.Frame(frame)
+        suffix_row.grid(row=4, column=1, sticky="ew", padx=4)
+        self.suffix_var = tk.StringVar(value=suffix)
+        ttk.Entry(suffix_row, textvariable=self.suffix_var, width=24).pack(side="left")
+        ttk.Label(
+            suffix_row,
+            text="added to the button's macros, and to any name this add-in already uses",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=8)
+        self.suffix_var.trace_add("write", lambda *_a: self._schedule())
+
+        ttk.Label(frame, text="What happens:").grid(row=5, column=0, sticky="ne", padx=4, pady=3)
+        preview = ttk.Frame(frame)
+        preview.grid(row=5, column=1, sticky="nsew", padx=4, pady=(3, 0))
+        frame.rowconfigure(5, weight=1)
+        self.preview = tk.Text(preview, wrap="word", height=16, state="disabled")
+        psb = ttk.Scrollbar(preview, orient="vertical", command=self.preview.yview)
+        self.preview.configure(yscrollcommand=psb.set)
+        self.preview.pack(side="left", fill="both", expand=True)
+        psb.pack(side="right", fill="y")
+
+        win.bind("<Escape>", lambda _e: win.destroy())
+        if controls:
+            self.listbox.selection_set(0)
+        self._control_changed()
+        self.listbox.focus_set()
+
+    # -- state ---------------------------------------------------------------
+
+    def _selected_control(self) -> port_service.PortableControl | None:
+        sel = self.listbox.curselection()
+        return self.controls[int(sel[0])] if sel else None
+
+    def _selected_target(self) -> port_service.PortTarget | None:
+        index = self.target_box.current()
+        return self.targets[index] if 0 <= index < len(self.targets) else None
+
+    def _control_changed(self) -> None:
+        control = self._selected_control()
+        self.targets = self.targets_for(control) if control is not None else []
+        self.target_box.config(values=[t.describe(self.show_part) for t in self.targets])
+        if self.targets:
+            self.target_box.current(0)
+        else:
+            self.target_box.set("")
+        self._sync()
+
+    def _sync(self) -> None:
+        target = self._selected_target()
+        new_group = target is not None and target.new_group
+        self.group_entry.config(state="normal" if new_group else "disabled")
+        self._refresh()
+
+    def _schedule(self) -> None:
+        if self._pending is not None:
+            self.win.after_cancel(self._pending)
+        self._pending = self.win.after(300, self._refresh)
+
+    def _refresh(self) -> None:
+        self._pending = None
+        control, target = self._selected_control(), self._selected_target()
+        if control is None:
+            self.plan, text = None, "Choose a control."
+        elif target is None:
+            self.plan = None
+            text = (
+                f"This add-in's ribbon has no place a {control.element} can go "
+                "(it needs a custom group, menu or tab)."
+            )
+        else:
+            plan = self.planner(control, target, self.suffix_var.get().strip(), self.group_var.get())
+            self.plan, text = plan, plan.describe()
+        self.preview.config(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.insert("1.0", text)
+        self.preview.config(state="disabled")
+        ok = self.plan is not None and self.plan.ok
+        self.import_btn.config(state="normal" if ok else "disabled")
+
+    def confirm(self) -> None:
+        if self._pending is not None:
+            self.win.after_cancel(self._pending)
+            self._refresh()
+        if self.plan is None or not self.plan.ok:
+            return
+        self.result = self.plan
+        self.win.destroy()
+
+    def wait(self) -> port_service.PortPlan | None:
+        self.win.grab_set()
+        self.root.wait_window(self.win)
+        return self.result
