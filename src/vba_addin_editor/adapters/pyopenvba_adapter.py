@@ -190,6 +190,25 @@ def _host_class(path: Path) -> type[VBAHostFile]:
     raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
 
 
+def blank_template_bytes(extension: str) -> bytes:
+    """The Office-authored empty package a new file of ``extension`` starts from.
+
+    Excel's add-in template for .xlam; PowerPoint's macro-enabled presentation
+    for .pptm and .ppam (pyOpenVBA ships no .ppam template: the caller turns
+    the presentation into an add-in by its main part content type).
+    """
+    suffix = extension.lower()
+    if suffix == ".xlam":
+        from pyopenvba._templates import EMPTY_XLAM_BYTES
+
+        return EMPTY_XLAM_BYTES
+    if suffix in (".ppam", ".pptm"):
+        from pyopenvba._templates import EMPTY_PPTM_BYTES
+
+        return EMPTY_PPTM_BYTES
+    raise AdapterError("Only .xlam, .ppam, and .pptm files are supported.")
+
+
 # A destination save() can never write: its folder does not exist. The
 # in-memory host recognises it and returns the saved parts instead.
 _CAPTURE_ONLY = Path("vbaae-capture-only") / "never-written"

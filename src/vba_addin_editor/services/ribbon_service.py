@@ -1121,13 +1121,15 @@ def new_relationships_text() -> str:
     )
 
 
-def add_relationship(text: str, rel_type: str, target: str) -> tuple[str, str]:
+def add_relationship(
+    text: str, rel_type: str, target: str, *, id_prefix: str = "rIdImg"
+) -> tuple[str, str]:
     """Append a Relationship; returns (new_text, its Id)."""
     taken = {rid.casefold() for rid, _t, _g in relationships(text)}
     n = 1
-    while f"rIdImg{n}".casefold() in taken:
+    while f"{id_prefix}{n}".casefold() in taken:
         n += 1
-    rid = f"rIdImg{n}"
+    rid = f"{id_prefix}{n}"
     element = f'<Relationship Id="{rid}" Type="{_attr(rel_type)}" Target="{_attr(target)}"/>'
     tags = _scan_tags(text)
     close = next(
@@ -1143,7 +1145,7 @@ def add_relationship(text: str, rel_type: str, target: str) -> tuple[str, str]:
         (t for t in tags if t.self_closing and _local_name(t.name) == "Relationships"), None
     )
     if empty is None:
-        raise RibbonEditError("The ribbon's relationships part has no <Relationships> element.")
+        raise RibbonEditError("The relationships part has no <Relationships> element.")
     opening = re.sub(r"\s*/>$", ">", text[empty.start : empty.end])
     name = text[empty.start + 1 : empty.start + 1 + len(empty.name)]
     return (
@@ -1173,6 +1175,44 @@ def ensure_default_content_type(text: str, extension: str, content_type: str) ->
             at = text.rfind("\n", 0, first_child.start) + 1
             return text[:at] + indent + element + "\n" + text[at:]
     return text[: root.end] + element + text[root.end :]
+
+
+def default_content_type(text: str, extension: str) -> str | None:
+    """The ContentType [Content_Types].xml gives files with ``extension``, if any."""
+    for tag in _scan_tags(text):
+        if (
+            not tag.closing
+            and _local_name(tag.name) == "Default"
+            and tag.attrs.get("Extension", ("", 0))[0].casefold() == extension.casefold()
+        ):
+            return _unescape(tag.attrs.get("ContentType", ("", 0))[0])
+    return None
+
+
+def override_content_type(text: str, part_name: str) -> str | None:
+    """The ContentType an <Override> gives ``part_name`` ("/a/b.xml"), if any."""
+    for tag in _scan_tags(text):
+        if (
+            not tag.closing
+            and _local_name(tag.name) == "Override"
+            and _unescape(tag.attrs.get("PartName", ("", 0))[0]).casefold() == part_name.casefold()
+        ):
+            return _unescape(tag.attrs.get("ContentType", ("", 0))[0])
+    return None
+
+
+def add_override_content_type(text: str, part_name: str, content_type: str) -> str:
+    """[Content_Types].xml with an <Override> for ``part_name`` appended."""
+    tags = _scan_tags(text)
+    close = next((t for t in reversed(tags) if t.closing and _local_name(t.name) == "Types"), None)
+    if close is None:
+        raise RibbonEditError("[Content_Types].xml has no <Types> element to add to.")
+    element = f'<Override PartName="{_attr(part_name)}" ContentType="{_attr(content_type)}"/>'
+    indent, on_own_line = _line_indent(text, close.start)
+    if on_own_line:
+        at = text.rfind("\n", 0, close.start) + 1
+        return text[:at] + indent + "  " + element + "\n" + text[at:]
+    return text[: close.start] + element + text[close.start :]
 
 
 def image_control_at(text: str, offset: int) -> RibbonElement | None:

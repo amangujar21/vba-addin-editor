@@ -36,6 +36,7 @@ from vba_addin_editor.platform.settings import load_settings, save_settings
 from vba_addin_editor.services import icon_service
 from vba_addin_editor.services import port_service as ps
 from vba_addin_editor.services import ribbon_service as rs
+from vba_addin_editor.services import starter_service as ss
 from vba_addin_editor.services.backup_service import BackupService
 from vba_addin_editor.services.conflict_service import ConflictService
 from vba_addin_editor.services.diagnostics_service import dialog_text, report_for
@@ -68,6 +69,7 @@ from vba_addin_editor.ui.ribbon_dialogs import (
     GroupMenuDialog,
     ImportControlDialog,
     RibbonButtonsDialog,
+    StarterRibbonDialog,
     ask_image_file,
     choose,
 )
@@ -80,6 +82,11 @@ _FILETYPES = [
     ("Excel Add-ins", "*.xlam"),
     ("PowerPoint Add-ins", "*.ppam"),
     ("PowerPoint Macro-Enabled Presentations", "*.pptm"),
+]
+_NEW_FILETYPES = [
+    ("Excel Add-in", "*.xlam"),
+    ("PowerPoint Add-in", "*.ppam"),
+    ("PowerPoint Macro-Enabled Presentation", "*.pptm"),
 ]
 
 
@@ -226,6 +233,7 @@ class MainWindow:
         self.root.bind("<F10>", lambda _e: self._post_header_menu(self._header_buttons[0]))
 
         file_menu = self._header_menu("File")
+        file_menu.add_command(label="New Add-in…", accelerator="Ctrl+N", command=self.new_file)
         file_menu.add_command(label="Open Office VBA File…", accelerator="Ctrl+O", command=self.open_file)
         self.recent_menu = tk.Menu(file_menu, tearoff=0, postcommand=self._fill_recent_menu)
         self._menus.append(self.recent_menu)
@@ -273,6 +281,7 @@ class MainWindow:
         module_menu.add_command(label="Export All…", command=self.export_all)
 
         ribbon_menu = self._header_menu("Ribbon")
+        ribbon_menu.add_command(label="Create Ribbon…", command=self.create_ribbon)
         ribbon_menu.add_command(label="Ribbon Buttons…", command=self.show_ribbon_buttons)
         ribbon_menu.add_command(
             label="Go to Macro / Button", accelerator="F12", command=self.goto_callback_under_cursor
@@ -743,6 +752,7 @@ class MainWindow:
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self.open_file())
+        self.root.bind("<Control-n>", lambda _e: self.new_file())
         self.root.bind("<Control-s>", lambda _e: self.save())
         self.root.bind("<Control-S>", lambda _e: self.save_copy())
         # Reached only when focus is outside an editor's text; the text widget
@@ -1165,14 +1175,15 @@ class MainWindow:
             return
         self.load_path(Path(path))
 
-    def load_path(self, path: Path) -> None:
+    def load_path(self, path: Path, *, written=None) -> bool:
+        """Open ``path``; ``written`` = (bytes, fingerprint) of a file this editor just made."""
         if self._saving:
-            return
+            return False
         self._flush_all_editors()
 
         def work():
             try:
-                session = self.session_service.open(path)
+                session = self.session_service.open(path, written=written)
             except (AdapterError, OSError, ValueError):
                 return None, self.doc_service.open(path)
             return session, session.draft
@@ -1189,7 +1200,7 @@ class MainWindow:
                 else f"{path.name} could not be opened.\n\n{exc}",
             )
             self._refresh_state()
-            return
+            return False
         finally:
             self._saving = False
         if self.session is not None:
@@ -1215,6 +1226,132 @@ class MainWindow:
         self._remember_recent(path)
         self.status.config(text=f"Opened {path.name}")
         self._offer_icon_repair()
+        return True
+
+    # -- new file / first ribbon -------------------------------------------------------
+
+    def new_file(self) -> None:
+        """Make a new, empty add-in file (optionally with a ribbon tab) and open it."""
+        if self._saving:
+            return
+        kind = tk.StringVar(master=self.root, value=_NEW_FILETYPES[0][0])
+        chosen = filedialog.asksaveasfilename(
+            title="New Add-in",
+            filetypes=_NEW_FILETYPES,
+            typevariable=kind,
+            confirmoverwrite=False,
+        )
+        if not chosen:
+            return
+        path = Path(chosen)
+        if path.suffix.lower() not in (".xlam", ".ppam", ".pptm"):
+            # A name typed without an extension takes the chosen file type's.
+            pattern = dict(_NEW_FILETYPES).get(kind.get(), "*.xlam")
+            path = path.with_name(path.name + pattern.lstrip("*"))
+        if path.exists():
+            messagebox.showerror(
+                APP_NAME, f"{path.name} already exists. Choose a new file name, or open it instead."
+            )
+            return
+        dialog = StarterRibbonDialog(
+            self.root,
+            title="New Add-in",
+            intro=f"Give {path.name} its own ribbon tab with a group for your macros' buttons?",
+            optional=True,
+        )
+        spec = dialog.wait()
+        if spec is None and not dialog.skipped:
+            return
+        self.create_new_file(path, spec)
+
+    def create_new_file(self, path: Path, ribbon: ss.StarterRibbonSpec | None) -> bool:
+        """Write an empty ``path`` (.xlam/.ppam/.pptm), open it, and add ``ribbon`` as an edit."""
+        try:
+            written = ss.create_blank_file(path)
+        except ss.StarterError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return False
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"{path.name} could not be created.\n\n{exc}")
+            return False
+        if not self.load_path(path, written=written):
+            return False
+        if ribbon is not None and not self.apply_starter_ribbon(ribbon):
+            return True
+        tail = " with a ribbon tab. Save File writes the ribbon" if ribbon else ""
+        self.status.config(text=f"Created {path.name}{tail}.")
+        return True
+
+    def create_ribbon(self) -> bool:
+        """Ribbon → Create Ribbon…: give a file without ribbon XML a first tab."""
+        draft = self.draft
+        if draft is None or self._saving:
+            return False
+        self._flush_all_editors()
+        problem = ss.ribbon_blocker(draft)
+        if problem:
+            messagebox.showinfo(APP_NAME, problem)
+            return False
+        spec = self.ask_starter_ribbon(
+            f"{draft.baseline.path.name} has no ribbon yet. Add a tab with one group?"
+        )
+        return spec is not None and self.apply_starter_ribbon(spec)
+
+    def ask_starter_ribbon(self, intro: str) -> ss.StarterRibbonSpec | None:
+        return StarterRibbonDialog(self.root, title="Create Ribbon", intro=intro).wait()
+
+    def apply_starter_ribbon(self, spec: ss.StarterRibbonSpec) -> bool:
+        """Add a first ribbon (customUI14.xml and its links) to the draft as one undoable edit."""
+        draft = self.draft
+        if draft is None:
+            return False
+        self._flush_all_editors()
+        problem = ss.ribbon_blocker(draft) or ss.validate_spec(spec)
+        if problem:
+            messagebox.showinfo(APP_NAME, problem)
+            return False
+        added: list = []
+        failures: list[str] = []
+
+        def mutate() -> None:
+            try:
+                added.append(ss.add_starter_ribbon(draft, spec))
+            except ss.StarterError as exc:  # pragma: no cover - checked just above
+                failures.append(str(exc))
+
+        self._batch_edit(mutate)
+        if failures or not added:
+            messagebox.showerror(APP_NAME, failures[0] if failures else "No ribbon was added.")
+            return False
+        part = added[0]
+        text = part.text or ""
+        _tab_id, group_id = spec.ids()
+        at = text.find(f'id="{rs.xml_attr(group_id)}"')
+        line = text.count("\n", 0, max(at, 0)) + 1
+        self._open_xml_at(part.path, line, 1)
+        self.status.config(
+            text=f'Added ribbon tab "{spec.tab_label}" with group "{spec.group_label}". '
+            "Nothing is written until Save File."
+        )
+        return True
+
+    def _ensure_ribbon(self, purpose: str) -> bool:
+        """When the file has no editable ribbon XML, offer to create one. True = there is one now."""
+        draft = self.draft
+        if draft is None:
+            return False
+        if any(p.editable for p in rs.ribbon_parts(draft)):
+            return True
+        problem = ss.ribbon_blocker(draft)
+        if problem:
+            messagebox.showinfo(
+                APP_NAME, f"This file has no editable ribbon XML to put {purpose} in.\n\n{problem}"
+            )
+            return False
+        spec = self.ask_starter_ribbon(
+            f"This file has no ribbon yet. Add a tab with one group to put {purpose} in?"
+        )
+        return spec is not None and self.apply_starter_ribbon(spec)
 
     def _offer_icon_repair(self) -> None:
         """Version 0.6.0 linked custom icons so that Office shows them blank: offer the fix."""
@@ -2509,14 +2646,9 @@ class MainWindow:
         if draft.baseline.safety.password_protected:
             messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
             return
-        parts = [p for p in rs.ribbon_parts(draft) if p.editable]
-        if not parts:
-            messagebox.showinfo(
-                APP_NAME,
-                "This file has no editable ribbon XML (customUI/customUI.xml or "
-                "customUI14.xml).\n\nAdding a new ribbon part is not supported yet.",
-            )
+        if not self._ensure_ribbon("the button"):
             return
+        parts = [p for p in rs.ribbon_parts(draft) if p.editable]
         containers = [c for p in parts for c in rs.find_containers(p.text or "", p.path)]
         if not containers:
             messagebox.showinfo(
@@ -2555,14 +2687,9 @@ class MainWindow:
         if draft is None:
             return
         self._flush_all_editors()
-        parts = [p for p in rs.ribbon_parts(draft) if p.editable]
-        if not parts:
-            messagebox.showinfo(
-                APP_NAME,
-                "This file has no editable ribbon XML (customUI/customUI.xml or "
-                "customUI14.xml).\n\nAdding a new ribbon part is not supported yet.",
-            )
+        if not self._ensure_ribbon("the menu"):
             return
+        parts = [p for p in rs.ribbon_parts(draft) if p.editable]
         containers = [c for p in parts for c in rs.find_containers(p.text or "", p.path)]
         if not containers:
             messagebox.showinfo(
@@ -2743,12 +2870,7 @@ class MainWindow:
                 "This file has a package digital signature; editing its ribbon would break it.",
             )
             return
-        if not any(p.editable for p in rs.ribbon_parts(draft)):
-            messagebox.showinfo(
-                APP_NAME,
-                "This file has no editable ribbon XML (customUI/customUI.xml or customUI14.xml) "
-                "to put a button in.\n\nAdding a new ribbon part is not supported yet.",
-            )
+        if not self._ensure_ribbon("the imported button"):
             return
         path = filedialog.askopenfilename(
             title="Import Button from Another Add-in", filetypes=_FILETYPES

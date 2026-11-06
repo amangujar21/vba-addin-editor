@@ -62,8 +62,24 @@ lets Office load the updated code the next time it starts.
    Recent**). In the module list, ● marks an edited module, + a new one, → a
    renamed one, and 🔒 one that cannot be renamed or deleted (its code can
    still be edited; selecting it says why). VBA and XML are syntax-coloured.
+8. **File → New Add-in…** (Ctrl+N) makes a new, empty `.xlam`, `.ppam` or
+   `.pptm` (pick the type in the file dialog) and opens it. It starts from the
+   blank file Excel or PowerPoint itself writes (shipped inside pyOpenVBA):
+   `ThisWorkbook`, `Sheet1` and an empty `Module1` for Excel, an empty
+   `Module1` for PowerPoint. A `.ppam` is that PowerPoint presentation with its
+   main part typed as an add-in. The form that follows offers a ribbon tab with
+   one group for your buttons (**No Ribbon** skips it); the ribbon is an
+   unsaved edit until **Save File**. An existing file is never replaced.
 
 ## Ribbon buttons ↔ macros
+
+**Ribbon → Create Ribbon…** gives a file that has no ribbon XML a first one:
+a custom tab with one empty group, in a new `customUI/customUI14.xml` linked
+from `_rels/.rels` (one Undo removes it again; nothing is written until Save
+File). **Add Ribbon Button**, **Add Ribbon Menu** and **Import Button** offer
+the same when the file has no ribbon yet. Files with an OPC package signature,
+or whose `_rels/.rels` already links a ribbon part that is missing, are
+refused with the reason.
 
 For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
 
@@ -171,8 +187,8 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
 - **XML edits stay inside their package.** Only the exact XML parts you edited
   may differ; every other payload is verified byte-identical. An XML-only save
   never touches `vbaProject.bin`. The only members a save may add are the ones
-  the draft adds (ribbon icons, made or imported with a button, and their
-  relationships part); each must hold
+  the draft adds (a first ribbon part, ribbon icons, made or imported with a
+  button, and their relationships part); each must hold
   exactly the draft's bytes, and none may already exist. The only members a
   save may remove are images no ribbon control shows any more; nothing else is
   ever removed.
@@ -209,6 +225,7 @@ decompress modules that have not changed. The folder can be deleted at any time.
 - The tool validates structure, not VBA compilation. A syntax error you type
   will surface when Office runs the macro. Use a backup to roll back.
 - **XML editing** covers existing parts. The only parts the editor adds are
+  a first ribbon part (`customUI/customUI14.xml`, for a file without one),
   ribbon icons (made, or imported with a button) and the relationships part
   that links them, and the only parts
   it removes are icon images nothing shows; it never renames package parts.

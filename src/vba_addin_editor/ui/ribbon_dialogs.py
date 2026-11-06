@@ -1,4 +1,4 @@
-"""Ribbon dialogs: button list, Add Ribbon Button form, and a simple chooser."""
+"""Ribbon dialogs: button list, Add Ribbon Button form, a first ribbon tab, and a simple chooser."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from vba_addin_editor.services import icon_service, port_service
 from vba_addin_editor.services import ribbon_service as rs
+from vba_addin_editor.services import starter_service as ss
 from vba_addin_editor.ui import theme
 from vba_addin_editor.version import APP_NAME
 
@@ -595,6 +596,79 @@ class GroupMenuDialog:
         self.win.destroy()
 
     def wait(self) -> GroupMenuSpec | None:
+        self.win.grab_set()
+        self.root.wait_window(self.win)
+        return self.result
+
+
+class StarterRibbonDialog:
+    """Tab and group labels for a file's first ribbon.
+
+    With ``optional`` (a new file), "No Ribbon" closes it with ``skipped`` set:
+    the file is made without one.
+    """
+
+    def __init__(self, root, *, title: str, intro: str, optional: bool = False) -> None:
+        self.root = root
+        self.result: ss.StarterRibbonSpec | None = None
+        self.skipped = False
+        win = self.win = tk.Toplevel(root)
+        win.title(title)
+        win.transient(root)
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text=intro, wraplength=440).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 8)
+        )
+        ttk.Label(frame, text="Tab label:").grid(row=1, column=0, sticky="e", padx=4, pady=3)
+        self.tab_var = tk.StringVar(master=win, value=ss.DEFAULT_TAB_LABEL)
+        self.tab_entry = ttk.Entry(frame, textvariable=self.tab_var, width=40)
+        self.tab_entry.grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Label(frame, text="Group label:").grid(row=2, column=0, sticky="e", padx=4, pady=3)
+        self.group_var = tk.StringVar(master=win, value=ss.DEFAULT_GROUP_LABEL)
+        ttk.Entry(frame, textvariable=self.group_var, width=40).grid(
+            row=2, column=1, sticky="ew", padx=4
+        )
+        ttk.Label(
+            frame,
+            text="The group starts empty: put the cursor in a Sub and use "
+            "Ribbon → Add Ribbon Button for This Macro… to fill it.",
+            style="Muted.TLabel",
+            wraplength=440,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=4)
+        if optional:
+            ttk.Button(buttons, text="No Ribbon", command=self.skip).pack(side="right", padx=4)
+        ttk.Button(buttons, text="Add Ribbon", command=self.confirm).pack(side="right")
+        win.bind("<Return>", lambda _e: self.confirm())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self.tab_entry.focus_set()
+        self.tab_entry.select_range(0, "end")
+
+    def spec(self) -> ss.StarterRibbonSpec:
+        return ss.StarterRibbonSpec(
+            tab_label=self.tab_var.get().strip(), group_label=self.group_var.get().strip()
+        )
+
+    def confirm(self) -> None:
+        spec = self.spec()
+        problem = ss.validate_spec(spec)
+        if problem:
+            messagebox.showerror(APP_NAME, problem, parent=self.win)
+            return
+        self.result = spec
+        self.win.destroy()
+
+    def skip(self) -> None:
+        self.skipped = True
+        self.win.destroy()
+
+    def wait(self) -> ss.StarterRibbonSpec | None:
         self.win.grab_set()
         self.root.wait_window(self.win)
         return self.result

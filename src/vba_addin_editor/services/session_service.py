@@ -74,12 +74,18 @@ class SessionService:
         self.session_root = session_root
         self._locks: dict[str, SessionLock] = {}
 
-    def open(self, path: Path) -> DocumentSession:
+    def open(self, path: Path, *, written=None) -> DocumentSession:
+        """Open ``path`` in a new session.
+
+        ``written`` = (bytes, fingerprint) of a file this process just wrote
+        and verified through the writing handle: it is used instead of reading
+        the file back, which would wait for an antivirus scan.
+        """
         path = Path(path).resolve()
         last_error: Exception | None = None
         for _ in range(3):
             try:
-                return self._open_once(path)
+                return self._open_once(path, written)
             except paths.UnstableSourceError as exc:
                 last_error = exc
         raise AdapterError(
@@ -87,7 +93,7 @@ class SessionService:
             {"reason": "source_unstable", "exception": repr(last_error)},
         )
 
-    def _open_once(self, path: Path) -> DocumentSession:
+    def _open_once(self, path: Path, written=None) -> DocumentSession:
         session_id = new_session_id()
         directory = create_session_dir(session_id, root=self.session_root)
         lock = acquire_lock(directory)
@@ -95,7 +101,10 @@ class SessionService:
         captured = baseline_package_path(directory, path.suffix.lower())
         # One stable read serves the fingerprint, the captured copy and the
         # parse. The captured copy is verified as it is written, never reopened.
-        data, original_fp = paths.read_stable(path)
+        if written is not None:
+            data, original_fp = written
+        else:
+            data, original_fp = paths.read_stable(path)
         write_bytes_atomic(captured, data)
         captured_fp = replace(original_fp, mtime_ns=captured.stat().st_mtime_ns)
         snapshot = self._snapshot_from_captured(data, captured_fp, path)
