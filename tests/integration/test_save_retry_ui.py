@@ -42,8 +42,8 @@ def test_save_button_enabled_when_host_was_running_at_open(work_xlam: Path, monk
         assert str(window.save_btn.cget("state")) == "normal"
         shown = []
         monkeypatch.setattr(
-            "vba_addin_editor.ui.main_window.messagebox.askokcancel",
-            lambda *_a, **_k: True,
+            "vba_addin_editor.ui.main_window.ask_review",
+            lambda *_a, **_k: "save",
         )
         monkeypatch.setattr(
             "vba_addin_editor.ui.main_window.messagebox.showinfo",
@@ -75,8 +75,8 @@ def test_blocked_save_leaves_button_retryable(work_xlam: Path, monkeypatch):
         window._flush_all_editors()
         window.save_service.process_probe = lambda _p: True
         monkeypatch.setattr(
-            "vba_addin_editor.ui.main_window.messagebox.askokcancel",
-            lambda *_a, **_k: True,
+            "vba_addin_editor.ui.main_window.ask_review",
+            lambda *_a, **_k: "save",
         )
         monkeypatch.setattr(
             "vba_addin_editor.ui.main_window.messagebox.askyesno",
@@ -142,8 +142,8 @@ def test_gui_save_publishes_session_baseline(work_xlam: Path, monkeypatch):
         window.editor.text.insert("end", "\n' session-pub\n")
         window._flush_all_editors()
         monkeypatch.setattr(
-            "vba_addin_editor.ui.main_window.messagebox.askokcancel",
-            lambda *_a, **_k: True,
+            "vba_addin_editor.ui.main_window.ask_review",
+            lambda *_a, **_k: "save",
         )
         monkeypatch.setattr(
             "vba_addin_editor.ui.main_window.messagebox.showinfo",

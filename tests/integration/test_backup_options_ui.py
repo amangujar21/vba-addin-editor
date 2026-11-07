@@ -36,7 +36,7 @@ def _backups(path: Path) -> list[Path]:
 
 def _edit_and_save(win, monkeypatch, marker: str):
     shown: list[str] = []
-    monkeypatch.setattr(mw.messagebox, "askokcancel", lambda _t, msg, **k: shown.append(msg) or True)
+    monkeypatch.setattr(mw, "ask_review", lambda _p, view, **k: shown.append(view.backup_text) or mw.SAVE)
     monkeypatch.setattr(mw.messagebox, "showinfo", lambda _t, msg, **k: shown.append(msg))
     module = win.draft.find_current("Module1")
     win._open_module_at(module.id, 1)

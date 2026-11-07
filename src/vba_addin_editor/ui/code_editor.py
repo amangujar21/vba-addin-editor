@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import bisect
+import difflib
 import re
 import tkinter as tk
+from collections.abc import Callable
 from tkinter import ttk
 
 from vba_addin_editor.ui import theme
@@ -12,6 +14,28 @@ from vba_addin_editor.ui.highlight import TAGS, Highlighter
 from vba_addin_editor.ui.text_context_menu import install_text_context_menu
 
 LINE_SPACING = 2  # pixels above each line
+CHANGE_MARK_DELAY_MS = 300
+MAX_MARKED_LINES = 20000  # past this, change bars are skipped (diffing would lag typing)
+
+
+def changed_lines(baseline: str | None, current: str) -> dict[int, str]:
+    """1-based line -> "add" or "mod" for lines that differ from ``baseline``."""
+    new = current.split("\n")
+    if baseline is None:
+        return {n: "add" for n in range(1, len(new) + 1)} if current else {}
+    old = baseline.split("\n")
+    marks: dict[int, str] = {}
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "insert":
+            for n in range(j1, j2):
+                marks[n + 1] = "add"
+        elif tag == "replace":
+            for n in range(j1, j2):
+                marks[n + 1] = "mod" if n - j1 < i2 - i1 else "add"
+        elif tag == "delete" and j1 < len(new):
+            marks.setdefault(j1 + 1, "mod")
+    return marks
 
 
 class CodeEditor(ttk.Frame):
@@ -20,6 +44,10 @@ class CodeEditor(ttk.Frame):
         self.on_change = on_change
         self._find_token = ""
         self._view_after = None
+        # Change bars in the gutter: lines that differ from what the file holds.
+        self.baseline_provider: Callable[[], tuple[bool, str | None]] | None = None
+        self._marks: dict[int, str] = {}
+        self._marks_after = None
         self.linenumbers = tk.Canvas(self, width=44, highlightthickness=0)
         self.text = tk.Text(
             self,
@@ -95,6 +123,7 @@ class CodeEditor(ttk.Frame):
         self.text.delete("1.0", "end")
         self.text.insert("1.0", value)
         self.text.edit_reset()
+        self._update_marks()
         self._redraw_line_numbers()
 
     def goto_line(self, line: int) -> None:
@@ -114,10 +143,34 @@ class CodeEditor(ttk.Frame):
     def _on_modified(self, event) -> None:
         self.text.edit_modified(False)
         self._schedule_view_update()
+        self._schedule_marks()
         if self.find_bar.winfo_manager() and self._highlight_after is None:
             self._highlight_after = self.after_idle(self._highlight_matches)
         if self.on_change is not None:
             self.on_change()
+
+    def _schedule_marks(self) -> None:
+        if self._marks_after is not None:
+            self.after_cancel(self._marks_after)
+        self._marks_after = self.after(CHANGE_MARK_DELAY_MS, self._update_marks)
+
+    def _update_marks(self) -> None:
+        """Recompute the change bars against the provider's baseline text."""
+        if self._marks_after is not None:
+            self.after_cancel(self._marks_after)
+            self._marks_after = None
+        if not self.winfo_exists():
+            return
+        provided = self.baseline_provider() if self.baseline_provider is not None else (False, None)
+        has_baseline, baseline = provided
+        current = self.get_text()
+        if not has_baseline or current.count("\n") > MAX_MARKED_LINES:
+            marks: dict[int, str] = {}
+        else:
+            marks = changed_lines(baseline, current)
+        if marks != self._marks:
+            self._marks = marks
+            self._schedule_view_update()
 
     def _on_undo(self, _event=None):
         if self.on_undo is not None:
@@ -152,10 +205,11 @@ class CodeEditor(ttk.Frame):
         linespace = int(self.tk.call("font", "metrics", font, "-linespace")) + LINE_SPACING
         total = int(text.index("end-1c").split(".")[0])
         digit = int(self.tk.call("font", "measure", font, "0"))
-        width = digit * max(len(str(total)), 3) + 2 * digit
+        width = digit * max(len(str(total)), 3) + 3 * digit
         if int(self.linenumbers.cget("width")) != width:
             self.linenumbers.configure(width=width)
         current = int(text.index("insert").split(".")[0])
+        mark_colors = {"add": colors.ok, "mod": colors.warn}
         self.linenumbers.delete("all")
         first = int(text.index("@0,0").split(".")[0])
         last = first + text.winfo_height() // linespace + 2
@@ -164,13 +218,19 @@ class CodeEditor(ttk.Frame):
             if dline is None:
                 continue
             self.linenumbers.create_text(
-                width - digit,
+                width - 2 * digit,
                 dline[1] + LINE_SPACING,
                 anchor="ne",
                 text=str(line),
                 font=font,
-                fill=colors.text if line == current else colors.faint,
+                fill=colors.muted if line == current else colors.gutter,
             )
+            mark = self._marks.get(line)
+            if mark is not None:
+                top = dline[1] + LINE_SPACING + 1
+                self.linenumbers.create_rectangle(
+                    width - 4, top, width - 2, top + dline[3] - LINE_SPACING - 2, fill=mark_colors[mark], width=0
+                )
         text.tag_remove("current_line", "1.0", "end")
         text.tag_add("current_line", f"{current}.0", f"{current + 1}.0")
         self.highlighter.refresh()

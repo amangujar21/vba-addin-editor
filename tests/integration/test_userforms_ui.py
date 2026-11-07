@@ -35,7 +35,7 @@ def _group_children(win: MainWindow, group: str) -> list[str]:
 def test_forms_tab_and_delete(window: MainWindow, work_xlam_with_form: Path, monkeypatch):
     window.load_path(work_xlam_with_form)
     assert window.draft is not None
-    assert _group_children(window, "UserForms") == ["EntryForm"]
+    assert _group_children(window, "Forms") == ["EntryForm"]
 
     # Forms tab: form -> frame -> textbox, plus the button.
     assert window.forms_tree.get_children() == ("form::EntryForm",)
@@ -65,12 +65,12 @@ def test_forms_tab_and_delete(window: MainWindow, work_xlam_with_form: Path, mon
     window.delete_module()
     assert prompts and "layout" in prompts[0]
     assert form.is_deleted
-    assert _group_children(window, "UserForms") == []
+    assert _group_children(window, "Forms") == []
     assert "deleted" in window.forms_tree.item("form::EntryForm", "text")
 
     window.undo()
     assert not form.is_deleted
-    assert _group_children(window, "UserForms") == ["EntryForm"]
+    assert _group_children(window, "Forms") == ["EntryForm"]
 
 
 def test_rename_userform_refused(window: MainWindow, work_xlam_with_form: Path, monkeypatch):
@@ -87,7 +87,7 @@ def test_rename_userform_refused(window: MainWindow, work_xlam_with_form: Path, 
 
 def test_orphan_layout_is_labelled_in_forms_tab(window: MainWindow, work_xlam_with_orphan_form: Path):
     window.load_path(work_xlam_with_orphan_form)
-    assert _group_children(window, "UserForms") == ["EntryForm"]
+    assert _group_children(window, "Forms") == ["EntryForm"]
     assert "no code module" in window.forms_tree.item("form::StaleForm", "text")
     assert "no code module" not in window.forms_tree.item("form::EntryForm", "text")
     window.forms_tree.selection_set("form::StaleForm")

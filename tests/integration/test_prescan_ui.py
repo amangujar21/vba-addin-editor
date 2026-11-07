@@ -25,7 +25,7 @@ def window(work_xlam: Path, tmp_path: Path, monkeypatch):
     win = mw.MainWindow(root)
     win.backup_service.catalog_path = tmp_path / "catalog.json"
     win.save_service.process_probe = lambda p: False
-    monkeypatch.setattr(mw.messagebox, "askokcancel", lambda *a, **k: True)
+    monkeypatch.setattr(mw, "ask_review", lambda *a, **k: mw.SAVE)
     monkeypatch.setattr(mw.messagebox, "showinfo", lambda *a, **k: None)
     win.load_path(work_xlam)
     root.update()

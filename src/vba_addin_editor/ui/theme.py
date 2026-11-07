@@ -18,68 +18,91 @@ from typing import Any
 @dataclass(frozen=True)
 class Palette:
     name: str
-    bg0: str  # chrome: header, tab strip, status bar
+    bg0: str  # chrome: title bar, activity rail, status bar
     bg1: str  # sidebars, panels, dialogs
     bg2: str  # editor text
-    bg3: str  # buttons, entries
+    bg3: str  # inputs, raised surfaces
     bg4: str  # hover
-    border: str
+    border: str  # hairlines between areas
+    border_strong: str  # outlines of inputs, pills and ghost buttons
     text: str
     muted: str
     faint: str
+    gutter: str  # line numbers away from the cursor
     accent: str
     accent_hover: str
+    accent_bg: str  # tinted fill behind accent text (toggles, chips)
     on_accent: str
     select: str
     select_text: str
     tree_select: str
     current_line: str
     find_match: str
-    warn: str
-    ok: str
-    info: str
+    warn: str  # also "edited"
+    warn_bg: str
+    ok: str  # also "new"
+    info: str  # also "renamed"
     danger: str
     banner_bg: str
     banner_text: str
+    banner_sub: str
+    diff_add_bg: str
+    diff_del_bg: str
     keyword: str
     string: str
     comment: str
     number: str
     xml_tag: str
     xml_attr: str
+    file_tags: tuple[tuple[str, str, str], ...]  # (extension, background, foreground)
+
+    def file_tag(self, extension: str) -> tuple[str, str]:
+        for ext, bg, fg in self.file_tags:
+            if ext == extension.lower():
+                return bg, fg
+        return self.bg3, self.muted
 
 
+# One night palette: flat fills only, taken from the redesign mockup.
 DARK = Palette(
     name="dark",
-    bg0="#16181c",
-    bg1="#1b1e23",
-    bg2="#1f2228",
-    bg3="#272b32",
-    bg4="#30353d",
-    border="#2a2e35",
-    text="#d4d7dd",
-    muted="#8a909a",
-    faint="#575d68",
-    accent="#4d8dff",
-    accent_hover="#6aa1ff",
-    on_accent="#ffffff",
-    select="#264f78",
+    bg0="#0b0c0f",
+    bg1="#101115",
+    bg2="#131418",
+    bg3="#1a1c21",
+    bg4="#22252b",
+    border="#1c1e24",
+    border_strong="#272a31",
+    text="#e3e4e8",
+    muted="#8c909a",
+    faint="#555963",
+    gutter="#3b3f48",
+    accent="#8b9dff",
+    accent_hover="#a3b2ff",
+    accent_bg="#1b2040",
+    on_accent="#0b0c0f",
+    select="#2a3358",
     select_text="#ffffff",
-    tree_select="#2a3a52",
-    current_line="#23272e",
-    find_match="#5b4a1c",
-    warn="#e5b45a",
-    ok="#6cc489",
-    info="#6fa8ff",
-    danger="#ef6b73",
-    banner_bg="#2e2817",
-    banner_text="#f0d48a",
-    keyword="#7aa2f7",
-    string="#9ece6a",
-    comment="#6a717c",
-    number="#e0af68",
-    xml_tag="#7aa2f7",
-    xml_attr="#bb9af7",
+    tree_select="#1d2233",
+    current_line="#171920",
+    find_match="#3a3218",
+    warn="#e3b35c",
+    warn_bg="#2f2716",
+    ok="#6fcf97",
+    info="#7aa8ff",
+    danger="#f07178",
+    banner_bg="#17140d",
+    banner_text="#ecd9a8",
+    banner_sub="#9a8c68",
+    diff_add_bg="#12201a",
+    diff_del_bg="#24161a",
+    keyword="#8b9dff",
+    string="#a8d58a",
+    comment="#5c616c",
+    number="#e8b46a",
+    xml_tag="#8b9dff",
+    xml_attr="#76cfc4",
+    file_tags=((".xlam", "#14261b", "#6fcf97"), (".ppam", "#2a1a17", "#f0a078"), (".pptm", "#251b2c", "#c9a0f0")),
 )
 
 LIGHT = Palette(
@@ -87,44 +110,63 @@ LIGHT = Palette(
     bg0="#eceef1",
     bg1="#f6f7f9",
     bg2="#ffffff",
-    bg3="#e3e6eb",
-    bg4="#d5d9e0",
-    border="#d9dde3",
+    bg3="#e9ecf0",
+    bg4="#dde1e7",
+    border="#e1e4e9",
+    border_strong="#cfd4db",
     text="#1f2328",
     muted="#5f6673",
     faint="#9aa1ac",
-    accent="#2f6fe0",
-    accent_hover="#4682f0",
+    gutter="#b4bac3",
+    accent="#4459d6",
+    accent_hover="#5a6ee6",
+    accent_bg="#e3e8ff",
     on_accent="#ffffff",
-    select="#cfe0fb",
+    select="#cfd8fb",
     select_text="#1f2328",
-    tree_select="#dbe6f8",
-    current_line="#f3f6fa",
+    tree_select="#dfe5fb",
+    current_line="#f4f6fa",
     find_match="#ffe7a3",
     warn="#a86a00",
+    warn_bg="#fbefd6",
     ok="#2f8f52",
     info="#2f6fe0",
     danger="#c62f3a",
     banner_bg="#fff4d6",
     banner_text="#5c4300",
-    keyword="#1f5fbf",
+    banner_sub="#8a7440",
+    diff_add_bg="#e6f6ea",
+    diff_del_bg="#fbe9ea",
+    keyword="#3346c2",
     string="#3c7d22",
     comment="#7a828e",
     number="#a35d00",
-    xml_tag="#1f5fbf",
-    xml_attr="#8a3fb0",
+    xml_tag="#3346c2",
+    xml_attr="#1d7f74",
+    file_tags=((".xlam", "#dff3e5", "#1f7a41"), (".ppam", "#fbe6dd", "#b14a1c"), (".pptm", "#efe3f8", "#7a3fa8")),
 )
 
 PALETTES = {"dark": DARK, "light": LIGHT}
 
 UI_FAMILY = "Segoe UI"
 UI_SIZE = 10
-CODE_FAMILY = "Consolas"
+CODE_FAMILY = "Consolas"  # last resort; the first installed of CODE_FAMILIES wins
+CODE_FAMILIES = ("Cascadia Code", "Cascadia Mono", "Consolas")
+UI_FAMILIES = ("Segoe UI Variable Text", "Segoe UI")
+ICON_FAMILIES = ("Segoe Fluent Icons", "Segoe MDL2 Assets")
 CODE_SIZE = 11
 CODE_FONT = "VbaaeCode"  # named font shared by every code editor (zoom changes it once)
 BOLD_FONT = "VbaaeBold"
 SMALL_FONT = "VbaaeSmall"
+SMALL_BOLD_FONT = "VbaaeSmallBold"
+CAPTION_FONT = "VbaaeCaption"  # upper-case section headings
 HERO_FONT = "VbaaeHero"
+TITLE_FONT = "VbaaeTitle"
+ICON_FONT = "VbaaeIcon"
+ICON_SMALL_FONT = "VbaaeIconSmall"
+LOGO_FONT = "VbaaeLogo"
+LOGO_BIG_FONT = "VbaaeLogoBig"
+TAG_FONT = "VbaaeTag"
 
 _active: Palette = DARK
 
@@ -173,19 +215,50 @@ def _named_font(root: tk.Misc, name: str, **options) -> None:
         root.tk.call("font", "create", name, *args)
 
 
+def _first_family(root: tk.Misc, choices: tuple[str, ...], fallback: str) -> str:
+    try:
+        installed = {f.casefold() for f in root.tk.splitlist(root.tk.call("font", "families"))}
+    except tk.TclError:
+        return fallback
+    return next((f for f in choices if f.casefold() in installed), fallback)
+
+
+_icons_available = False
+
+
+def icons_available() -> bool:
+    """Whether a Windows icon font was found (otherwise widgets show text fallbacks)."""
+    return _icons_available
+
+
 def _configure_fonts(root: tk.Misc, code_size: int) -> None:
+    global _icons_available
+    ui = _first_family(root, UI_FAMILIES, UI_FAMILY)
+    code = _first_family(root, CODE_FAMILIES, CODE_FAMILY)
+    icon = _first_family(root, ICON_FAMILIES, "")
+    _icons_available = bool(icon)
     for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
-        _named_font(root, name, family=UI_FAMILY, size=UI_SIZE)
-    _named_font(root, BOLD_FONT, family=UI_FAMILY + " Semibold", size=UI_SIZE)
-    _named_font(root, SMALL_FONT, family=UI_FAMILY, size=UI_SIZE - 1)
-    _named_font(root, HERO_FONT, family=UI_FAMILY + " Semibold", size=UI_SIZE + 8)
-    _named_font(root, CODE_FONT, family=CODE_FAMILY, size=code_size)
+        _named_font(root, name, family=ui, size=UI_SIZE)
+    semibold = ui + " Semibold" if ui == UI_FAMILY else ui
+    weight = "normal" if ui == UI_FAMILY else "bold"
+    _named_font(root, BOLD_FONT, family=semibold, size=UI_SIZE, weight=weight)
+    _named_font(root, SMALL_FONT, family=ui, size=UI_SIZE - 1)
+    _named_font(root, SMALL_BOLD_FONT, family=semibold, size=UI_SIZE - 1, weight=weight)
+    _named_font(root, CAPTION_FONT, family=semibold, size=UI_SIZE - 2, weight=weight)
+    _named_font(root, HERO_FONT, family=semibold, size=UI_SIZE + 7, weight=weight)
+    _named_font(root, TITLE_FONT, family=semibold, size=UI_SIZE + 1, weight=weight)
+    _named_font(root, ICON_FONT, family=icon or ui, size=UI_SIZE + 2)
+    _named_font(root, ICON_SMALL_FONT, family=icon or ui, size=UI_SIZE - 1)
+    _named_font(root, LOGO_FONT, family=code, size=UI_SIZE, weight="bold")
+    _named_font(root, LOGO_BIG_FONT, family=code, size=UI_SIZE + 6, weight="bold")
+    _named_font(root, TAG_FONT, family=code, size=UI_SIZE - 3, weight="bold")
+    _named_font(root, CODE_FONT, family=code, size=code_size)
 
 
 def code_font(widget: tk.Misc) -> str:
     """Name of the shared code font, created with defaults if the window is unthemed."""
     if CODE_FONT not in widget.tk.splitlist(widget.tk.call("font", "names")):
-        _named_font(widget, CODE_FONT, family=CODE_FAMILY, size=CODE_SIZE)
+        _named_font(widget, CODE_FONT, family=_first_family(widget, CODE_FAMILIES, CODE_FAMILY), size=CODE_SIZE)
     return CODE_FONT
 
 
@@ -264,24 +337,54 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
     )
     s.map(".", foreground=[("disabled", c.faint)])
 
-    s.configure("Chrome.TFrame", background=c.bg0)
-    s.configure("Editor.TFrame", background=c.bg2)
+    for style, bg in (("Chrome", c.bg0), ("Editor", c.bg2), ("Panel", c.bg1), ("Raised", c.bg3)):
+        s.configure(f"{style}.TFrame", background=bg)
+    s.configure("Line.TFrame", background=c.border)
     s.configure("Chrome.TLabel", background=c.bg0, foreground=c.muted)
-    s.configure("Title.TLabel", background=c.bg0, foreground=c.text, font=BOLD_FONT)
+    s.configure("Title.TLabel", background=c.bg0, foreground=c.text, font=TITLE_FONT)
+    s.configure("Path.TLabel", background=c.bg0, foreground=c.faint, font=SMALL_FONT)
     s.configure("Dirty.TLabel", background=c.bg0, foreground=c.warn)
-    s.configure("Status.TLabel", background=c.bg0, foreground=c.muted, font=SMALL_FONT)
-    s.configure("Logo.TLabel", background=c.bg0, foreground=c.accent)
+    s.configure("Status.TLabel", background=c.bg0, foreground=c.faint, font=SMALL_FONT)
+    s.configure("StatusOk.TLabel", background=c.bg0, foreground=c.ok, font=ICON_SMALL_FONT)
+    s.configure("StatusIcon.TLabel", background=c.bg0, foreground=c.faint, font=ICON_SMALL_FONT)
+    s.configure("Logo.TLabel", background=c.accent, foreground=c.on_accent, font=LOGO_FONT, padding=(6, 1))
     s.configure("Banner.TFrame", background=c.banner_bg)
     s.configure("Banner.TLabel", background=c.banner_bg, foreground=c.banner_text)
+    s.configure("BannerBold.TLabel", background=c.banner_bg, foreground=c.banner_text, font=BOLD_FONT)
+    s.configure("BannerSub.TLabel", background=c.banner_bg, foreground=c.banner_sub, font=SMALL_FONT)
     s.configure("Muted.TLabel", foreground=c.muted)
     s.configure("Faint.TLabel", foreground=c.faint, font=SMALL_FONT)
-    s.configure("Caption.TLabel", foreground=c.faint, font=SMALL_FONT)
+    s.configure("Caption.TLabel", foreground=c.faint, font=CAPTION_FONT)
     s.configure("Hero.TLabel", foreground=c.text, font=HERO_FONT)
-    s.configure("Link.TLabel", foreground=c.info)
-    s.configure("EditorInfo.TLabel", background=c.bg2, foreground=c.muted, font=SMALL_FONT)
+    s.configure("Link.TLabel", foreground=c.accent)
     s.configure("Heading.TLabel", font=BOLD_FONT)
+    s.configure("Ok.TLabel", foreground=c.ok)
+    s.configure("Warn.TLabel", foreground=c.warn)
+    s.configure("PanelIcon.TLabel", foreground=c.faint, font=ICON_SMALL_FONT)
+    s.configure("OkIcon.TLabel", foreground=c.ok, font=ICON_SMALL_FONT)
+    s.configure("WarnIcon.TLabel", foreground=c.warn, font=ICON_SMALL_FONT)
+    s.configure("EditorInfo.TLabel", background=c.bg2, foreground=c.faint, font=SMALL_FONT)
+    # Breadcrumb bar above each editor.
+    s.configure("Crumb.TLabel", background=c.bg2, foreground=c.faint, font=SMALL_FONT)
+    s.configure("CrumbStrong.TLabel", background=c.bg2, foreground=c.muted, font=SMALL_BOLD_FONT)
+    s.configure("CrumbSep.TLabel", background=c.bg2, foreground=c.faint, font=ICON_SMALL_FONT)
+    for name, color in (("Warn", c.warn), ("Ok", c.ok), ("Info", c.info), ("Muted", c.faint)):
+        s.configure(f"Crumb{name}.TLabel", background=c.bg2, foreground=color, font=SMALL_FONT)
+    s.configure("Toast.TFrame", background=c.bg3)
+    s.configure("Toast.TLabel", background=c.bg3, foreground=c.text, font=BOLD_FONT)
+    s.configure("ToastSub.TLabel", background=c.bg3, foreground=c.faint, font=SMALL_FONT)
+    s.configure("ToastIcon.TLabel", background=c.bg3, foreground=c.ok, font=ICON_FONT)
+    s.configure("Raised.TLabel", background=c.bg3, foreground=c.text)
+    s.configure("LogoBig.TLabel", background=c.accent, foreground=c.on_accent, font=LOGO_BIG_FONT, padding=(12, 4))
+    # Labels that sit on the editor surface (welcome screen, form view).
+    s.configure("EditorHero.TLabel", background=c.bg2, foreground=c.text, font=HERO_FONT)
+    s.configure("EditorMuted.TLabel", background=c.bg2, foreground=c.muted)
+    s.configure("EditorFaint.TLabel", background=c.bg2, foreground=c.faint, font=SMALL_FONT)
+    s.configure("EditorCaption.TLabel", background=c.bg2, foreground=c.faint, font=CAPTION_FONT)
+    for badge, color in (("M", c.warn), ("A", c.ok), ("R", c.info)):
+        s.configure(f"Badge{badge}.TLabel", foreground=color, font=TAG_FONT)
 
-    # Buttons: flat blocks; Accent is the one primary action, Ghost sits on chrome.
+    # Buttons: flat blocks; Accent is the one primary action, Ghost is outlined.
     s.configure("TButton", background=c.bg3, padding=(12, 4), focusthickness=0, **_flat(c.bg3))
     s.map(
         "TButton",
@@ -297,29 +400,122 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
         foreground=[("disabled", c.faint)],
         **_flat_map(("disabled", c.bg3), ("pressed", c.accent), ("active", c.accent_hover)),
     )
-    for style, bg in (("Ghost.TButton", c.bg0), ("Panel.TButton", c.bg1)):
-        s.configure(style, background=bg, padding=(10, 3), width=0, focusthickness=0, **_flat(bg))
+    for style, bg, fg, outline, hover in (
+        ("Ghost.TButton", c.bg0, c.muted, c.border_strong, c.bg4),
+        ("Panel.TButton", c.bg1, c.muted, c.border_strong, c.bg4),
+        ("Banner.TButton", c.banner_bg, c.banner_text, c.banner_sub, c.banner_bg),
+    ):
+        s.configure(
+            style,
+            background=bg,
+            foreground=fg,
+            padding=(10, 3),
+            width=0,
+            focusthickness=0,
+            lightcolor=bg,
+            darkcolor=bg,
+            bordercolor=outline,
+        )
         s.map(
             style,
-            foreground=[("disabled", c.faint)],
-            **_flat_map(("disabled", bg), ("pressed", c.bg4), ("active", c.bg3)),
+            foreground=[("disabled", c.faint), ("active", c.text if bg != c.banner_bg else fg)],
+            background=[("pressed", hover), ("active", hover)],
+            lightcolor=[("pressed", hover), ("active", hover)],
+            darkcolor=[("pressed", hover), ("active", hover)],
         )
-
-    # Header menus: text only until hovered or open.
-    s.layout(
-        "Header.TMenubutton",
-        [("Menubutton.border", {"sticky": "nswe", "children": [
-            ("Menubutton.padding", {"sticky": "nswe", "children": [
-                ("Menubutton.label", {"sticky": ""})]})]})],
+    # Borderless text and icon buttons.
+    for style, bg, font in (
+        ("Flat.TButton", c.bg0, None),
+        ("Icon.TButton", c.bg1, ICON_SMALL_FONT),
+        ("ChromeIcon.TButton", c.bg0, ICON_SMALL_FONT),
+        ("EditorIcon.TButton", c.bg2, ICON_SMALL_FONT),
+        ("RaisedIcon.TButton", c.bg3, ICON_SMALL_FONT),
+    ):
+        options = {"font": font} if font else {}
+        s.configure(
+            style,
+            background=bg,
+            foreground=c.muted if font is None else c.faint,
+            padding=(9, 4) if font is None else (5, 3),
+            width=0,
+            focusthickness=0,
+            **_flat(bg),
+            **options,
+        )
+        s.map(
+            style,
+            foreground=[("disabled", c.faint), ("active", c.text)],
+            **_flat_map(("pressed", c.bg4), ("active", c.bg4)),
+        )
+    s.configure("Changes.TButton", background=c.bg0, foreground=c.warn, padding=(10, 4), width=0, **_flat(c.bg0))
+    s.map(
+        "Changes.TButton",
+        foreground=[("disabled", c.faint), ("active", c.warn)],
+        **_flat_map(("pressed", c.bg4), ("active", c.bg4)),
     )
     s.configure(
-        "Header.TMenubutton", background=c.bg0, foreground=c.muted, padding=(9, 4), width=0, **_flat(c.bg0)
+        "EditorText.TButton", background=c.bg2, foreground=c.muted, font=SMALL_FONT, padding=(8, 2), width=0,
+        **_flat(c.bg2),
     )
     s.map(
-        "Header.TMenubutton",
-        foreground=[("disabled", c.faint), ("active", c.text), ("pressed", c.text)],
-        **_flat_map(("pressed", c.bg3), ("active", c.bg3)),
+        "EditorText.TButton",
+        foreground=[("disabled", c.faint), ("active", c.text)],
+        **_flat_map(("pressed", c.bg4), ("active", c.bg4)),
     )
+    s.configure(
+        "EditorGhost.TButton", background=c.bg2, foreground=c.muted, padding=(14, 5), width=0, focusthickness=0,
+        lightcolor=c.bg2, darkcolor=c.bg2, bordercolor=c.border_strong,
+    )
+    s.map(
+        "EditorGhost.TButton",
+        foreground=[("active", c.text)],
+        background=[("active", c.bg4)],
+        lightcolor=[("active", c.bg4)],
+        darkcolor=[("active", c.bg4)],
+    )
+    s.configure(
+        "CommandIcon.TButton", background=c.bg3, foreground=c.faint, font=ICON_SMALL_FONT, padding=(8, 5),
+        focusthickness=0, lightcolor=c.bg3, darkcolor=c.bg3, bordercolor=c.border_strong,
+    )
+    s.map("CommandIcon.TButton", foreground=[("active", c.text)], background=[("active", c.bg4)])
+    # The title bar's search / command box.
+    s.configure(
+        "Command.TButton",
+        background=c.bg3,
+        foreground=c.faint,
+        padding=(10, 4),
+        anchor="w",
+        focusthickness=0,
+        lightcolor=c.bg3,
+        darkcolor=c.bg3,
+        bordercolor=c.border_strong,
+    )
+    s.map(
+        "Command.TButton",
+        foreground=[("active", c.muted)],
+        background=[("active", c.bg3)],
+        bordercolor=[("active", c.faint)],
+        lightcolor=[("active", c.bg3)],
+        darkcolor=[("active", c.bg3)],
+    )
+
+    # Header menus: text only until hovered or open.
+    menubutton_layout: Any = [("Menubutton.border", {"sticky": "nswe", "children": [
+        ("Menubutton.padding", {"sticky": "nswe", "children": [
+            ("Menubutton.label", {"sticky": ""})]})]})]
+    for style, bg, fg in (("Header.TMenubutton", c.bg0, c.muted), ("Crumb.TMenubutton", c.bg2, c.text)):
+        s.layout(style, menubutton_layout)
+        s.configure(style, background=bg, foreground=fg, padding=(8, 3), width=0, **_flat(bg))
+        s.map(
+            style,
+            foreground=[("disabled", c.faint), ("active", c.text), ("pressed", c.text)],
+            **_flat_map(("pressed", c.bg4), ("active", c.bg4)),
+        )
+    s.configure("Crumb.TMenubutton", font=SMALL_FONT, padding=(6, 1))
+
+    # The activity rail replaces tab strips: notebooks keep their pages, not their tabs.
+    s.layout("Hidden.TNotebook.Tab", [])
+    s.configure("Hidden.TNotebook", background=c.bg2, borderwidth=0, tabmargins=0, padding=0, **_flat(c.bg2))
 
     s.layout(
         "TNotebook.Tab",
@@ -346,8 +542,8 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
         fieldbackground=c.bg1,
         foreground=c.text,
         borderwidth=0,
-        rowheight=linespace + 9,
-        indent=14,
+        rowheight=linespace + 11,
+        indent=12,
     )
     s.map("Treeview", background=[("selected", c.tree_select)], foreground=[("selected", c.select_text)])
     s.configure("Treeview.Heading", background=c.bg0, foreground=c.muted, padding=(6, 4), **_flat(c.bg0))
@@ -373,9 +569,21 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
     s.configure("TPanedwindow", background=c.bg0)
     s.configure("Sash", sashthickness=3, gripcount=0, background=c.bg0, **_flat(c.bg0))
 
-    entry = {"fieldbackground": c.bg3, "insertcolor": c.text, "padding": (6, 4), **_flat(c.bg3)}
+    entry = {
+        "fieldbackground": c.bg3,
+        "insertcolor": c.text,
+        "padding": (7, 4),
+        "lightcolor": c.bg3,
+        "darkcolor": c.bg3,
+        "bordercolor": c.border_strong,
+    }
     s.configure("TEntry", **entry)
-    s.map("TEntry", bordercolor=[("focus", c.accent)], lightcolor=[("focus", c.accent)])
+    s.map("TEntry", bordercolor=[("focus", c.accent)], lightcolor=[("focus", c.bg3)])
+    s.configure("Editor.Treeview", background=c.bg2, fieldbackground=c.bg2)
+    s.configure("Editor.Treeview.Heading", background=c.bg2, foreground=c.faint, font=SMALL_FONT, **_flat(c.bg2))
+    s.configure("Palette.Treeview", background=c.bg3, fieldbackground=c.bg3, rowheight=linespace + 14)
+    s.configure("Palette.TEntry", fieldbackground=c.bg3, padding=(10, 8), **_flat(c.bg3))
+    s.map("Palette.TEntry", bordercolor=[("focus", c.bg3)], lightcolor=[("focus", c.bg3)])
     s.configure("TCombobox", background=c.bg3, arrowcolor=c.muted, **entry)
     s.map(
         "TCombobox",
@@ -405,7 +613,7 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
         )
     s.configure("TRadiobutton", indicatorbackground=c.bg3, indicatorforeground=c.on_accent, focusthickness=0)
     s.map("TRadiobutton", background=[("active", c.bg1)], indicatorbackground=[("selected", c.accent)])
-    s.configure("TLabelframe", background=c.bg1, bordercolor=c.border, lightcolor=c.bg1, darkcolor=c.bg1)
+    s.configure("TLabelframe", background=c.bg1, bordercolor=c.border_strong, lightcolor=c.bg1, darkcolor=c.bg1)
     s.configure("TLabelframe.Label", background=c.bg1, foreground=c.muted)
     s.configure("TSeparator", background=c.border)
     s.configure("TProgressbar", background=c.accent, troughcolor=c.bg3, **_flat(c.bg3))

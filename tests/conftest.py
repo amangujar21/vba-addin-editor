@@ -379,3 +379,15 @@ def replace_package_payload():
         temp.replace(path)
 
     return replace
+
+
+@pytest.fixture(autouse=True)
+def _no_modal_review(monkeypatch):
+    """A test that reaches the review dialog without patching main_window.ask_review fails, not hangs."""
+    from vba_addin_editor.ui import review_dialog
+
+    def refuse(self):
+        self.win.destroy()
+        raise AssertionError("patch vba_addin_editor.ui.main_window.ask_review in GUI tests")
+
+    monkeypatch.setattr(review_dialog.ReviewDialog, "wait", refuse)

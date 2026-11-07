@@ -110,9 +110,10 @@ def test_tree_marks_edited_and_locked_modules(window, work_xlam: Path):
     window._flush_all_editors()
     window._refresh_tree()
     window._refresh_state()
-    assert window.tree.item(module.id, "text") == "Module1  ●"
+    assert window.tree.item(module.id, "text") == "Module1"
+    assert window.tree.item(module.id, "values") == ("M",)
     assert window.tree.item(module.id, "tags") == ("dirty",)
     locked = next(m for m in window.draft.modules if not (m.can_delete or m.can_rename))
-    assert window.tree.item(locked.id, "text").startswith("🔒 ")
+    assert window.tree.item(locked.id, "values") == ("🔒",)
     assert window.tree.item(locked.id, "tags") == ("locked",)
-    assert window.dirty_label.cget("text") == "●  1 unsaved"
+    assert window.review_btn.cget("text") == "●  1 change"

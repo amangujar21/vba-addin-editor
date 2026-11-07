@@ -57,12 +57,20 @@ from vba_addin_editor.services.recovery_service import (
 )
 from vba_addin_editor.services.review_service import ReviewService
 from vba_addin_editor.services.save_service import SaveService
-from vba_addin_editor.services.search_service import SearchService
+from vba_addin_editor.services.search_service import SearchService, parse_procedures
 from vba_addin_editor.services.session_service import SessionService
 from vba_addin_editor.services.validation_service import validate_module_name
 from vba_addin_editor.ui import theme
 from vba_addin_editor.ui.code_editor import CodeEditor
+from vba_addin_editor.ui.command_palette import (
+    COMMAND,
+    MODULE,
+    PROCEDURE,
+    CommandPalette,
+    PaletteItem,
+)
 from vba_addin_editor.ui.conflict_dialog import ConflictDialog
+from vba_addin_editor.ui.review_dialog import REVERT, SAVE, ReviewView, ask_review, entry_from_item
 from vba_addin_editor.ui.ribbon_dialogs import (
     AddButtonDialog,
     AddMenuDialog,
@@ -73,7 +81,9 @@ from vba_addin_editor.ui.ribbon_dialogs import (
     ask_image_file,
     choose,
 )
+from vba_addin_editor.ui.ribbon_panel import RibbonPanel
 from vba_addin_editor.ui.search_dialog import ProjectSearchDialog
+from vba_addin_editor.ui.widgets import RailButton, Spinner, Toast, Tooltip, hover_row, icon
 from vba_addin_editor.ui.xml_editor import XmlEditor
 from vba_addin_editor.version import APP_NAME, PYOPENVBA_PIN, VERSION, build_identity
 
@@ -98,6 +108,22 @@ QUEUED_SAVE_POLL_MS = 500
 MAX_RECENT_FILES = 8
 MIN_CODE_SIZE, MAX_CODE_SIZE = 7, 28
 _FILE_KINDS = {".xlam": "Excel add-in", ".ppam": "PowerPoint add-in", ".pptm": "PowerPoint presentation"}
+# Sidebar groups, in display order.
+GROUP_MODULES, GROUP_CLASSES, GROUP_FORMS = "Modules", "Class modules", "Forms"
+# Start of a procedure, or its end, for the breadcrumb (Tcl regular expression).
+_PROC_EDGE_TCL = (
+    r"^[ \t]*((public|private|friend)[ \t]+)?(static[ \t]+)?"
+    r"(sub|function|property[ \t]+(get|let|set))[ \t]+[a-z_][a-z0-9_]*"
+    r"|^[ \t]*end[ \t]+(sub|function|property)"
+)
+_PROC_DECL = re.compile(
+    r"^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?(?:Sub|Function|Property\s+(?:Get|Let|Set))\s+(\w+)",
+    re.IGNORECASE,
+)
+CURSOR_FOLLOW_MS = 150
+HEADER_PATH_MIN_WIDTH = 1440  # narrower: the folder path moves to the file name tooltip
+HEADER_COMMAND_MIN_WIDTH = 1100  # narrower: the command box becomes a search icon
+RIBBON_PANEL_REFRESH_MS = 400
 
 
 def _shorten(text: str, limit: int = 56) -> str:
@@ -106,6 +132,22 @@ def _shorten(text: str, limit: int = 56) -> str:
         return text
     keep = (limit - 1) // 2
     return text[:keep] + "…" + text[-keep:]
+
+
+def _when(path: Path) -> str:
+    """Today / Yesterday / Nov 2 for a recent file's last change."""
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return "missing"
+    day = time.localtime(stamp)
+    now = time.localtime()
+    days = (time.mktime(now[:3] + (0, 0, 0, 0, 0, -1)) - time.mktime(day[:3] + (0, 0, 0, 0, 0, -1))) // 86400
+    if days <= 0:
+        return "Today"
+    if days == 1:
+        return "Yesterday"
+    return time.strftime("%b %d", day).replace(" 0", " ")
 
 
 def _draft_signature(draft: DocumentDraft) -> str:
@@ -145,6 +187,8 @@ class MainWindow:
         self._gc_was_enabled = False
         self._last_vba_text = ""
         self._last_xml_text = ""
+        self._follow_after = None
+        self._ribbon_after = None
         self.doc_service = DocumentService()
         session_root = os.environ.get("VBAAE_SESSION_ROOT")
         if session_root:
@@ -177,8 +221,8 @@ class MainWindow:
             enable_source_disk_cache(appdata_root() / "source-cache" / f"pyopenvba-{PYOPENVBA_PIN}")
 
         root.title(APP_NAME)
-        root.geometry("1100x700")
-        root.minsize(760, 480)
+        root.geometry("1280x800")
+        root.minsize(820, 520)
         # Before any widget exists: classic Tk widgets read the option database once.
         theme.apply_theme(root, self.settings.theme, self.settings.editor_font_size)
         theme.set_title_bar(root)
@@ -186,6 +230,8 @@ class MainWindow:
         self._build_toolbar()
         self._build_panes()
         self._build_statusbar()
+        self.command_palette = CommandPalette(root, self._palette_items)
+        self.toast = Toast(root)
         self._bind_shortcuts()
         for tree in (self.tree, self.xml_tree, self.forms_tree):
             self._configure_tree_tags(tree)
@@ -199,6 +245,8 @@ class MainWindow:
         self.editor.on_redo = self.redo
         self.xml_editor.on_undo = self.undo
         self.xml_editor.on_redo = self.redo
+        self.editor.baseline_provider = self._module_baseline
+        self.xml_editor.baseline_provider = self._xml_baseline
         self._recovery_after = None
         self._schedule_host_poll()
         if not os.environ.get("PYTEST_CURRENT_TEST"):
@@ -225,9 +273,11 @@ class MainWindow:
         return "break"
 
     def _build_menu(self) -> None:
-        self.header = ttk.Frame(self.root, style="Chrome.TFrame", padding=(6, 6, 10, 6))
+        self.header = ttk.Frame(self.root, style="Chrome.TFrame", padding=(10, 6, 8, 6))
         self.header.pack(fill="x", side="top")
-        ttk.Label(self.header, text="◆", style="Logo.TLabel").pack(side="left", padx=(6, 6))
+        self.header_line = ttk.Frame(self.root, style="Line.TFrame", height=1)
+        self.header_line.pack(fill="x", side="top")
+        ttk.Label(self.header, text="V", style="Logo.TLabel").pack(side="left", padx=(2, 10))
         self._header_buttons: list[ttk.Menubutton] = []
         self._menus: list[tk.Menu] = []
         self.root.bind("<F10>", lambda _e: self._post_header_menu(self._header_buttons[0]))
@@ -269,6 +319,8 @@ class MainWindow:
             label="Find Next", accelerator="F3", command=lambda: self._active_text_editor().find_next()
         )
         edit_menu.add_command(label="Find in Project…", accelerator="Ctrl+Shift+F", command=self.project_search)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Revert All Changes…", command=self.confirm_revert_all)
 
         module_menu = self._header_menu("Module")
         module_menu.add_command(label="Add Standard Module…", command=lambda: self.add_module(standard=True))
@@ -315,6 +367,10 @@ class MainWindow:
         ribbon_menu.add_command(label="Check Ribbon Callbacks", command=self.check_ribbon_callbacks)
 
         view_menu = self._header_menu("View")
+        view_menu.add_command(
+            label="Command Palette…", accelerator="Ctrl+K", command=lambda: self.open_command_palette()
+        )
+        view_menu.add_separator()
         self.theme_var = tk.StringVar(master=self.root, value=theme.palette().name)
         view_menu.add_radiobutton(
             label="Dark Theme", value="dark", variable=self.theme_var, command=self._on_theme_chosen
@@ -333,34 +389,84 @@ class MainWindow:
         self._last_result = None
 
     def _build_toolbar(self) -> None:
-        """File identity and the save actions, on the right of the header."""
+        """File identity, the command box and the save actions, in the header."""
         bar = self.header
-        self.save_btn = ttk.Button(bar, text="Save", style="Accent.TButton", command=self.save, state="disabled")
-        self.save_btn.configure(width=8)
+        colors = theme.palette()
+        self.save_btn = ttk.Button(
+            bar, text="Save   Ctrl+S", style="Accent.TButton", command=self.save, state="disabled", takefocus=False
+        )
         self.review_btn = ttk.Button(
-            bar, text="Review", style="Toolbar.TButton", command=self.review_changes, state="disabled"
+            bar, text="", style="Changes.TButton", command=self.review_changes, state="disabled", takefocus=False
         )
-        self.revert_btn = ttk.Button(
-            bar, text="Revert", style="Toolbar.TButton", command=self.revert_all, state="disabled"
-        )
+        Tooltip(self.review_btn, "Review changes")
         self.file_label = ttk.Label(bar, text="", style="Title.TLabel")
-        self.file_label.pack(side="left", padx=(22, 0))
-        self.dirty_label = ttk.Label(bar, text="", style="Dirty.TLabel")
-        self.dirty_label.pack(side="left", padx=(12, 0))
+        self.file_label.pack(side="left", padx=(14, 0))
+        self.path_label = ttk.Label(bar, text="", style="Path.TLabel")
+        # Whether the Office host that would load the file is running.
+        self.host_pill = tk.Frame(
+            bar,
+            background=colors.bg0,
+            highlightthickness=1,
+            highlightbackground=colors.border_strong,
+            highlightcolor=colors.border_strong,
+        )
+        self.host_dot = tk.Label(
+            self.host_pill, text="●", font=theme.SMALL_FONT, background=colors.bg0, foreground=colors.ok
+        )
+        self.host_dot.pack(side="left", padx=(7, 3))
+        self.host_text = tk.Label(
+            self.host_pill, text="", font=theme.SMALL_FONT, background=colors.bg0, foreground=colors.muted
+        )
+        self.host_text.pack(side="left", padx=(0, 8), pady=1)
+        self.command_btn = ttk.Button(
+            bar,
+            text="Search modules, code or commands" + " " * 8 + "Ctrl+K",
+            style="Command.TButton",
+            width=42,
+            command=lambda: self.open_command_palette(),
+            takefocus=False,
+        )
+        # Last: when the header is narrow, the command box gives way first.
+        self.command_btn.pack(side="left", expand=True, padx=12)
+        self._command_text = str(self.command_btn.cget("text"))
+        self.file_tip = Tooltip(self.file_label, "")
+        bar.bind("<Configure>", lambda _e: self._fit_header(), add=True)
+
+    def _fit_header(self) -> None:
+        """Like the mockup on small screens: drop the folder path, then shrink the command box."""
+        width = self.header.winfo_width()
+        if self.draft is not None and width >= HEADER_PATH_MIN_WIDTH:
+            if not self.path_label.winfo_manager() and self.save_btn.winfo_manager():
+                self.path_label.pack(side="left", padx=(8, 0), after=self.file_label)
+        elif self.path_label.winfo_manager():
+            self.path_label.pack_forget()
+        compact = width < HEADER_COMMAND_MIN_WIDTH
+        self.command_btn.configure(
+            text=icon("search") if compact else self._command_text,
+            width=0 if compact else 42,
+            style="CommandIcon.TButton" if compact else "Command.TButton",
+        )
 
     def _show_header_actions(self, show: bool) -> None:
-        """Save, Review and Revert appear once a file is open."""
-        buttons = (self.save_btn, self.review_btn, self.revert_btn)
+        """Path, host state, changes and Save appear once a file is open."""
+        right = (self.save_btn, self.review_btn)
         if not show:
-            for button in buttons:
-                button.pack_forget()
+            for widget in (*right, self.path_label, self.host_pill):
+                widget.pack_forget()
         elif not self.save_btn.winfo_manager():
             # Packed ahead of the labels: when the header is narrow the file name gives way, not Save.
-            for button in buttons:
-                button.pack(side="right", padx=(6, 0), before=self.file_label)
+            self.save_btn.pack(side="right", padx=(6, 0), before=self.file_label)
+            self.review_btn.pack(side="right", padx=(6, 0), before=self.file_label)
+            self.host_pill.pack(side="left", padx=(10, 0), after=self.file_label)
+            self._fit_header()
 
     def _build_panes(self) -> None:
-        self.editor_notebook = ttk.Notebook(self.root)
+        # The activity rail picks the view; the notebook keeps the pages but shows no tabs.
+        self.rail = ttk.Frame(self.root, style="Chrome.TFrame", padding=(0, 6, 0, 6))
+        self.rail.pack(side="left", fill="y")
+        self.rail_line = ttk.Frame(self.root, style="Line.TFrame", width=1)
+        self.rail_line.pack(side="left", fill="y")
+        self.editor_notebook = ttk.Notebook(self.root, style="Hidden.TNotebook")
         vba_tab = ttk.Frame(self.editor_notebook)
         self._build_vba_tab(vba_tab)
         self.xml_tab = ttk.Frame(self.editor_notebook)
@@ -371,56 +477,239 @@ class MainWindow:
         self.editor_notebook.add(self.xml_tab, text="Ribbon & XML")
         self.editor_notebook.add(self.forms_tab, text="UserForms")
         self.editor_notebook.pack(fill="both", expand=True)
+        self.editor_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._sync_rail(), add=True)
+        self._build_rail()
         self._build_welcome()
         self.banner = ttk.Label(self.root, text="", style="Banner.TLabel", padding=(14, 7))
         # Shown while a save waits for the Office host to release the file.
-        self.wait_bar = ttk.Frame(self.root, padding=(14, 5), style="Banner.TFrame")
+        colors = theme.palette()
+        self.wait_bar = ttk.Frame(self.root, padding=(14, 6, 10, 6), style="Banner.TFrame")
+        self.wait_spinner = Spinner(self.wait_bar, background=colors.banner_bg, color=colors.warn)
+        self.wait_spinner.pack(side="left", padx=(0, 10))
+        self.wait_title = ttk.Label(self.wait_bar, text="", style="BannerBold.TLabel")
+        self.wait_title.pack(side="left")
         self.wait_label = ttk.Label(self.wait_bar, text="", style="Banner.TLabel")
-        self.wait_label.pack(side="left", fill="x", expand=True)
+        self.wait_label.pack(side="left", padx=(6, 0))
         self.wait_cancel_btn = ttk.Button(
-            self.wait_bar, text="Cancel Auto-Save", command=self.cancel_queued_save
+            self.wait_bar, text="Cancel auto-save", style="Banner.TButton", command=self.cancel_queued_save
         )
         self.wait_cancel_btn.pack(side="right")
+        self.wait_sub = ttk.Label(
+            self.wait_bar,
+            text="Keep this window open · edits made meanwhile are reviewed again",
+            style="BannerSub.TLabel",
+        )
+        self.wait_sub.pack(side="left", padx=(14, 0))
         self._install_ribbon_actions()
+
+    def _build_rail(self) -> None:
+        views = (
+            ("code", "VBA code", 0),
+            ("ribbon", "Ribbon & XML", 1),
+            ("form", "UserForms", 2),
+        )
+        self.rail_buttons: list[RailButton] = []
+        for name, tip, index in views:
+            button = RailButton(self.rail, icon(name), tip, lambda i=index: self._show_view(i))
+            button.pack(side="top", pady=1)
+            self.rail_buttons.append(button)
+        self._rail_extra = [
+            RailButton(self.rail, icon("search"), "Find in project  Ctrl+Shift+F", self.project_search),
+            RailButton(self.rail, icon("history"), "Backups", self.backup_browser),
+        ]
+        for button in self._rail_extra:
+            button.pack(side="top", pady=1)
+        settings = RailButton(self.rail, icon("gear"), "Settings", lambda: self._post_settings_menu(settings))
+        settings.pack(side="bottom", pady=1)
+        self._rail_extra.append(settings)
+        menu = self.settings_menu = tk.Menu(self.rail, tearoff=0)
+        self._menus.append(menu)
+        menu.add_radiobutton(label="Dark Theme", value="dark", variable=self.theme_var, command=self._on_theme_chosen)
+        menu.add_radiobutton(
+            label="Light Theme", value="light", variable=self.theme_var, command=self._on_theme_chosen
+        )
+        menu.add_separator()
+        menu.add_checkbutton(
+            label="Back Up Automatically on Save", variable=self.auto_backup_var, command=self._on_auto_backup_toggled
+        )
+        menu.add_separator()
+        menu.add_command(label="Zoom In", accelerator="Ctrl+=", command=lambda: self.zoom(1))
+        menu.add_command(label="Zoom Out", accelerator="Ctrl+-", command=lambda: self.zoom(-1))
+        menu.add_command(label="Reset Zoom", accelerator="Ctrl+0", command=lambda: self.zoom(0))
+        self._sync_rail()
+
+    def _post_settings_menu(self, button) -> None:
+        self.settings_menu.tk_popup(button.winfo_rootx() + button.winfo_width(), button.winfo_rooty())
+
+    def _show_view(self, index: int) -> None:
+        if self.draft is None:
+            return
+        self.editor_notebook.select(index)
+        self._sync_rail()
+
+    def _sync_rail(self) -> None:
+        try:
+            current = self.editor_notebook.index("current")
+        except tk.TclError:
+            current = 0
+        for index, button in enumerate(getattr(self, "rail_buttons", [])):
+            button.set_active(index == current)
+        if hasattr(self, "cursor_label"):  # the status bar is built after the rail
+            self._update_cursor_label()
+
+    def _build_sidebar(
+        self,
+        parent,
+        title: str,
+        *,
+        add=None,
+        add_tip: str = "",
+        filter_var: tk.StringVar | None = None,
+        legend: bool = False,
+    ):
+        """Sidebar column: heading, optional filter box, a tree and an optional legend."""
+        side = ttk.Frame(parent, width=264)
+        side.pack_propagate(False)
+        head = ttk.Frame(side, padding=(14, 8, 6, 4))
+        head.pack(fill="x", side="top")
+        ttk.Label(head, text=title, style="Caption.TLabel").pack(side="left", pady=3)
+        if add is not None:
+            plus = ttk.Button(head, text=icon("plus"), style="Icon.TButton", command=add, takefocus=False)
+            plus.pack(side="right")
+            Tooltip(plus, add_tip)
+        if filter_var is not None:
+            box = ttk.Frame(side, padding=(10, 0, 10, 8))
+            box.pack(fill="x", side="top")
+            entry = ttk.Entry(box, textvariable=filter_var)
+            entry.pack(fill="x")
+            hint = ttk.Label(entry, text=f"{icon('search')}", style="PanelIcon.TLabel", background=theme.palette().bg3)
+            hint_text = ttk.Label(entry, text="Filter", style="Faint.TLabel", background=theme.palette().bg3)
+
+            def update_hint(*_args) -> None:
+                if filter_var.get() or entry.focus_get() is entry:
+                    hint.place_forget()
+                    hint_text.place_forget()
+                else:
+                    hint.place(x=8, rely=0.5, anchor="w")
+                    hint_text.place(x=28, rely=0.5, anchor="w")
+
+            for widget in (hint, hint_text):
+                widget.bind("<Button-1>", lambda _e: entry.focus_set())
+            entry.bind("<FocusIn>", update_hint, add=True)
+            entry.bind("<FocusOut>", update_hint, add=True)
+            entry.bind("<Escape>", lambda _e: filter_var.set(""))
+            filter_var.trace_add("write", update_hint)
+            update_hint()
+        if legend:
+            foot = ttk.Frame(side, padding=(14, 8))
+            foot.pack(fill="x", side="bottom")
+            ttk.Frame(side, style="Line.TFrame", height=1).pack(fill="x", side="bottom")
+            for badge, label in (("M", "edited"), ("A", "new"), ("R", "renamed")):
+                ttk.Label(foot, text=badge, style=f"Badge{badge}.TLabel").pack(side="left")
+                ttk.Label(foot, text=label, style="Faint.TLabel").pack(side="left", padx=(3, 8))
+            lock = ttk.Label(foot, text=icon("lock"), style="PanelIcon.TLabel")
+            lock.pack(side="left")
+            Tooltip(lock, "Locked: code is editable, the module can't be renamed or deleted")
+        body = ttk.Frame(side, padding=(6, 0, 0, 6))
+        body.pack(fill="both", expand=True, side="top")
+        tree = ttk.Treeview(body, show="tree", columns=("badge",), selectmode="browse")
+        tree.column("#0", width=200, stretch=True)
+        tree.column("badge", width=30, stretch=False, anchor="center")
+        tree_sb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
+        tree.pack(side="left", fill="both", expand=True)
+        return side, tree
+
+    def _crumb_bar(self, parent):
+        bar = ttk.Frame(parent, style="Editor.TFrame", padding=(14, 4, 8, 4))
+        bar.pack(fill="x", side="top")
+        ttk.Frame(parent, style="Line.TFrame", height=1).pack(fill="x", side="top")
+        return bar
 
     def _build_welcome(self) -> None:
         """What a first-time user sees until a file is open: one clear thing to do."""
-        self.welcome = ttk.Frame(self.root)
-        inner = ttk.Frame(self.welcome)
-        inner.place(relx=0.5, rely=0.42, anchor="center")
-        ttk.Label(inner, text="Open an Office add-in", style="Hero.TLabel").pack()
+        self.welcome = ttk.Frame(self.root, style="Editor.TFrame")
+        inner = ttk.Frame(self.welcome, style="Editor.TFrame")
+        inner.place(relx=0.5, rely=0.44, anchor="center")
+        ttk.Label(inner, text="V", style="LogoBig.TLabel").pack(anchor="w")
+        ttk.Label(inner, text="Open an add-in", style="EditorHero.TLabel").pack(anchor="w", pady=(18, 0))
         # Text set by _show_welcome: it depends on the backup setting.
-        self.welcome_note = ttk.Label(inner, style="Muted.TLabel", justify="center", wraplength=520)
-        self.welcome_note.pack(pady=(8, 20))
-        ttk.Button(
-            inner, text="Open file…", style="Accent.TButton", padding=(24, 7), command=self.open_file
+        self.welcome_note = ttk.Label(inner, style="EditorMuted.TLabel", justify="left", wraplength=540)
+        self.welcome_note.pack(anchor="w", pady=(4, 20))
+        colors = theme.palette()
+        self.welcome_card = tk.Frame(
+            inner, background=colors.bg2, highlightthickness=1, highlightbackground=colors.border_strong
+        )
+        self.welcome_card.pack(fill="x")
+        card = ttk.Frame(self.welcome_card, style="Editor.TFrame", padding=(26, 22))
+        card.pack(fill="x")
+        ttk.Label(
+            card, text="Open an .xlam, .ppam or .pptm file, or start a new one", style="EditorFaint.TLabel"
         ).pack()
-        ttk.Label(inner, text="or press Ctrl+O", style="Faint.TLabel").pack(pady=(6, 0))
-        self.welcome_recent = ttk.Frame(inner)
-        self.welcome_recent.pack(fill="x", pady=(26, 0))
+        buttons = ttk.Frame(card, style="Editor.TFrame")
+        buttons.pack(pady=(12, 0))
+        ttk.Button(
+            buttons, text="Open file   Ctrl+O", style="Accent.TButton", padding=(16, 6), command=self.open_file
+        ).pack(side="left")
+        ttk.Button(buttons, text="New add-in   Ctrl+N", style="EditorGhost.TButton", command=self.new_file).pack(
+            side="left", padx=(8, 0)
+        )
+        self.welcome_recent = ttk.Frame(inner, style="Editor.TFrame", width=540)
+        self.welcome_recent.pack(fill="x", pady=(24, 0))
         self.welcome.place(in_=self.editor_notebook, x=0, y=0, relwidth=1, relheight=1)
 
     def _show_welcome(self, show: bool) -> None:
         if not show:
             self.welcome.place_forget()
+            if not self.rail.winfo_manager():
+                self.rail.pack(side="left", fill="y", before=self.editor_notebook)
+                self.rail_line.pack(side="left", fill="y", before=self.editor_notebook)
             return
+        self.rail.pack_forget()
+        self.rail_line.pack_forget()
         backup_note = " The original is kept as a backup when you save." if self.settings.auto_backup else ""
         self.welcome_note.config(
-            text="Edit VBA modules and ribbon XML in .xlam, .ppam and .pptm files.\n"
-            "Office does not need to be installed or running." + backup_note
+            text="Edit VBA and ribbon XML inside .xlam, .ppam and .pptm files — in place, "
+            "without the VBA editor. Office does not need to be installed or running." + backup_note
         )
         for child in self.welcome_recent.winfo_children():
             child.destroy()
         recent = self._recent_files()
+        colors = theme.palette()
         if recent:
-            ttk.Label(self.welcome_recent, text="RECENT", style="Caption.TLabel").pack(anchor="w", pady=(0, 4))
+            ttk.Label(self.welcome_recent, text="RECENT", style="EditorCaption.TLabel").pack(
+                anchor="w", pady=(0, 6), padx=(10, 0)
+            )
         for path in recent[:5]:
-            row = ttk.Frame(self.welcome_recent)
-            row.pack(fill="x", pady=1)
-            link = ttk.Label(row, text=path.name, style="Link.TLabel", cursor="hand2")
-            link.pack(side="left")
-            link.bind("<Button-1>", lambda _e, p=path: self.open_recent(p))
-            ttk.Label(row, text=_shorten(str(path.parent)), style="Faint.TLabel").pack(side="left", padx=(10, 0))
+            row = tk.Frame(self.welcome_recent, background=colors.bg2)
+            row.pack(fill="x")
+            tag_bg, tag_fg = colors.file_tag(path.suffix)
+            tag = tk.Label(
+                row,
+                text=path.suffix.lstrip(".").upper() or "FILE",
+                font=theme.TAG_FONT,
+                width=6,
+                background=tag_bg,
+                foreground=tag_fg,
+                pady=2,
+            )
+            tag.pack(side="left", padx=(10, 12), pady=8)
+            name = tk.Label(row, text=path.name, font=theme.BOLD_FONT, background=colors.bg2, foreground=colors.text)
+            name.pack(side="left")
+            when = tk.Label(
+                row, text=_when(path), font=theme.SMALL_FONT, background=colors.bg2, foreground=colors.faint
+            )
+            when.pack(side="right", padx=(12, 10))
+            where = tk.Label(
+                row,
+                text=_shorten(str(path.parent), 44),
+                font=theme.SMALL_FONT,
+                background=colors.bg2,
+                foreground=colors.faint,
+                anchor="w",
+            )
+            where.pack(side="left", padx=(12, 0), fill="x", expand=True)
+            hover_row([row, name, where, when], colors.bg2, colors.bg3, lambda p=path: self.open_recent(p))
         self.welcome.place(in_=self.editor_notebook, x=0, y=0, relwidth=1, relheight=1)
         self.welcome.lift()
 
@@ -473,6 +762,7 @@ class MainWindow:
         for editor in (self.editor, self.xml_editor):
             editor._redraw_line_numbers()
         save_settings(self.settings, self._settings_path)
+        self._update_status_cells()
         self.status.config(text=f"Code font size {size}")
 
     def _on_theme_chosen(self) -> None:
@@ -493,11 +783,30 @@ class MainWindow:
             editor.apply_palette()
         for tree in (self.tree, self.xml_tree, self.forms_tree):
             self._configure_tree_tags(tree)
+        for button in self.rail_buttons + self._rail_extra:
+            button.apply_palette()
+        self.host_pill.configure(
+            background=colors.bg0, highlightbackground=colors.border_strong, highlightcolor=colors.border_strong
+        )
+        self.host_text.configure(background=colors.bg0)
+        self.host_dot.configure(background=colors.bg0)
+        self.welcome_card.configure(background=colors.bg2, highlightbackground=colors.border_strong)
+        self.ribbon_panel.apply_palette()
+        palette_window = self.command_palette.window
+        if palette_window is not None:
+            palette_window.destroy()  # rebuilt with the new colours when next opened
+            self.command_palette.window = None
+        self.toast.frame.destroy()
+        self.toast = Toast(self.root)
+        self.wait_spinner.configure(background=colors.banner_bg)
         theme.set_title_bar(self.root)
+        self._refresh_state()
+        if self.draft is None:
+            self._show_welcome(True)
 
     def _configure_tree_tags(self, tree: ttk.Treeview) -> None:
         colors = theme.palette()
-        tree.tag_configure("group", foreground=colors.muted, font=theme.BOLD_FONT)
+        tree.tag_configure("group", foreground=colors.faint, font=theme.SMALL_FONT)
         tree.tag_configure("dirty", foreground=colors.warn)
         tree.tag_configure("new", foreground=colors.ok)
         tree.tag_configure("renamed", foreground=colors.info)
@@ -551,51 +860,84 @@ class MainWindow:
     def _build_vba_tab(self, parent) -> None:
         panes = ttk.Panedwindow(parent, orient="horizontal")
         panes.pack(fill="both", expand=True)
-
-        left = ttk.Frame(panes, padding=(6, 8, 0, 6))
-        self.tree = ttk.Treeview(left, show="tree", selectmode="browse")
-        tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
-        self.tree.pack(side="left", fill="both", expand=True)
-        tree_sb.pack(side="right", fill="y")
+        self.tree_filter = tk.StringVar(master=self.root)
+        self.add_module_menu = tk.Menu(self.root, tearoff=0)
+        self._menus.append(self.add_module_menu)
+        self.add_module_menu.add_command(label="Standard Module…", command=lambda: self.add_module(standard=True))
+        self.add_module_menu.add_command(label="Class Module…", command=lambda: self.add_module(standard=False))
+        self.add_module_menu.add_separator()
+        self.add_module_menu.add_command(label="Import .bas/.cls…", command=self.import_file)
+        side, self.tree = self._build_sidebar(
+            panes,
+            "MODULES",
+            add=self._post_add_module_menu,
+            add_tip="Add module",
+            filter_var=self.tree_filter,
+            legend=True,
+        )
         self.tree.bind("<<TreeviewSelect>>", self.on_module_selected)
-        panes.add(left, weight=1)
+        self.tree_filter.trace_add("write", lambda *_a: self._refresh_tree())
+        panes.add(side, weight=0)
 
-        right = ttk.Frame(panes)
-        self.editor = CodeEditor(right)
+        main = ttk.Frame(panes, style="Editor.TFrame")
+        bar = self._crumb_bar(main)
+        self.crumb_group = ttk.Label(bar, text="", style="Crumb.TLabel")
+        self.crumb_group.pack(side="left")
+        ttk.Label(bar, text=icon("right"), style="CrumbSep.TLabel").pack(side="left", padx=6)
+        self.crumb_module = ttk.Label(bar, text="", style="CrumbStrong.TLabel")
+        self.crumb_module.pack(side="left")
+        self.crumb_proc_sep = ttk.Label(bar, text=icon("right"), style="CrumbSep.TLabel")
+        self.crumb_proc_sep.pack(side="left", padx=(6, 0))
+        self.proc_button = ttk.Menubutton(bar, text="", style="Crumb.TMenubutton", takefocus=False)
+        self.proc_button.pack(side="left")
+        self.proc_menu = tk.Menu(self.proc_button, tearoff=0, postcommand=self._fill_procedure_menu)
+        self.proc_button.configure(menu=self.proc_menu)
+        self._menus.append(self.proc_menu)
+        self.crumb_note = ttk.Label(bar, text="", style="CrumbMuted.TLabel")
+        self.crumb_note.pack(side="right", padx=(8, 4))
+        self.editor = CodeEditor(main)
         self.editor.pack(fill="both", expand=True)
-        panes.add(right, weight=4)
+        panes.add(main, weight=1)
+
+    def _post_add_module_menu(self) -> None:
+        if self.draft is None:
+            return
+        x, y = self.root.winfo_pointerxy()
+        self.add_module_menu.tk_popup(x, y)
 
     def _build_xml_tab(self, parent) -> None:
         panes = ttk.Panedwindow(parent, orient="horizontal")
         panes.pack(fill="both", expand=True)
-
-        left = ttk.Frame(panes, padding=(6, 8, 0, 6))
-        bar = ttk.Frame(left)
-        bar.pack(fill="x", pady=(0, 6))
-        self.validate_xml_btn = ttk.Button(
-            bar, text="Validate XML", command=self._validate_selected_xml, state="disabled"
-        )
-        self.validate_xml_btn.pack(side="left")
-        ttk.Button(
-            bar, text="▼", width=3, command=lambda: self.move_ribbon_control(1)
-        ).pack(side="right")
-        ttk.Button(
-            bar, text="▲", width=3, command=lambda: self.move_ribbon_control(-1)
-        ).pack(side="right", padx=(6, 2))
-        self.xml_tree = ttk.Treeview(left, show="tree", selectmode="browse")
-        tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.xml_tree.yview)
-        self.xml_tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
-        self.xml_tree.pack(side="left", fill="both", expand=True)
-        tree_sb.pack(side="right", fill="y")
+        self.xml_filter = tk.StringVar(master=self.root)
+        side, self.xml_tree = self._build_sidebar(panes, "PACKAGE PARTS", filter_var=self.xml_filter)
         self.xml_tree.bind("<<TreeviewSelect>>", self.on_xml_part_selected)
-        panes.add(left, weight=1)
+        self.xml_filter.trace_add("write", lambda *_a: self._refresh_xml_tree())
+        panes.add(side, weight=0)
 
-        right = ttk.Frame(panes)
-        self.xml_editor = XmlEditor(right)
-        self.xml_editor.pack(fill="both", expand=True)
+        main = ttk.Frame(panes, style="Editor.TFrame")
+        bar = self._crumb_bar(main)
+        self.xml_crumb_folder = ttk.Label(bar, text="", style="Crumb.TLabel")
+        self.xml_crumb_folder.pack(side="left")
+        self.xml_crumb_sep = ttk.Label(bar, text=icon("right"), style="CrumbSep.TLabel")
+        self.xml_crumb_sep.pack(side="left", padx=6)
+        self.xml_crumb_file = ttk.Label(bar, text="", style="CrumbStrong.TLabel")
+        self.xml_crumb_file.pack(side="left")
+        self.validate_xml_btn = ttk.Button(
+            bar, text="Validate XML", style="EditorText.TButton", command=self._validate_selected_xml,
+            state="disabled", takefocus=False,
+        )
+        self.validate_xml_btn.pack(side="right")
+        self.xml_crumb_note = ttk.Label(bar, text="", style="CrumbMuted.TLabel")
+        self.xml_crumb_note.pack(side="right", padx=(8, 8))
+        content = ttk.Frame(main, style="Editor.TFrame")
+        content.pack(fill="both", expand=True)
+        self.xml_editor = XmlEditor(content)
+        self.xml_editor.pack(side="left", fill="both", expand=True)
         self.xml_editor.set_validate_action(self._validate_selected_xml)
-        panes.add(right, weight=4)
+        self.ribbon_panel_line = ttk.Frame(content, style="Line.TFrame", width=1)
+        self.ribbon_panel = RibbonPanel(content, self)
+        self.ribbon_panel.pack_propagate(False)
+        panes.add(main, weight=1)
 
         self.current_xml_part_path: str | None = None
 
@@ -603,48 +945,42 @@ class MainWindow:
         """Read-only UserForm layouts, as stored in the file when it was opened."""
         panes = ttk.Panedwindow(parent, orient="horizontal")
         panes.pack(fill="both", expand=True)
-
-        left = ttk.Frame(panes, padding=(6, 8, 0, 6))
-        bar = ttk.Frame(left)
-        bar.pack(fill="x", pady=(0, 6))
-        self.form_code_btn = ttk.Button(
-            bar, text="Go to Code", command=self.goto_form_code, state="disabled"
-        )
-        self.form_code_btn.pack(side="left")
-        self.forms_tree = ttk.Treeview(left, show="tree", selectmode="browse")
-        tree_sb = ttk.Scrollbar(left, orient="vertical", command=self.forms_tree.yview)
-        self.forms_tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
-        self.forms_tree.pack(side="left", fill="both", expand=True)
-        tree_sb.pack(side="right", fill="y")
+        side, self.forms_tree = self._build_sidebar(panes, "USERFORMS")
+        self.forms_tree.column("badge", width=0, minwidth=0)
         self.forms_tree.bind("<<TreeviewSelect>>", self.on_form_item_selected)
-        panes.add(left, weight=1)
+        panes.add(side, weight=0)
 
-        right = ttk.Frame(panes, padding=(12, 8))
-        self.form_heading = ttk.Label(
-            right, text="", anchor="w", wraplength=560, justify="left", style="Heading.TLabel"
+        main = ttk.Frame(panes, style="Editor.TFrame")
+        bar = self._crumb_bar(main)
+        ttk.Label(bar, text=icon("lock"), style="CrumbSep.TLabel").pack(side="left", padx=(0, 6))
+        self.form_heading = ttk.Label(bar, text="", style="CrumbStrong.TLabel", anchor="w")
+        self.form_heading.pack(side="left", fill="x", expand=True)
+        self.form_code_btn = ttk.Button(
+            bar, text="Go to code", style="EditorText.TButton", command=self.goto_form_code,
+            state="disabled", takefocus=False,
         )
-        self.form_heading.pack(fill="x")
-        props = ttk.Frame(right)
-        props.pack(fill="both", expand=True, pady=(8, 0))
-        self.form_props = ttk.Treeview(props, columns=("value",), show="tree headings", selectmode="browse")
-        self.form_props.heading("#0", text="Property")
-        self.form_props.heading("value", text="Value")
-        self.form_props.column("#0", width=200, stretch=False)
+        self.form_code_btn.pack(side="right")
+        ttk.Label(
+            main,
+            text=(
+                "Layout is read-only. Only properties that differ from the control's "
+                "default are stored in the file, so only those are listed."
+            ),
+            style="EditorInfo.TLabel",
+            padding=(14, 8),
+        ).pack(fill="x", side="bottom")
+        props = ttk.Frame(main, style="Editor.TFrame", padding=(6, 6, 0, 0))
+        props.pack(fill="both", expand=True)
+        self.form_props = ttk.Treeview(
+            props, columns=("value",), show="tree headings", selectmode="browse", style="Editor.Treeview"
+        )
+        self.form_props.heading("#0", text="Property", anchor="w")
+        self.form_props.heading("value", text="Value", anchor="w")
+        self.form_props.column("#0", width=220, stretch=False)
         props_sb = ttk.Scrollbar(props, orient="vertical", command=self.form_props.yview)
         self.form_props.configure(yscrollcommand=theme.autohide(props_sb, side="right", fill="y"))
         self.form_props.pack(side="left", fill="both", expand=True)
-        props_sb.pack(side="right", fill="y")
-        ttk.Label(
-            right,
-            text=(
-                "Read-only view. Only properties that differ from the control's "
-                "default are stored in the file, so only those are listed."
-            ),
-            style="Muted.TLabel",
-            wraplength=560,
-            justify="left",
-        ).pack(fill="x", pady=(8, 0))
-        panes.add(right, weight=3)
+        panes.add(main, weight=1)
 
         self._form_items: dict[str, tuple[str, FormDesignSnapshot | FormControlSnapshot]] = {}
 
@@ -658,9 +994,9 @@ class MainWindow:
             self.form_heading.config(text="")
             return
         if not draft.baseline.forms:
-            self.form_heading.config(text="This project has no UserForms.")
+            self.form_heading.config(text="This project has no UserForms")
             return
-        self.form_heading.config(text="Select a form or control to see its stored properties.")
+        self.form_heading.config(text="Select a form or control to see its stored properties")
         deleted = {
             (m.origin_name or m.current_name).casefold() for m in draft.deleted_original_modules()
         }
@@ -693,11 +1029,11 @@ class MainWindow:
         form_name, item = self._form_items[selection[0]]
         self.form_props.delete(*self.form_props.get_children())
         if isinstance(item, FormDesignSnapshot):
-            heading = f"UserForm {item.name} — {item.control_count()} control(s)"
+            heading = f"{item.name}  ·  {item.control_count()} control(s)"
             if item.problem:
-                heading += f"\nThe layout could not be read: {item.problem}"
+                heading += f"  ·  the layout could not be read: {item.problem}"
         else:
-            heading = f"{item.name} ({item.kind}) on {form_name}"
+            heading = f"{form_name}  ›  {item.name}  ({item.kind.rsplit('.', 1)[-1]})"
         self.form_heading.config(text=heading)
         for name, value in item.properties:
             self.form_props.insert("", "end", text=name, values=(value,))
@@ -719,36 +1055,190 @@ class MainWindow:
             self._open_module_at(mod.id, 1)
 
     def _build_statusbar(self) -> None:
-        self.statusbar = ttk.Frame(self.root, style="Chrome.TFrame")
-        # Packed ahead of the tabs, so a small window shrinks the editor, not the status bar.
-        self.statusbar.pack(fill="x", side="bottom", before=self.editor_notebook)
-        # Right: whether antivirus has finished with the last saved file.
-        self.scan_status = ttk.Label(self.statusbar, text="", padding=(10, 4), anchor="e", style="Status.TLabel")
+        self.statusbar = ttk.Frame(self.root, style="Chrome.TFrame", padding=(6, 0))
+        # Packed ahead of the rail and the pages, so a small window shrinks the editor, not
+        # the status bar, and the bar runs the whole width under the rail.
+        self.statusbar.pack(fill="x", side="bottom", before=self.rail)
+        ttk.Frame(self.root, style="Line.TFrame", height=1).pack(fill="x", side="bottom", before=self.rail)
+
+        def cell(text: str = "", command=None, tip: str = "") -> ttk.Label:
+            label = ttk.Label(self.statusbar, text=text, padding=(8, 4), style="Status.TLabel")
+            label.pack(side="right")
+            if command is not None:
+                label.configure(cursor="hand2")
+                label.bind("<Button-1>", lambda _e: command())
+            if tip:
+                Tooltip(label, tip)
+            return label
+
+        self.zoom_label = cell(command=lambda: self.zoom(0), tip="Code size · click to reset")
+        self.backup_label = cell(command=self._toggle_auto_backup, tip="Click to switch automatic backup on or off")
+        self.lang_label = cell()
+        self.cursor_label = cell()
+        # Whether antivirus has finished with the last saved file.
+        self.scan_status = ttk.Label(self.statusbar, text="", padding=(0, 4, 8, 4), anchor="e", style="Status.TLabel")
         self.scan_status.pack(side="right")
-        self.cursor_label = ttk.Label(self.statusbar, text="", padding=(10, 4), style="Status.TLabel")
-        self.cursor_label.pack(side="right")
-        self.status = ttk.Label(self.statusbar, text="Ready", padding=(10, 4), anchor="w", style="Status.TLabel")
+        self.scan_icon = ttk.Label(self.statusbar, text="", padding=(8, 4, 4, 4), style="StatusIcon.TLabel")
+        self.scan_icon.pack(side="right")
+        self.status = ttk.Label(self.statusbar, text="Ready", padding=(8, 4), anchor="w", style="Status.TLabel")
         self.status.pack(fill="x", side="left", expand=True)
         for editor in (self.editor, self.xml_editor):
             editor.bind("<<CursorMove>>", lambda _e: self._update_cursor_label(), add=True)
-        self.editor_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._update_cursor_label(), add=True)
+        self._update_status_cells()
+
+    def _toggle_auto_backup(self) -> None:
+        self.auto_backup_var.set(not self.auto_backup_var.get())
+        self._on_auto_backup_toggled()
+
+    def _update_status_cells(self) -> None:
+        open_file = self.draft is not None
+        self.backup_label.config(
+            text=("Backup on save" if self.settings.auto_backup else "No backup on save") if open_file else ""
+        )
+        percent = round(100 * self.settings.editor_font_size / theme.CODE_SIZE)
+        self.zoom_label.config(text=f"{percent}%" if open_file else "")
 
     def _update_cursor_label(self) -> None:
-        tab = str(self.editor_notebook.select())
-        if self.draft is None or tab == str(self.forms_tab):
+        try:
+            tab = str(self.editor_notebook.select())
+        except tk.TclError:
+            return
+        if self.draft is None:
             self.cursor_label.config(text="")
+            self.lang_label.config(text="")
+            return
+        if tab == str(self.forms_tab):
+            self.cursor_label.config(text="")
+            self.lang_label.config(text="UserForm")
             return
         editor = self._active_text_editor()
-        if editor is self.editor and self.current_module_id is None:
+        if (editor is self.editor and self.current_module_id is None) or (
+            editor is self.xml_editor and self.current_xml_part_path is None
+        ):
             self.cursor_label.config(text="")
-            return
-        if editor is self.xml_editor and self.current_xml_part_path is None:
-            self.cursor_label.config(text="")
+            self.lang_label.config(text="")
             return
         line, column = editor.cursor_position().split(".")
-        language = "VBA" if editor is self.editor else "XML"
-        kind = _FILE_KINDS.get(self.draft.baseline.path.suffix.lower(), "")
-        self.cursor_label.config(text=f"Ln {line}, Col {int(column) + 1}   ·   {language}   ·   {kind}")
+        self.cursor_label.config(text=f"Ln {line}, Col {int(column) + 1}")
+        self.lang_label.config(text="VBA" if editor is self.editor else "XML")
+        if self._follow_after is None:
+            self._follow_after = self.root.after(CURSOR_FOLLOW_MS, self._follow_cursor)
+
+    def _follow_cursor(self) -> None:
+        """Breadcrumb procedure and ribbon outline follow the cursor, a moment after it moves."""
+        self._follow_after = None
+        if self.draft is None:
+            return
+        if self._active_text_editor() is self.editor:
+            self._update_procedure_crumb()
+        elif self.ribbon_panel.winfo_manager():
+            text = self.xml_editor.get_text()
+            offset = len(self.xml_editor.text.get("1.0", "insert"))
+            self.ribbon_panel.follow_cursor(text, offset)
+
+    # -- breadcrumbs -----------------------------------------------------------
+
+    def _module_group(self, mod: ModuleDraft) -> str:
+        if mod.kind == ModuleDisplayKind.CLASS:
+            return GROUP_CLASSES
+        if mod.pyopenvba_kind == "standard":
+            return GROUP_MODULES
+        if mod.project_item_kind == "userform":
+            return GROUP_FORMS
+        return self._document_group()
+
+    def _document_group(self) -> str:
+        if self.draft is not None and self.draft.baseline.path.suffix.lower() == ".xlam":
+            return "Excel objects"
+        return "Document modules"
+
+    def _update_crumbs(self) -> None:
+        draft = self.draft
+        mod = draft.module_by_id(self.current_module_id) if draft and self.current_module_id else None
+        if mod is None or mod.is_deleted:
+            self.crumb_group.config(text=draft.baseline.path.name if draft else "")
+            self.crumb_module.config(text="No module open" if draft else "")
+            self.crumb_proc_sep.pack_forget()
+            self.proc_button.pack_forget()
+            self.crumb_note.config(text="", style="CrumbMuted.TLabel")
+        else:
+            self.crumb_group.config(text=self._module_group(mod))
+            self.crumb_module.config(text=mod.current_name)
+            if not self.proc_button.winfo_manager():
+                self.crumb_proc_sep.pack(side="left", padx=(6, 0), after=self.crumb_module)
+                self.proc_button.pack(side="left", after=self.crumb_proc_sep)
+            self._update_procedure_crumb()
+            note, style = "", "CrumbMuted.TLabel"
+            if draft is not None and draft.baseline.safety.password_protected:
+                note, style = "Password-protected project: VBA is read-only", "CrumbWarn.TLabel"
+            elif mod.is_new:
+                note, style = "New module · not saved yet", "CrumbOk.TLabel"
+            elif mod.origin_name and mod.current_name.casefold() != mod.origin_name.casefold():
+                note, style = f"Renamed from {mod.origin_name}", "CrumbInfo.TLabel"
+            elif not (mod.can_delete or mod.can_rename):
+                note = "🔒 Code is editable; this module can't be renamed or deleted"
+            self.crumb_note.config(text=note, style=style)
+        part = draft.xml_part_by_path(self.current_xml_part_path) if draft and self.current_xml_part_path else None
+        if part is None:
+            self.xml_crumb_folder.config(text=draft.baseline.path.name if draft else "")
+            self.xml_crumb_file.config(text="No part open" if draft else "")
+            self.xml_crumb_note.config(text="", style="CrumbMuted.TLabel")
+        else:
+            folder, _sep, name = part.path.rpartition("/")
+            self.xml_crumb_folder.config(text=folder or "package root")
+            self.xml_crumb_file.config(text=name)
+            if not part.editable:
+                self.xml_crumb_note.config(text="Read-only: malformed when opened", style="CrumbWarn.TLabel")
+            elif part.is_new:
+                self.xml_crumb_note.config(text="New part · not saved yet", style="CrumbOk.TLabel")
+            elif part.is_dirty():
+                self.xml_crumb_note.config(text="Edited", style="CrumbWarn.TLabel")
+            else:
+                self.xml_crumb_note.config(text="", style="CrumbMuted.TLabel")
+
+    def _current_procedure(self) -> str | None:
+        """Name of the procedure the VBA cursor is in, by a backward scan of the text."""
+        text = self.editor.text
+        start = "insert lineend"
+        for _attempt in range(2):
+            try:
+                found = text.search(_PROC_EDGE_TCL, start, "1.0", backwards=True, regexp=True, nocase=True)
+            except tk.TclError:
+                return None
+            if not found:
+                return None
+            line = text.get(f"{found} linestart", f"{found} lineend")
+            match = _PROC_DECL.match(line)
+            if match:
+                return match.group(1)
+            # An End line: inside that procedure only when the cursor sits on the End line itself.
+            if text.index(f"{found} linestart") != text.index("insert linestart"):
+                return None
+            start = f"{found} linestart"
+        return None
+
+    def _update_procedure_crumb(self) -> None:
+        if self.current_module_id is None:
+            return
+        name = self._current_procedure() or "(General)"
+        self.proc_button.config(text=f"{name}  ▾")
+
+    def _fill_procedure_menu(self) -> None:
+        menu = self.proc_menu
+        menu.delete(0, "end")
+        draft = self.draft
+        mod = draft.module_by_id(self.current_module_id) if draft and self.current_module_id else None
+        if mod is None:
+            return
+        self._flush_active_vba_editor()
+        procedures = parse_procedures(mod.body, mod.id)
+        for proc in procedures[:400]:
+            menu.add_command(
+                label=f"{proc.name}", accelerator=proc.kind,
+                command=lambda p=proc: self._open_module_at(mod.id, p.line),
+            )
+        if not procedures:
+            menu.add_command(label="No procedures", state="disabled")
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self.open_file())
@@ -763,8 +1253,83 @@ class MainWindow:
         self.root.bind("<Control-z>", lambda _e: self.undo())
         self.root.bind("<Control-y>", lambda _e: self.redo())
         self.root.bind("<F12>", lambda _e: self.goto_callback_under_cursor())
+        self.root.bind("<Control-k>", lambda _e: self.open_command_palette())
+        for editor in (self.editor, self.xml_editor):
+            # Tk's Text binds Ctrl+K to "delete to end of line"; here it opens the palette.
+            editor.text.bind("<Control-k>", lambda _e: self.open_command_palette() or "break")
         for sequence, step in (("<Control-equal>", 1), ("<Control-plus>", 1), ("<Control-minus>", -1), ("<Control-0>", 0)):
             self.root.bind(sequence, lambda _e, step=step: self.zoom(step))
+
+    # -- command palette ----------------------------------------------------------
+
+    def open_command_palette(self, prefix: str = "") -> str:
+        if not self._saving:
+            self._flush_all_editors()
+            self.command_palette.open(prefix)
+        return "break"
+
+    def _palette_items(self) -> list[PaletteItem]:
+        """Every enabled menu command, plus the open file's modules, parts and procedures."""
+        items: list[PaletteItem] = []
+        for button in self._header_buttons:
+            menu = self.root.nametowidget(button.cget("menu"))
+            group = str(button.cget("text"))
+            last = menu.index("end")
+            for index in range(0 if last is None else last + 1):
+                kind = menu.type(index)
+                if kind not in ("command", "checkbutton", "radiobutton"):
+                    continue
+                if str(menu.entrycget(index, "state")) == "disabled":
+                    continue
+                label = str(menu.entrycget(index, "label")).rstrip("…").rstrip(".")
+                if label == "Command Palette":
+                    continue
+                items.append(
+                    PaletteItem(
+                        COMMAND,
+                        label,
+                        group,
+                        str(menu.entrycget(index, "accelerator")),
+                        lambda m=menu, i=index: m.invoke(i),
+                    )
+                )
+        for path in self._recent_files():
+            items.append(PaletteItem(COMMAND, f"Open {path.name}", "Recent", "", lambda p=path: self.open_recent(p)))
+        draft = self.draft
+        if draft is None:
+            return items
+        for mod in draft.modules:
+            if not mod.is_deleted:
+                items.append(
+                    PaletteItem(
+                        MODULE, mod.current_name, self._module_group(mod), "",
+                        lambda mid=mod.id: self._open_module_at(mid, 1),
+                    )
+                )
+        for part in draft.xml_parts:
+            if part.text is not None:
+                items.append(
+                    PaletteItem(MODULE, part.path, "XML part", "", lambda p=part.path: self._open_xml_at(p, 1))
+                )
+        for locations in rs.procedure_index(draft).values():
+            for loc in locations:
+                items.append(
+                    PaletteItem(
+                        PROCEDURE, loc.name, f"{loc.module_name} · {loc.kind}", "",
+                        lambda loc=loc: self._goto_procedure(loc),
+                    )
+                )
+        return items
+
+    def _goto_procedure(self, loc) -> None:
+        module = self.draft.module_by_id(loc.module_id) if self.draft else None
+        if module is None:
+            return
+        lines = module.body.split("\n")
+        line_text = lines[loc.line - 1] if 0 < loc.line <= len(lines) else ""
+        found = re.search(rf"\b{re.escape(loc.name)}\b", line_text)
+        column = found.start() + 1 if found else 1
+        self._open_module_at(loc.module_id, loc.line, column, len(loc.name) if found else 0)
 
     # -- banners / status ----------------------------------------------------
 
@@ -865,11 +1430,13 @@ class MainWindow:
         name = self._prescan.path.name if self._prescan.path is not None else ""
         if self._prescan.busy:
             self.scan_status.config(text=f"Antivirus scanning {name}…")
+            self.scan_icon.config(text=icon("shield"), style="StatusIcon.TLabel")
             self._prescan_after = self.root.after(200, self._poll_prescan)
             return
         self._release_prescan_gc()
         ready = self._prescan.state == READY
         self.scan_status.config(text=f"{name} ready for Office" if ready else "")
+        self.scan_icon.config(text=icon("shield") if ready else "", style="StatusOk.TLabel")
 
     def _release_prescan_gc(self) -> None:
         if self._prescan_holds_gc:
@@ -908,7 +1475,7 @@ class MainWindow:
         self._set_menubar_state("normal")
 
     def _set_menubar_state(self, state: str) -> None:
-        for button in self._header_buttons:
+        for button in self._header_buttons + [self.command_btn]:
             try:
                 button.configure(state=state)
             except tk.TclError:
@@ -917,31 +1484,35 @@ class MainWindow:
     def _refresh_state(self) -> None:
         draft = self.draft
         self._show_wait_bar()
+        self._update_status_cells()
         if draft is None:
             self.file_label.config(text="")
-            self.dirty_label.config(text="")
             self.save_btn.config(state="disabled")
             self.review_btn.config(state="disabled")
-            self.revert_btn.config(state="disabled")
             self.status.config(text="Open an add-in to begin.")
             self._show_header_actions(False)
             self._show_welcome(True)
             self._update_cursor_label()
+            self._update_crumbs()
             return
         self._show_welcome(False)
         self._show_header_actions(True)
         name = draft.baseline.path.name
         n = dirty_count(draft)
         self.file_label.config(text=name)
-        self.dirty_label.config(text=f"●  {n} unsaved" if n else "")
+        self.path_label.config(text=_shorten(str(draft.baseline.path.parent), 40))
+        self.file_tip.text = str(draft.baseline.path)
+        self.review_btn.config(text=f"●  {n} change{'s' if n != 1 else ''}" if n else "No changes")
+        self.save_btn.config(text="Waiting…" if self._queued_save is not None else "Save   Ctrl+S")
+        self._update_host_pill()
         self._update_cursor_label()
+        self._update_crumbs()
         inplace_ok = (
             not self._saving
             and (self.session is None or (self.session.original_exists and not self.session.conflicts_pending))
         )
         self.save_btn.config(state="normal" if inplace_ok else "disabled")
-        self.review_btn.config(state="normal" if n else "disabled")
-        self.revert_btn.config(state="normal" if n else "disabled")
+        self.review_btn.config(state="normal" if n and inplace_ok else "disabled")
         if self.session is not None and not self.session.original_exists:
             self._set_banner(
                 "The original add-in is missing. In-place Save is disabled. "
@@ -975,11 +1546,24 @@ class MainWindow:
         if self._queued_save is None or self.draft is None:
             self.wait_bar.pack_forget()
             return
+        label = wp.corresponding_host_label(self.draft.baseline.path)
+        self.wait_title.config(text=f"{label} is open.")
         self.wait_label.config(
-            text=f"Waiting for {wp.corresponding_host_label(self.draft.baseline.path)} "
-            f"to close. {self.draft.baseline.path.name} will be saved automatically."
+            text=f"Close it and {self.draft.baseline.path.name} will be saved automatically."
         )
-        self.wait_bar.pack(fill="x", after=self.statusbar, side="bottom")
+        self.wait_bar.pack(fill="x", side="top", after=self.header_line)
+
+    def _update_host_pill(self) -> None:
+        colors = theme.palette()
+        label = self._host_label or "Office"
+        if self._live_host_probe_failed:
+            text, dot = f"Can't check {label}", colors.faint
+        elif self._live_host_running:
+            text, dot = f"{label} running", colors.warn
+        else:
+            text, dot = f"{label} closed", colors.ok
+        self.host_text.config(text=text)
+        self.host_dot.config(foreground=dot)
 
     def _refresh_tree(self) -> None:
         draft = self.draft
@@ -987,41 +1571,38 @@ class MainWindow:
         if draft is None:
             return
         self._refresh_forms()
-        groups = {
-            "Standard Modules": [],
-            "Class Modules": [],
-            "UserForms": [],
-            "Document Modules": [],
-        }
+        query = self.tree_filter.get().strip().casefold()
+        groups: dict[str, list] = {self._document_group(): [], GROUP_MODULES: [], GROUP_CLASSES: [], GROUP_FORMS: []}
         for m in draft.modules:
             if m.is_deleted:
                 continue
-            marker, tags = "", ()
+            if query and query not in m.current_name.casefold():
+                continue
+            badge, tags = "", ()
+            label = m.current_name
             if m.is_new:
-                marker, tags = "  +", ("new",)
+                badge, tags = "A", ("new",)
             elif m.origin_name and m.current_name.casefold() != m.origin_name.casefold():
-                marker, tags = "  →", ("renamed",)
+                badge, tags = "R", ("renamed",)
+                label += f"   (was {m.origin_name})"
             elif m.original_body is not None and m.body != m.original_body:
-                marker, tags = "  ●", ("dirty",)
-            if m.kind == ModuleDisplayKind.CLASS:
-                group = "Class Modules"
-            elif m.pyopenvba_kind == "standard":
-                group = "Standard Modules"
-            elif m.project_item_kind == "userform":
-                group = "UserForms"
-            else:
-                group = "Document Modules"
+                badge, tags = "M", ("dirty",)
             locked = not (m.can_delete or m.can_rename or m.is_new)
             if locked:
                 tags = tags or ("locked",)
-            label = ("🔒 " if locked else "") + m.current_name + marker
-            groups[group].append((m.id, label, tags))
+                badge = badge or "🔒"
+            groups.setdefault(self._module_group(m), []).append((m.id, label, badge, tags))
         for group, items in groups.items():
-            if group == "UserForms" and not items:
+            if not items:
                 continue
             parent = self.tree.insert("", "end", text=group, open=True, tags=("group",))
-            for mid, label, tags in items:
-                self.tree.insert(parent, "end", iid=mid, text=label, tags=tags)
+            for mid, label, badge, tags in items:
+                self.tree.insert(parent, "end", iid=mid, text=label, values=(badge,), tags=tags)
+        current = self.current_module_id
+        if current and self.tree.exists(current):
+            # on_module_selected ignores re-selection of the module already shown.
+            self.tree.selection_set(current)
+            self.tree.see(current)
 
     # -- editor plumbing ------------------------------------------------------
 
@@ -1076,11 +1657,11 @@ class MainWindow:
         mid = selection[0]
         if mid == self.current_module_id:
             return  # already shown (programmatic re-selection)
-        self._flush_all_editors()
-        self.current_module_id = mid
         mod = draft.module_by_id(mid)
         if mod is None:
-            return
+            return  # a group heading
+        self._flush_all_editors()
+        self.current_module_id = mid
         self.editor.set_text(mod.body)
         self.editor.text.config(state="normal")  # body editing allowed; deletion is gated
         self._refresh_state()
@@ -1096,6 +1677,8 @@ class MainWindow:
         selection = self.xml_tree.selection()
         if not selection:
             return
+        if not selection[0].startswith("xml::"):
+            return  # a group heading
         path = selection[0][len("xml::"):]
         if path == self.current_xml_part_path:
             return  # already shown (programmatic re-selection)
@@ -1112,6 +1695,7 @@ class MainWindow:
             self.xml_editor.text.config(state="disabled")
         self.xml_editor.set_part_info(part)
         self.validate_xml_btn.config(state="normal")
+        self._refresh_ribbon_panel()
         self._refresh_state()
 
     def _refresh_xml_tree(self) -> None:
@@ -1119,14 +1703,27 @@ class MainWindow:
         self.xml_tree.delete(*self.xml_tree.get_children())
         if draft is None:
             return
+        query = self.xml_filter.get().strip().casefold()
+        groups: dict[str, list] = {"Ribbon": [], "Package": []}
         for part in sorted(draft.xml_parts, key=lambda p: p.path.lower()):
+            if query and query not in part.path.casefold():
+                continue
             dirty = part.is_dirty()
-            iid = "xml::" + part.path
             warning = "⚠ " if not part.editable else ""
-            tags = ("readonly",) if not part.editable else ("dirty",) if dirty else ()
-            self.xml_tree.insert(
-                "", "end", iid=iid, text=warning + part.path + ("  ●" if dirty else ""), tags=tags
-            )
+            tags = ("readonly",) if not part.editable else ("new",) if part.is_new else ("dirty",) if dirty else ()
+            badge = "A" if part.is_new else "M" if dirty else ""
+            group = "Ribbon" if part.path.casefold().startswith("customui") else "Package"
+            groups[group].append(("xml::" + part.path, warning + part.path, badge, tags))
+        for group, items in groups.items():
+            if not items:
+                continue
+            parent = self.xml_tree.insert("", "end", iid=f"group::{group}", text=group, open=True, tags=("group",))
+            for iid, label, badge, tags in items:
+                self.xml_tree.insert(parent, "end", iid=iid, text=label, values=(badge,), tags=tags)
+        current = "xml::" + (self.current_xml_part_path or "")
+        if self.current_xml_part_path and self.xml_tree.exists(current):
+            self.xml_tree.selection_set(current)
+            self.xml_tree.see(current)
 
     def _active_text_editor(self):
         if str(self.editor_notebook.select()) == str(self.xml_tab):
@@ -1701,15 +2298,28 @@ class MainWindow:
                 if part is not None:
                     self.xml_editor.set_text(part.text)
                     self.xml_editor.set_part_info(part)
+            self._refresh_ribbon_panel()
             self._refresh_state()
-            msg = "Saved successfully."
-            if note:
-                msg += f"\n\n{note}"
-            if result.backup_path:
-                msg += f"\n\nBackup: {result.backup_path}"
-            if warning:
-                msg += f"\n\n{warning}"
-            messagebox.showinfo(APP_NAME, msg)
+            name = self.draft.baseline.path.name if self.draft else ""
+            if note or warning:
+                msg = "Saved successfully."
+                if note:
+                    msg += f"\n\n{note}"
+                if result.backup_path:
+                    msg += f"\n\nBackup: {result.backup_path}"
+                if warning:
+                    msg += f"\n\n{warning}"
+                messagebox.showinfo(APP_NAME, msg)
+            else:
+                kept = (
+                    f"Backup kept next to the file: {Path(str(result.backup_path)).name}."
+                    if result.backup_path
+                    else "No backup was made: automatic backup is off."
+                )
+                self.toast.show(f"Saved {name}", kept + " The antivirus check runs in the status bar.")
+                self.status.config(
+                    text=f"Saved {name} · " + ("backup kept" if result.backup_path else "no backup")
+                )
         elif kind == "no_changes":
             messagebox.showinfo(APP_NAME, result.message or "No changes to save.")
         elif kind == "blocked":
@@ -1746,24 +2356,42 @@ class MainWindow:
         model = self.review_service.build(
             self.session, operation_type=operation_type, destination=destination
         )
-        lines = [
-            f"Review changes to {model.destination}",
-            f"Type: {model.file_type}    VBA: {model.vba_count}    XML: {model.xml_count}",
-            self._backup_policy_text() if operation_type == "save" else model.backup_policy,
-            "",
-        ]
-        for item in model.items:
-            ops = "+".join(item.operations)
-            label = item.new_name or item.old_name or item.target_id
-            lines.append(f"{item.category} [{ops}] {label}")
-            if item.unified_diff:
-                snippet = "\n".join(item.unified_diff.splitlines()[:40])
-                lines.append(snippet)
-                lines.append("")
+        in_place = operation_type == "save"
+        warnings = list(model.encoding_warnings)
         if model.signature_will_be_removed:
-            lines.append("This save will remove the VBA digital signature.")
-            lines.append("Confirm signature removal by choosing Save.")
-        if not messagebox.askokcancel(APP_NAME, "\n".join(lines)[:4000]):
+            warnings.insert(
+                0,
+                "This save removes the VBA digital signature. Office or your organization's "
+                "security policy may then block the add-in.",
+            )
+        extra = [f"VBA changes: {model.vba_count}   ·   XML changes: {model.xml_count}"]
+        if not in_place:
+            extra.append(model.backup_policy)
+        view = ReviewView(
+            file_name=self.draft.baseline.path.name,
+            destination=str(model.destination),
+            file_type=str(model.file_type),
+            entries=tuple(entry_from_item(item) for item in model.items),
+            backup_text=self._backup_policy_text() if in_place else model.backup_policy,
+            confirm_label=(
+                ("Save and Remove Signature" if model.signature_will_be_removed else "Save")
+                if in_place
+                else "Save Copy"
+            ),
+            warnings=tuple(warnings),
+            in_place=in_place,
+            extra=tuple(extra),
+        )
+        choice = ask_review(
+            self.root,
+            view,
+            backup_var=self.auto_backup_var if in_place else None,
+            on_backup_toggled=self._on_auto_backup_toggled,
+        )
+        if choice == REVERT:
+            self.confirm_revert_all()
+            return False
+        if choice != SAVE:
             return False
         if not self.session.matches_proposal(model.binding):
             messagebox.showwarning(APP_NAME, "This review is out of date because the draft changed.")
@@ -1893,6 +2521,23 @@ class MainWindow:
         else:
             self._handle_save_result(result)
 
+    def confirm_revert_all(self) -> None:
+        if self.draft is None:
+            return
+        self._flush_all_editors()
+        n = dirty_count(self.draft)
+        if not n:
+            self.status.config(text="Nothing to revert.")
+            return
+        if messagebox.askyesno(
+            APP_NAME,
+            f"Discard all {n} unsaved change{'s' if n != 1 else ''} to {self.draft.baseline.path.name}?\n\n"
+            "The file on disk is not touched.",
+            icon="warning",
+        ):
+            self.revert_all()
+            self.status.config(text="All changes reverted.")
+
     def revert_all(self) -> None:
         if self.draft is None:
             return
@@ -1900,6 +2545,8 @@ class MainWindow:
 
         self._flush_all_editors()
         self.draft = revert_all(self.draft)
+        if self.session is not None:
+            self.session.draft = self.draft
         self.current_module_id = None
         self.current_xml_part_path = None
         self._refresh_tree()
@@ -1908,6 +2555,7 @@ class MainWindow:
         self.xml_editor.set_text("")
         self.xml_editor.set_part_info(None)
         self.validate_xml_btn.config(state="disabled")
+        self._refresh_ribbon_panel()
         first = next((m.id for m in self.draft.modules if not m.is_deleted), None)
         if first:
             self.tree.selection_set(first)
@@ -2155,6 +2803,7 @@ class MainWindow:
         self.settings.auto_backup = enabled
         self.save_service.auto_backup = enabled
         saved = save_settings(self.settings, self._settings_path)
+        self._update_status_cells()
         self.status.config(
             text=(
                 "Automatic backup on save is on."
@@ -2258,12 +2907,10 @@ class MainWindow:
     # -- misc ------------------------------------------------------------------------
 
     def review_changes(self) -> None:
+        """The header's "N changes": the review step of Save, where Save, Revert or Cancel follow."""
         if self.draft is None:
             return
-        changes = compute_changes(self.draft)
-        lines = [f"Review changes to {self.draft.baseline.path.name}", ""]
-        lines.extend(changes.summary_lines() or ["No changes."])
-        messagebox.showinfo(APP_NAME, "\n".join(lines))
+        self.save()
 
     def show_about(self) -> None:
         identity = build_identity()
@@ -2317,6 +2964,76 @@ class MainWindow:
 
     def _on_xml_edited(self) -> None:
         self._note_text_edit(kind="xml")
+        if self._ribbon_after is not None:
+            self.root.after_cancel(self._ribbon_after)
+        self._ribbon_after = self.root.after(RIBBON_PANEL_REFRESH_MS, self._refresh_ribbon_panel)
+
+    def _refresh_ribbon_panel(self) -> None:
+        """Show the ribbon structure beside ribbon XML (from the editor's current text)."""
+        if self._ribbon_after is not None:
+            try:
+                self.root.after_cancel(self._ribbon_after)
+            except tk.TclError:
+                pass
+            self._ribbon_after = None
+        path = self.current_xml_part_path
+        if self.draft is None or path is None or not rs.is_ribbon_part(path):
+            self.ribbon_panel.pack_forget()
+            self.ribbon_panel_line.pack_forget()
+            self.ribbon_panel.refresh(None, "")
+            return
+        if not self.ribbon_panel.winfo_manager():
+            self.ribbon_panel.pack(side="right", fill="y", before=self.xml_editor)
+            self.ribbon_panel_line.pack(side="right", fill="y", before=self.xml_editor)
+        self._flush_active_xml_editor()
+        self.ribbon_panel.refresh(path, self.xml_editor.get_text())
+
+    def add_ribbon_button_from_panel(self) -> None:
+        """Pick a macro, then add a ribbon button for it (the panel's Button action)."""
+        draft = self.draft
+        if draft is None:
+            return
+        self._flush_all_editors()
+        subs = sorted(
+            (
+                loc
+                for locs in rs.procedure_index(draft).values()
+                for loc in locs
+                if loc.is_standard and loc.kind == "Sub"
+            ),
+            key=lambda loc: (loc.module_name.casefold(), loc.line),
+        )
+        if not subs:
+            messagebox.showinfo(
+                APP_NAME, "Add a Sub to a standard module first, then add a ribbon button for it."
+            )
+            return
+        index = choose(
+            self.root,
+            "Add Ribbon Button",
+            "Which macro should the new button run?",
+            [f"{loc.module_name}.{loc.name}" for loc in subs],
+        )
+        if index is None:
+            return
+        target = subs[index]
+        self._open_module_at(target.module_id, target.line)
+        self.add_ribbon_button()
+
+    # -- change bars ---------------------------------------------------------------
+
+    def _module_baseline(self) -> tuple[bool, str | None]:
+        mod = self.draft.module_by_id(self.current_module_id) if self.draft and self.current_module_id else None
+        if mod is None:
+            return False, None
+        return True, mod.original_body
+
+    def _xml_baseline(self) -> tuple[bool, str | None]:
+        path = self.current_xml_part_path
+        part = self.draft.xml_part_by_path(path) if self.draft and path else None
+        if part is None or not part.editable:
+            return False, None
+        return True, None if part.is_new else part.original_text
 
     def _note_text_edit(self, *, kind: str) -> None:
         if self.session is None or self.draft is None:
@@ -2400,6 +3117,7 @@ class MainWindow:
             part = self.draft.xml_part_by_path(self.current_xml_part_path)
             if part is not None:
                 self.xml_editor.set_text(part.text or "")
+        self._refresh_ribbon_panel()
         self._refresh_state()
 
     def project_search(self) -> None:
@@ -2460,6 +3178,7 @@ class MainWindow:
                 self.xml_editor.text.config(state="disabled")
             self.xml_editor.set_part_info(part)
             self.validate_xml_btn.config(state="normal")
+            self._refresh_ribbon_panel()
         try:
             self.xml_tree.selection_set("xml::" + part_path)
             self.xml_tree.see("xml::" + part_path)

@@ -37,6 +37,12 @@ def dialogs(monkeypatch):
 
     for name in calls:
         monkeypatch.setattr(f"vba_addin_editor.ui.main_window.messagebox.{name}", record(name))
+
+    def review(_parent, view, **_kwargs):
+        calls["askokcancel"].append(view.file_name)  # the review step (once a message box)
+        return "save" if answers.get("askokcancel") else "cancel"
+
+    monkeypatch.setattr("vba_addin_editor.ui.main_window.ask_review", review)
     calls["answers"] = answers  # type: ignore[assignment]
     return calls
 
