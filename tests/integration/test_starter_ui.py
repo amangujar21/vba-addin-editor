@@ -46,7 +46,7 @@ def test_new_file_with_ribbon_then_button_saves(root, tmp_path: Path, monkeypatc
     root.update()
     assert read_back == []  # opened from the bytes it wrote
     assert win.draft is not None and win.draft.baseline.path == path.resolve()
-    assert win.draft.is_dirty() and win.current_xml_part_path == PART
+    assert win.draft.is_dirty() and win.ribbon_designer.part_path == PART
     assert "Save File" in win.status.cget("text")
 
     # Add a macro and a button for it into the new group.

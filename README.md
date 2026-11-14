@@ -31,9 +31,11 @@ lets Office load the updated code the next time it starts.
 2. Edit code; add/rename/delete standard modules and ordinary class modules.
    UserForms can be deleted (code and layout together) but not renamed; host
    document modules and other designer components stay locked for
-   rename/delete. The **UserForms** tab shows each UserForm's controls and stored
-   properties (read-only). On `.xlam`/`.ppam`/`.pptm`, switch to the **Ribbon &
-   XML** tab to edit existing package parts.
+   rename/delete. The bar on the left switches between four views (Ctrl+1–4):
+   **Code** (modules and the procedures of the open module), **Ribbon** (the
+   ribbon designer, below), **UserForms** (each UserForm's controls and stored
+   properties, read-only) and **Package XML** (the existing package parts of a
+   `.xlam`/`.ppam`/`.pptm`, edited as text).
 3. **Save** (Ctrl+S) reviews the current draft, verifies the original has not
    changed, builds a verified candidate, and atomically replaces the original,
    keeping the old file as a same-folder backup. **File → Back Up
@@ -61,7 +63,11 @@ lets Office load the updated code the next time it starts.
    **Open file…** and your recently opened files (also under **File → Open
    Recent**). In the module list, ● marks an edited module, + a new one, → a
    renamed one, and 🔒 one that cannot be renamed or deleted (its code can
-   still be edited; selecting it says why). VBA and XML are syntax-coloured.
+   still be edited; selecting it says why). Under it, **PROCEDURES** lists the
+   open module's Subs, Functions (`fn`) and properties (`get`/`let`/`set`),
+   follows the cursor, and marks the macros a ribbon control runs; **+** adds a
+   new Sub, right-click adds or shows its ribbon button. VBA and XML are
+   syntax-coloured.
 8. **File → New Add-in…** (Ctrl+N) makes a new, empty `.xlam`, `.ppam` or
    `.pptm` (pick the type in the file dialog) and opens it. It starts from the
    blank file Excel or PowerPoint itself writes (shipped inside pyOpenVBA):
@@ -83,7 +89,36 @@ refused with the reason.
 
 For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
 
-- **Go to Macro** — in the Ribbon & XML tab, Ctrl+click (or right-click, or F12) any
+- **Ribbon view** (Ctrl+2, or **Ribbon → Design Ribbon**) edits the ribbon as
+  a form instead of XML. On the left is the ribbon as a tree (tab › group ›
+  menu › button) with a filter and a health line ("2 callbacks need a macro";
+  click it to show only the problems). On the right: a drawing of the tab, a
+  form for the selected control (Label, Macro, Icon, Size, Screentip,
+  Supertip, Id and its other callbacks), and the code of the macro it runs
+  (F12 or double-click opens it in the Code view).
+  - **+** or **Ins** adds a button at the selection and puts the cursor in
+    Label; its id follows the label until you give it one. The + menu also
+    adds a menu, group or separator.
+  - Typing a macro name that exists links it; a plain `Sub X()` gets its
+    `XCallback(control As IRibbonControl)` wrapper. A name that does not
+    exist shows **Create Sub**.
+  - In the tree: **Alt+Up/Down** moves, **Del** deletes (asks first when a
+    group or menu still holds controls), **F2** renames, drag and drop moves
+    before, after or into another control (only where the ribbon schema
+    allows it). Select several controls to delete them or group them into a
+    menu.
+  - Every change is an ordinary text edit of the ribbon XML: one Undo step
+    each, untouched XML stays byte-identical, and **Edit XML** shows the
+    control in the Package XML view. A ribbon part shown there has a
+    **Design view** button that goes back to the same control.
+  - Results of ribbon commands (add button or menu, icons, import, F12 from
+    the code) appear in whichever ribbon view, designer or XML, you used last.
+  - The Ribbon menu commands below that work on "the control under the
+    cursor" (move, group into menu, icons, Go to Macro) use the designer's
+    selection while the Ribbon view is showing.
+  - Built-in (`imageMso`) icons cannot be drawn offline; the drawing shows a
+    placeholder for them and the real picture for custom icons.
+- **Go to Macro** — in the Package XML view, Ctrl+click (or right-click, or F12) any
   `onAction="…"` or other callback attribute to jump to that Sub. If it does
   not exist, you are offered a stub with the right callback signature,
   placed in the module that already holds most of your ribbon callbacks.

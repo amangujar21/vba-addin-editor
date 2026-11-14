@@ -40,6 +40,9 @@ _ICONS = {
 }
 
 
+_ICONS["xml"] = ("", "≣")  # a document page: the package's XML parts
+
+
 def icon(name: str) -> str:
     glyph, fallback = _ICONS[name]
     return glyph if theme.icons_available() else fallback
@@ -242,6 +245,80 @@ class Toast:
     @property
     def visible(self) -> bool:
         return bool(self.frame.winfo_manager())
+
+
+class Sidebar(ttk.Frame):
+    """A view's left column: caption, optional + button and filter box, a tree, an optional footer."""
+
+    def __init__(
+        self,
+        master,
+        title: str,
+        *,
+        add: Callable[[], object] | None = None,
+        add_tip: str = "",
+        filter_var: tk.StringVar | None = None,
+        footer: bool = False,
+        width: int = 264,
+    ) -> None:
+        super().__init__(master, width=width)
+        self.pack_propagate(False)
+        self.head = ttk.Frame(self, padding=(14, 8, 6, 4))
+        self.head.pack(fill="x", side="top")
+        ttk.Label(self.head, text=title, style="Caption.TLabel").pack(side="left", pady=3)
+        if add is not None:
+            plus = ttk.Button(self.head, text=icon("plus"), style="Icon.TButton", command=add, takefocus=False)
+            plus.pack(side="right")
+            Tooltip(plus, add_tip)
+        self.filter_entry: ttk.Entry | None = None
+        self.hint_labels: list[ttk.Label] = []
+        if filter_var is not None:
+            self._build_filter(filter_var)
+        # Before the tree in packing order, so a short window shrinks the tree, not the footer.
+        self.foot: ttk.Frame | None = None
+        if footer:
+            self.foot = ttk.Frame(self, padding=(14, 7))
+            self.foot.pack(fill="x", side="bottom")
+            ttk.Frame(self, style="Line.TFrame", height=1).pack(fill="x", side="bottom")
+        self.body = ttk.Frame(self, padding=(6, 0, 0, 6))
+        self.body.pack(fill="both", expand=True, side="top")
+        self.tree = ttk.Treeview(self.body, show="tree", columns=("badge",), selectmode="browse")
+        self.tree.column("#0", width=200, stretch=True)
+        self.tree.column("badge", width=30, stretch=False, anchor="center")
+        scrollbar = ttk.Scrollbar(self.body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=theme.autohide(scrollbar, side="right", fill="y"))
+        self.tree.pack(side="left", fill="both", expand=True)
+
+    def _build_filter(self, filter_var: tk.StringVar) -> None:
+        box = ttk.Frame(self, padding=(10, 0, 10, 8))
+        box.pack(fill="x", side="top")
+        entry = self.filter_entry = ttk.Entry(box, textvariable=filter_var)
+        entry.pack(fill="x")
+        hint = ttk.Label(entry, text=icon("search"), style="PanelIcon.TLabel", background=theme.palette().bg3)
+        hint_text = ttk.Label(entry, text="Filter", style="Faint.TLabel", background=theme.palette().bg3)
+        self.hint_labels = [hint, hint_text]
+
+        def update_hint(*_args) -> None:
+            if filter_var.get() or entry.focus_get() is entry:
+                hint.place_forget()
+                hint_text.place_forget()
+            else:
+                hint.place(x=8, rely=0.5, anchor="w")
+                hint_text.place(x=28, rely=0.5, anchor="w")
+
+        for widget in (hint, hint_text):
+            widget.bind("<Button-1>", lambda _e: entry.focus_set())
+        entry.bind("<FocusIn>", update_hint, add=True)
+        entry.bind("<FocusOut>", update_hint, add=True)
+        entry.bind("<Escape>", lambda _e: filter_var.set(""))
+        filter_var.trace_add("write", update_hint)
+        update_hint()
+
+    def apply_palette(self) -> None:
+        """Recolour what styles do not reach: the filter hint sits on the entry's field colour."""
+        background = theme.palette().bg3
+        for label in self.hint_labels:
+            label.configure(background=background)
 
 
 def hover_row(widgets: list[Any], normal: str, hover: str, command: Callable[[], object]) -> None:

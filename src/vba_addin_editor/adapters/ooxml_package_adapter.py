@@ -91,6 +91,16 @@ def package_member_names(source: PackageSource) -> list[str]:
         return zf.namelist()
 
 
+def read_member_from_bytes(package: bytes, name: str, limit: int = MAX_ADDED_MEMBER_BYTES) -> bytes | None:
+    """One member of a package held in memory (never a file), or None if absent or too large."""
+    try:
+        with open_package(package) as zf:
+            info = zf.getinfo(name)
+            return zf.read(info) if info.file_size <= limit else None
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return None
+
+
 def _check_duplicates(zf: zipfile.ZipFile, path: object = None) -> None:
     names = zf.namelist()
     if len(names) != len(set(names)):

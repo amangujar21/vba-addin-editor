@@ -80,8 +80,8 @@ def test_apply_is_one_undo_step_and_saves(window, tmp_path: Path, monkeypatch):
     window.root.update()
     assert window.draft.find_current("RibbonCode") is not None
     assert window.tree.exists(plan.new_module_ids[0])
-    assert 'onAction="RunReport_Ribbon"' in window.xml_editor.get_text()
-    assert window.current_xml_part_path == PART
+    assert 'onAction="RunReport_Ribbon"' in window.draft.xml_part_by_path(PART).text
+    assert window.ribbon_designer.part_path == PART
 
     window.undo()
     assert window.draft.find_current("RibbonCode") is None

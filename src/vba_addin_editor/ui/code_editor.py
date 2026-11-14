@@ -136,6 +136,8 @@ class CodeEditor(ttk.Frame):
         self.text.tag_remove("sel", "1.0", "end")
         if length:
             self.text.tag_add("sel", start, f"{start}+{length}c")
+        # Before layout, see() can scroll sideways to the column; start from the left edge.
+        self.text.xview_moveto(0)
         self.text.see("insert")
 
     # -- internals ---------------------------------------------------------

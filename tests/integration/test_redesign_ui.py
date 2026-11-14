@@ -66,8 +66,10 @@ def test_palette_filters_by_section_and_prefix():
 def test_rail_switches_views_and_welcome_hides_it(window):
     assert window.rail.winfo_manager() == "pack"
     window.rail_buttons[1].command()
-    assert str(window.editor_notebook.select()) == str(window.xml_tab)
+    assert str(window.editor_notebook.select()) == str(window.ribbon_tab)
     assert window.rail_buttons[1]._active and not window.rail_buttons[0]._active
+    window.rail_buttons[3].command()
+    assert str(window.editor_notebook.select()) == str(window.xml_tab)
     window.rail_buttons[0].command()
     assert window.editor_notebook.index("current") == 0
 
@@ -120,18 +122,23 @@ def test_review_revert_discards_after_confirming(window, monkeypatch):
     assert window.session.draft is window.draft
 
 
-def test_ribbon_panel_shows_outline_and_missing_callback(window):
-    window._open_xml_at(PART, 1)
+def test_ribbon_designer_shows_outline_and_missing_callback(window):
+    window._show_view(1)
     window.root.update()
-    panel = window.ribbon_panel
-    assert panel.winfo_manager() == "pack"
-    labels = [panel.tree.item(i, "text").split("  ", 1)[-1] for i in panel._rows]
+    d = window.ribbon_designer
+
+    def rows(parent=""):
+        for iid in d.tree.get_children(parent):
+            yield iid
+            yield from rows(iid)
+
+    labels = [d.tree.item(i, "text").split("  ", 1)[-1] for i in rows()]
     assert labels[:3] == ["Tools", "Main", "Say Hello"]
-    assert any(panel.tree.item(i, "values") == ("large",) for i in panel._rows)
-    texts = [w.cget("text") for row in panel.check.winfo_children() for w in row.winfo_children()]
-    assert "NoSuchMacro: no macro" in texts and "Create stub" in texts
-    window._open_xml_at("[Content_Types].xml", 1)
-    assert panel.winfo_manager() == ""
+    missing = next(e for e in d.elements if e.attr("id") == "btnMissing")
+    assert d.tree.item(f"e{missing.index}", "values") == ("⚠",)
+    assert d.select_start(missing.start)
+    assert d.inspector.macro.link.cget("text") == "Create Sub"
+    assert "need" in d.health.cget("text")
 
 
 def test_successful_save_shows_a_toast_not_a_dialog(window, monkeypatch):

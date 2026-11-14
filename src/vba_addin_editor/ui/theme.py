@@ -383,6 +383,15 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
     s.configure("EditorCaption.TLabel", background=c.bg2, foreground=c.faint, font=CAPTION_FONT)
     for badge, color in (("M", c.warn), ("A", c.ok), ("R", c.info)):
         s.configure(f"Badge{badge}.TLabel", foreground=color, font=TAG_FONT)
+    # The ribbon designer's form, on the editor surface.
+    s.configure("Field.TLabel", background=c.bg2, foreground=c.muted, font=SMALL_FONT)
+    s.configure("EditorLink.TLabel", background=c.bg2, foreground=c.accent, font=SMALL_FONT)
+    s.configure("EditorOkIcon.TLabel", background=c.bg2, foreground=c.ok, font=ICON_SMALL_FONT)
+    s.configure("EditorWarnIcon.TLabel", background=c.bg2, foreground=c.warn, font=ICON_SMALL_FONT)
+    # One-line notes at the foot of a sidebar.
+    s.configure("OkNote.TLabel", foreground=c.muted, font=SMALL_FONT)
+    s.configure("WarnLink.TLabel", foreground=c.warn, font=SMALL_FONT)
+    s.configure("Link.TLabel", font=SMALL_FONT)
 
     # Buttons: flat blocks; Accent is the one primary action, Ghost is outlined.
     s.configure("TButton", background=c.bg3, padding=(12, 4), focusthickness=0, **_flat(c.bg3))
@@ -473,6 +482,20 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
         lightcolor=[("active", c.bg4)],
         darkcolor=[("active", c.bg4)],
     )
+    # A two-way switch (Large | Normal): the chosen half is filled.
+    for style, bg, fg in (("Seg.TButton", c.bg2, c.muted), ("SegOn.TButton", c.accent_bg, c.accent)):
+        s.configure(
+            style, background=bg, foreground=fg, font=SMALL_FONT, padding=(12, 3), width=0, focusthickness=0,
+            lightcolor=bg, darkcolor=bg, bordercolor=c.accent if style == "SegOn.TButton" else c.border_strong,
+        )
+        hover = bg if style == "SegOn.TButton" else c.bg4
+        s.map(
+            style,
+            foreground=[("active", fg if style == "SegOn.TButton" else c.text)],
+            background=[("pressed", hover), ("active", hover)],
+            lightcolor=[("pressed", hover), ("active", hover)],
+            darkcolor=[("pressed", hover), ("active", hover)],
+        )
     s.configure(
         "CommandIcon.TButton", background=c.bg3, foreground=c.faint, font=ICON_SMALL_FONT, padding=(8, 5),
         focusthickness=0, lightcolor=c.bg3, darkcolor=c.bg3, bordercolor=c.border_strong,
@@ -503,7 +526,11 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
     menubutton_layout: Any = [("Menubutton.border", {"sticky": "nswe", "children": [
         ("Menubutton.padding", {"sticky": "nswe", "children": [
             ("Menubutton.label", {"sticky": ""})]})]})]
-    for style, bg, fg in (("Header.TMenubutton", c.bg0, c.muted), ("Crumb.TMenubutton", c.bg2, c.text)):
+    for style, bg, fg in (
+        ("Header.TMenubutton", c.bg0, c.muted),
+        ("Crumb.TMenubutton", c.bg2, c.text),
+        ("Side.TMenubutton", c.bg1, c.muted),
+    ):
         s.layout(style, menubutton_layout)
         s.configure(style, background=bg, foreground=fg, padding=(8, 3), width=0, **_flat(bg))
         s.map(
@@ -512,6 +539,7 @@ def _configure_styles(root: tk.Misc, c: Palette) -> None:
             **_flat_map(("pressed", c.bg4), ("active", c.bg4)),
         )
     s.configure("Crumb.TMenubutton", font=SMALL_FONT, padding=(6, 1))
+    s.configure("Side.TMenubutton", font=SMALL_FONT, padding=(6, 1))
 
     # The activity rail replaces tab strips: notebooks keep their pages, not their tabs.
     s.layout("Hidden.TNotebook.Tab", [])

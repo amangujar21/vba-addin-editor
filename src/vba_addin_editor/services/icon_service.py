@@ -17,6 +17,7 @@ from vba_addin_editor.adapters.ooxml_package_adapter import (
     MAX_ADDED_MEMBER_BYTES,
     is_removable_member,
     package_member_names,
+    read_member_from_bytes,
 )
 from vba_addin_editor.domain.document import BinaryPartDraft, DocumentDraft, XmlPartDraft
 from vba_addin_editor.services import ribbon_service as rs
@@ -367,3 +368,42 @@ def set_custom_icon(
         # The old picture: gone from the file too, unless another control shows it.
         _release_image(draft, part_path, current)
     return path
+
+
+def clear_custom_icon(
+    draft: DocumentDraft, part_path: str, control_start: int, image_mso: str = ""
+) -> None:
+    """Take the custom picture off a control, optionally giving it a built-in icon instead.
+
+    The picture leaves the file too, unless another control still shows it.
+    """
+    ribbon = draft.xml_part_by_path(part_path)
+    if ribbon is None or ribbon.text is None or not ribbon.editable:
+        raise IconError("The ribbon XML part is not editable.")
+    element = next(
+        (e for e in rs.element_tree(ribbon.text) if e.start == control_start and e.complete), None
+    )
+    if element is None:
+        raise IconError("That control is no longer in the ribbon XML.")
+    current = element.attr("image")
+    ribbon.text = rs.set_element_attrs(
+        ribbon.text, element, {"image": None, "imageMso": image_mso or None}
+    )
+    if current and not draft.baseline.package_safety.opc_signature_present:
+        _release_image(draft, part_path, current)
+
+
+def image_bytes(draft: DocumentDraft, part_path: str, rid: str) -> bytes | None:
+    """The picture behind a control's image="rid", when it is at hand in memory.
+
+    Pictures this draft added come from the draft; pictures already in the file
+    come from the package bytes kept since it was opened (the file is not read).
+    """
+    link = next((l for l in image_links(draft) if l.ribbon_path == part_path and l.rid == rid), None)
+    if link is None or link.member in draft.removed_parts:
+        return None
+    pending = draft.binary_part_by_path(link.member)
+    if pending is not None:
+        return pending.data
+    package = draft.baseline.package_bytes
+    return read_member_from_bytes(package, link.member) if package is not None else None

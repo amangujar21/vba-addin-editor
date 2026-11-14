@@ -71,6 +71,7 @@ from vba_addin_editor.ui.command_palette import (
 )
 from vba_addin_editor.ui.conflict_dialog import ConflictDialog
 from vba_addin_editor.ui.review_dialog import REVERT, SAVE, ReviewView, ask_review, entry_from_item
+from vba_addin_editor.ui.ribbon_designer import RibbonDesigner
 from vba_addin_editor.ui.ribbon_dialogs import (
     AddButtonDialog,
     AddMenuDialog,
@@ -81,9 +82,16 @@ from vba_addin_editor.ui.ribbon_dialogs import (
     ask_image_file,
     choose,
 )
-from vba_addin_editor.ui.ribbon_panel import RibbonPanel
 from vba_addin_editor.ui.search_dialog import ProjectSearchDialog
-from vba_addin_editor.ui.widgets import RailButton, Spinner, Toast, Tooltip, hover_row, icon
+from vba_addin_editor.ui.widgets import (
+    RailButton,
+    Sidebar,
+    Spinner,
+    Toast,
+    Tooltip,
+    hover_row,
+    icon,
+)
 from vba_addin_editor.ui.xml_editor import XmlEditor
 from vba_addin_editor.version import APP_NAME, PYOPENVBA_PIN, VERSION, build_identity
 
@@ -123,7 +131,9 @@ _PROC_DECL = re.compile(
 CURSOR_FOLLOW_MS = 150
 HEADER_PATH_MIN_WIDTH = 1440  # narrower: the folder path moves to the file name tooltip
 HEADER_COMMAND_MIN_WIDTH = 1100  # narrower: the command box becomes a search icon
-RIBBON_PANEL_REFRESH_MS = 400
+OUTLINE_REFRESH_MS = 400
+# Badge in the PROCEDURES list; short so the narrow column never truncates it.
+OUTLINE_MARKS = {"Sub": "", "Function": "fn", "Property Get": "get", "Property Let": "let", "Property Set": "set"}
 
 
 def _shorten(text: str, limit: int = 56) -> str:
@@ -188,7 +198,9 @@ class MainWindow:
         self._last_vba_text = ""
         self._last_xml_text = ""
         self._follow_after = None
-        self._ribbon_after = None
+        self._shown_view = ""
+        # Where a ribbon edit is shown afterwards: the view used last, "design" or "xml".
+        self._ribbon_surface = "design"
         self.doc_service = DocumentService()
         session_root = os.environ.get("VBAAE_SESSION_ROOT")
         if session_root:
@@ -233,7 +245,7 @@ class MainWindow:
         self.command_palette = CommandPalette(root, self._palette_items)
         self.toast = Toast(root)
         self._bind_shortcuts()
-        for tree in (self.tree, self.xml_tree, self.forms_tree):
+        for tree in (self.tree, self.outline, self.xml_tree, self.forms_tree):
             self._configure_tree_tags(tree)
         self._refresh_state()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -280,6 +292,7 @@ class MainWindow:
         ttk.Label(self.header, text="V", style="Logo.TLabel").pack(side="left", padx=(2, 10))
         self._header_buttons: list[ttk.Menubutton] = []
         self._menus: list[tk.Menu] = []
+        self._sidebars: list[Sidebar] = []
         self.root.bind("<F10>", lambda _e: self._post_header_menu(self._header_buttons[0]))
 
         file_menu = self._header_menu("File")
@@ -333,15 +346,15 @@ class MainWindow:
         module_menu.add_command(label="Export All…", command=self.export_all)
 
         ribbon_menu = self._header_menu("Ribbon")
-        ribbon_menu.add_command(label="Create Ribbon…", command=self.create_ribbon)
-        ribbon_menu.add_command(label="Ribbon Buttons…", command=self.show_ribbon_buttons)
-        ribbon_menu.add_command(
-            label="Go to Macro / Button", accelerator="F12", command=self.goto_callback_under_cursor
-        )
+        ribbon_menu.add_command(label="Design Ribbon", accelerator="Ctrl+2", command=self.show_ribbon_design)
+        ribbon_menu.add_separator()
+        ribbon_menu.add_command(label="Add Button", command=lambda: self.add_ribbon_control("button"))
         ribbon_menu.add_command(
             label="Add Ribbon Button for This Macro…", command=self.add_ribbon_button
         )
-        ribbon_menu.add_command(label="Add Ribbon Menu…", command=self.add_ribbon_menu)
+        ribbon_menu.add_command(label="Add Menu", command=self.add_ribbon_menu)
+        ribbon_menu.add_command(label="Add Group", command=lambda: self.add_ribbon_control("group"))
+        ribbon_menu.add_command(label="Add Separator", command=lambda: self.add_ribbon_control("separator"))
         ribbon_menu.add_command(
             label="Import Button from Another Add-in…", command=self.import_ribbon_control
         )
@@ -361,15 +374,26 @@ class MainWindow:
             label="Set Icon from Clipboard", command=self.set_ribbon_icon_from_clipboard
         )
         ribbon_menu.add_command(label="Set Icon from File…", command=self.set_ribbon_icon_from_file)
+        ribbon_menu.add_separator()
+        ribbon_menu.add_command(
+            label="Go to Macro / Button", accelerator="F12", command=self.goto_callback_under_cursor
+        )
+        ribbon_menu.add_command(label="Ribbon Buttons…", command=self.show_ribbon_buttons)
+        ribbon_menu.add_command(label="Check Ribbon Callbacks", command=self.check_ribbon_callbacks)
+        ribbon_menu.add_separator()
+        ribbon_menu.add_command(label="Create Ribbon…", command=self.create_ribbon)
         ribbon_menu.add_command(label="Repair Custom Icons", command=self.repair_ribbon_icons)
         ribbon_menu.add_command(label="Remove Unused Icons", command=self.remove_unused_ribbon_icons)
-        ribbon_menu.add_separator()
-        ribbon_menu.add_command(label="Check Ribbon Callbacks", command=self.check_ribbon_callbacks)
 
         view_menu = self._header_menu("View")
         view_menu.add_command(
             label="Command Palette…", accelerator="Ctrl+K", command=lambda: self.open_command_palette()
         )
+        view_menu.add_separator()
+        for index, label in enumerate(("Code", "Ribbon", "UserForms", "Package XML")):
+            view_menu.add_command(
+                label=label, accelerator=f"Ctrl+{index + 1}", command=lambda i=index: self._show_view(i)
+            )
         view_menu.add_separator()
         self.theme_var = tk.StringVar(master=self.root, value=theme.palette().name)
         view_menu.add_radiobutton(
@@ -467,17 +491,21 @@ class MainWindow:
         self.rail_line = ttk.Frame(self.root, style="Line.TFrame", width=1)
         self.rail_line.pack(side="left", fill="y")
         self.editor_notebook = ttk.Notebook(self.root, style="Hidden.TNotebook")
-        vba_tab = ttk.Frame(self.editor_notebook)
-        self._build_vba_tab(vba_tab)
-        self.xml_tab = ttk.Frame(self.editor_notebook)
-        self._build_xml_tab(self.xml_tab)
+        self.vba_tab = ttk.Frame(self.editor_notebook)
+        self._build_vba_tab(self.vba_tab)
+        self.ribbon_tab = ttk.Frame(self.editor_notebook)
+        self.ribbon_designer = RibbonDesigner(self.ribbon_tab, self)
+        self.ribbon_designer.pack(fill="both", expand=True)
         self.forms_tab = ttk.Frame(self.editor_notebook)
         self._build_forms_tab(self.forms_tab)
-        self.editor_notebook.add(vba_tab, text="VBA code")
-        self.editor_notebook.add(self.xml_tab, text="Ribbon & XML")
+        self.xml_tab = ttk.Frame(self.editor_notebook)
+        self._build_xml_tab(self.xml_tab)
+        self.editor_notebook.add(self.vba_tab, text="Code")
+        self.editor_notebook.add(self.ribbon_tab, text="Ribbon")
         self.editor_notebook.add(self.forms_tab, text="UserForms")
+        self.editor_notebook.add(self.xml_tab, text="Package XML")
         self.editor_notebook.pack(fill="both", expand=True)
-        self.editor_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._sync_rail(), add=True)
+        self.editor_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._on_view_changed(), add=True)
         self._build_rail()
         self._build_welcome()
         self.banner = ttk.Label(self.root, text="", style="Banner.TLabel", padding=(14, 7))
@@ -503,13 +531,15 @@ class MainWindow:
         self._install_ribbon_actions()
 
     def _build_rail(self) -> None:
+        # In notebook page order: the rail button at index i shows page i.
         views = (
-            ("code", "VBA code", 0),
-            ("ribbon", "Ribbon & XML", 1),
-            ("form", "UserForms", 2),
+            ("code", "Code  ·  modules and macros"),
+            ("ribbon", "Ribbon  ·  tabs, groups and buttons"),
+            ("form", "UserForms"),
+            ("xml", "Package XML  ·  ribbon source and other parts"),
         )
         self.rail_buttons: list[RailButton] = []
-        for name, tip, index in views:
+        for index, (name, tip) in enumerate(views):
             button = RailButton(self.rail, icon(name), tip, lambda i=index: self._show_view(i))
             button.pack(side="top", pady=1)
             self.rail_buttons.append(button)
@@ -545,6 +575,30 @@ class MainWindow:
         if self.draft is None:
             return
         self.editor_notebook.select(index)
+        self._on_view_changed()
+
+    def _current_view(self) -> str:
+        try:
+            return str(self.editor_notebook.select())
+        except tk.TclError:
+            return ""
+
+    def _designer_shown(self) -> bool:
+        return self._current_view() == str(self.ribbon_tab)
+
+    def _on_view_changed(self) -> None:
+        """A view was picked: bring it up to date with the draft."""
+        view = self._current_view()
+        if view == self._shown_view:
+            self._sync_rail()
+            return
+        self._shown_view = view
+        if view == str(self.ribbon_tab):
+            self._flush_all_editors()
+            self._ribbon_surface = "design"
+            self.ribbon_designer.refresh()
+        elif view == str(self.xml_tab) and rs.is_ribbon_part(self.current_xml_part_path or ""):
+            self._ribbon_surface = "xml"
         self._sync_rail()
 
     def _sync_rail(self) -> None:
@@ -565,60 +619,11 @@ class MainWindow:
         add=None,
         add_tip: str = "",
         filter_var: tk.StringVar | None = None,
-        legend: bool = False,
     ):
-        """Sidebar column: heading, optional filter box, a tree and an optional legend."""
-        side = ttk.Frame(parent, width=264)
-        side.pack_propagate(False)
-        head = ttk.Frame(side, padding=(14, 8, 6, 4))
-        head.pack(fill="x", side="top")
-        ttk.Label(head, text=title, style="Caption.TLabel").pack(side="left", pady=3)
-        if add is not None:
-            plus = ttk.Button(head, text=icon("plus"), style="Icon.TButton", command=add, takefocus=False)
-            plus.pack(side="right")
-            Tooltip(plus, add_tip)
-        if filter_var is not None:
-            box = ttk.Frame(side, padding=(10, 0, 10, 8))
-            box.pack(fill="x", side="top")
-            entry = ttk.Entry(box, textvariable=filter_var)
-            entry.pack(fill="x")
-            hint = ttk.Label(entry, text=f"{icon('search')}", style="PanelIcon.TLabel", background=theme.palette().bg3)
-            hint_text = ttk.Label(entry, text="Filter", style="Faint.TLabel", background=theme.palette().bg3)
-
-            def update_hint(*_args) -> None:
-                if filter_var.get() or entry.focus_get() is entry:
-                    hint.place_forget()
-                    hint_text.place_forget()
-                else:
-                    hint.place(x=8, rely=0.5, anchor="w")
-                    hint_text.place(x=28, rely=0.5, anchor="w")
-
-            for widget in (hint, hint_text):
-                widget.bind("<Button-1>", lambda _e: entry.focus_set())
-            entry.bind("<FocusIn>", update_hint, add=True)
-            entry.bind("<FocusOut>", update_hint, add=True)
-            entry.bind("<Escape>", lambda _e: filter_var.set(""))
-            filter_var.trace_add("write", update_hint)
-            update_hint()
-        if legend:
-            foot = ttk.Frame(side, padding=(14, 8))
-            foot.pack(fill="x", side="bottom")
-            ttk.Frame(side, style="Line.TFrame", height=1).pack(fill="x", side="bottom")
-            for badge, label in (("M", "edited"), ("A", "new"), ("R", "renamed")):
-                ttk.Label(foot, text=badge, style=f"Badge{badge}.TLabel").pack(side="left")
-                ttk.Label(foot, text=label, style="Faint.TLabel").pack(side="left", padx=(3, 8))
-            lock = ttk.Label(foot, text=icon("lock"), style="PanelIcon.TLabel")
-            lock.pack(side="left")
-            Tooltip(lock, "Locked: code is editable, the module can't be renamed or deleted")
-        body = ttk.Frame(side, padding=(6, 0, 0, 6))
-        body.pack(fill="both", expand=True, side="top")
-        tree = ttk.Treeview(body, show="tree", columns=("badge",), selectmode="browse")
-        tree.column("#0", width=200, stretch=True)
-        tree.column("badge", width=30, stretch=False, anchor="center")
-        tree_sb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=theme.autohide(tree_sb, side="right", fill="y"))
-        tree.pack(side="left", fill="both", expand=True)
-        return side, tree
+        """Sidebar column: heading, optional filter box and a tree."""
+        side = Sidebar(parent, title, add=add, add_tip=add_tip, filter_var=filter_var)
+        self._sidebars.append(side)
+        return side, side.tree
 
     def _crumb_bar(self, parent):
         bar = ttk.Frame(parent, style="Editor.TFrame", padding=(14, 4, 8, 4))
@@ -781,17 +786,19 @@ class MainWindow:
             menu.configure(**menu_colors)
         for editor in (self.editor, self.xml_editor):
             editor.apply_palette()
-        for tree in (self.tree, self.xml_tree, self.forms_tree):
+        for tree in (self.tree, self.outline, self.xml_tree, self.forms_tree):
             self._configure_tree_tags(tree)
         for button in self.rail_buttons + self._rail_extra:
             button.apply_palette()
+        for side in self._sidebars:
+            side.apply_palette()
         self.host_pill.configure(
             background=colors.bg0, highlightbackground=colors.border_strong, highlightcolor=colors.border_strong
         )
         self.host_text.configure(background=colors.bg0)
         self.host_dot.configure(background=colors.bg0)
         self.welcome_card.configure(background=colors.bg2, highlightbackground=colors.border_strong)
-        self.ribbon_panel.apply_palette()
+        self.ribbon_designer.apply_palette()
         palette_window = self.command_palette.window
         if palette_window is not None:
             palette_window.destroy()  # rebuilt with the new colours when next opened
@@ -867,16 +874,37 @@ class MainWindow:
         self.add_module_menu.add_command(label="Class Module…", command=lambda: self.add_module(standard=False))
         self.add_module_menu.add_separator()
         self.add_module_menu.add_command(label="Import .bas/.cls…", command=self.import_file)
-        side, self.tree = self._build_sidebar(
-            panes,
+        # Two lists share the sidebar: the modules, and the procedures of the open one.
+        side = ttk.Frame(panes, width=264)
+        side.pack_propagate(False)
+        lists = ttk.Panedwindow(side, orient="vertical")
+        lists.pack(fill="both", expand=True)
+        modules, self.tree = self._build_sidebar(
+            lists,
             "MODULES",
             add=self._post_add_module_menu,
             add_tip="Add module",
             filter_var=self.tree_filter,
-            legend=True,
         )
         self.tree.bind("<<TreeviewSelect>>", self.on_module_selected)
         self.tree_filter.trace_add("write", lambda *_a: self._refresh_tree())
+        lists.add(modules, weight=3)
+        outline, self.outline = self._build_sidebar(
+            lists, "PROCEDURES", add=self.add_procedure, add_tip="New Sub in this module"
+        )
+        self.outline.column("badge", width=44, anchor="e")
+        self.outline.bind("<<TreeviewSelect>>", self._on_outline_selected)
+        self.outline.bind("<Button-3>", self._on_outline_right_click)
+        self.outline_menu = tk.Menu(self.root, tearoff=0)
+        self._menus.append(self.outline_menu)
+        self.outline_menu.add_command(label="Add Ribbon Button for This Macro…", command=self.add_ribbon_button)
+        self.outline_menu.add_command(label="Show Its Ribbon Button", command=self.show_buttons_for_macro)
+        lists.add(outline, weight=2)
+        self._outline_rows: dict[str, int] = {}
+        self._outline_signature: tuple | None = None
+        self._outline_after = None
+        self._outline_idle = None
+        self._outline_selecting = False
         panes.add(side, weight=0)
 
         main = ttk.Frame(panes, style="Editor.TFrame")
@@ -929,14 +957,13 @@ class MainWindow:
         self.validate_xml_btn.pack(side="right")
         self.xml_crumb_note = ttk.Label(bar, text="", style="CrumbMuted.TLabel")
         self.xml_crumb_note.pack(side="right", padx=(8, 8))
-        content = ttk.Frame(main, style="Editor.TFrame")
-        content.pack(fill="both", expand=True)
-        self.xml_editor = XmlEditor(content)
-        self.xml_editor.pack(side="left", fill="both", expand=True)
+        # Shown for ribbon XML only: the same control in the Ribbon view.
+        self.design_btn = ttk.Button(
+            bar, text="Design view", style="EditorText.TButton", command=self.show_ribbon_design, takefocus=False
+        )
+        self.xml_editor = XmlEditor(main)
+        self.xml_editor.pack(fill="both", expand=True)
         self.xml_editor.set_validate_action(self._validate_selected_xml)
-        self.ribbon_panel_line = ttk.Frame(content, style="Line.TFrame", width=1)
-        self.ribbon_panel = RibbonPanel(content, self)
-        self.ribbon_panel.pack_propagate(False)
         panes.add(main, weight=1)
 
         self.current_xml_part_path: str | None = None
@@ -1107,9 +1134,9 @@ class MainWindow:
             self.cursor_label.config(text="")
             self.lang_label.config(text="")
             return
-        if tab == str(self.forms_tab):
+        if tab in (str(self.forms_tab), str(self.ribbon_tab)):
             self.cursor_label.config(text="")
-            self.lang_label.config(text="UserForm")
+            self.lang_label.config(text="UserForm" if tab == str(self.forms_tab) else "Ribbon")
             return
         editor = self._active_text_editor()
         if (editor is self.editor and self.current_module_id is None) or (
@@ -1125,16 +1152,13 @@ class MainWindow:
             self._follow_after = self.root.after(CURSOR_FOLLOW_MS, self._follow_cursor)
 
     def _follow_cursor(self) -> None:
-        """Breadcrumb procedure and ribbon outline follow the cursor, a moment after it moves."""
+        """Breadcrumb and outline follow the VBA cursor, a moment after it moves."""
         self._follow_after = None
         if self.draft is None:
             return
         if self._active_text_editor() is self.editor:
             self._update_procedure_crumb()
-        elif self.ribbon_panel.winfo_manager():
-            text = self.xml_editor.get_text()
-            offset = len(self.xml_editor.text.get("1.0", "insert"))
-            self.ribbon_panel.follow_cursor(text, offset)
+            self._follow_outline()
 
     # -- breadcrumbs -----------------------------------------------------------
 
@@ -1154,6 +1178,7 @@ class MainWindow:
 
     def _update_crumbs(self) -> None:
         draft = self.draft
+        self._refresh_outline()
         mod = draft.module_by_id(self.current_module_id) if draft and self.current_module_id else None
         if mod is None or mod.is_deleted:
             self.crumb_group.config(text=draft.baseline.path.name if draft else "")
@@ -1240,6 +1265,129 @@ class MainWindow:
         if not procedures:
             menu.add_command(label="No procedures", state="disabled")
 
+    # -- procedures of the open module ---------------------------------------------
+
+    def _schedule_outline(self) -> None:
+        if self._outline_after is not None:
+            self.root.after_cancel(self._outline_after)
+        self._outline_after = self.root.after(OUTLINE_REFRESH_MS, self._refresh_outline)
+
+    def _linked_macro_names(self) -> set[str]:
+        """Casefolded names of the procedures some ribbon control runs."""
+        if self.draft is None:
+            return set()
+        return {entry.callback.procedure_name.casefold() for entry in rs.ribbon_entries(self.draft)}
+
+    def _refresh_outline(self) -> None:
+        """List the open module's procedures; a mark shows the ones a ribbon control runs."""
+        if self._outline_after is not None:
+            try:
+                self.root.after_cancel(self._outline_after)
+            except tk.TclError:
+                pass
+            self._outline_after = None
+        draft = self.draft
+        mod = draft.module_by_id(self.current_module_id) if draft and self.current_module_id else None
+        tree = self.outline
+        if draft is None or mod is None or mod.is_deleted:
+            if self._outline_signature is not None:
+                tree.delete(*tree.get_children())
+                self._outline_rows.clear()
+                self._outline_signature = None
+            return
+        linked = self._linked_macro_names()
+        rows = []
+        for proc in parse_procedures(self.editor.get_text(), mod.id):
+            name = proc.name.casefold()
+            on_ribbon = name in linked or name + "callback" in linked
+            mark = icon("ribbon") if on_ribbon else OUTLINE_MARKS.get(proc.kind, "")
+            rows.append((proc.name, proc.line, mark, proc.visibility.casefold() == "private"))
+        signature = (mod.id, tuple(rows))
+        if signature != self._outline_signature:
+            self._outline_signature = signature
+            top = tree.yview()[0]
+            self._outline_selecting = True
+            try:
+                tree.delete(*tree.get_children())
+                self._outline_rows.clear()
+                for name, line, mark, private in rows:
+                    iid = tree.insert("", "end", text=name, values=(mark,), tags=("locked",) if private else ())
+                    self._outline_rows[iid] = line
+                tree.yview_moveto(top)
+            finally:
+                self._outline_selecting = False
+        self._follow_outline()
+
+    def _follow_outline(self) -> None:
+        """Highlight the procedure the VBA cursor is in."""
+        if not self._outline_rows:
+            return
+        line = int(self.editor.text.index("insert").split(".")[0])
+        inside = self._current_procedure() is not None
+        current = None
+        for iid, start in self._outline_rows.items():
+            if start <= line:
+                current = iid
+        self._outline_selecting = True
+        try:
+            if current is None or not inside:
+                self.outline.selection_set(())
+            elif self.outline.selection() != (current,):
+                self.outline.selection_set(current)
+                self.outline.see(current)
+        finally:
+            if self._outline_idle is None:
+                self._outline_idle = self.root.after_idle(self._end_outline_selecting)
+
+    def _end_outline_selecting(self) -> None:
+        self._outline_idle = None
+        self._outline_selecting = False
+
+    def _on_outline_selected(self, _event=None) -> None:
+        selection = self.outline.selection()
+        if self._outline_selecting or not selection or self.current_module_id is None:
+            return
+        line = self._outline_rows.get(selection[0])
+        if line is not None:
+            self._open_module_at(self.current_module_id, line)
+            self.editor.text.yview(f"{max(line - 2, 1)}.0")
+
+    def _on_outline_right_click(self, event) -> str:
+        iid = self.outline.identify_row(event.y)
+        if iid:
+            self.outline.selection_set(iid)
+            self._on_outline_selected()
+            self.outline_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def add_procedure(self) -> None:
+        """A new Sub at the end of the open module, with the cursor inside it."""
+        draft = self.draft
+        mod = draft.module_by_id(self.current_module_id) if draft and self.current_module_id else None
+        if draft is None or mod is None or mod.is_deleted:
+            return
+        if draft.baseline.safety.password_protected:
+            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
+            return
+        name = self._prompt_name("New Sub", "")
+        if not name:
+            return
+        self._flush_all_editors()
+        if not rs.is_valid_procedure_name(name):
+            messagebox.showerror(APP_NAME, f"'{name}' is not a valid VBA procedure name.")
+            return
+        if any(p.name.casefold() == name.casefold() for p in parse_procedures(mod.body, mod.id)):
+            messagebox.showerror(APP_NAME, f"{mod.current_name} already has a procedure named {name}.")
+            return
+        new_body, line = rs.append_procedure(mod.body, f"Public Sub {name}()\n    \nEnd Sub\n")
+
+        def mutate() -> None:
+            mod.body = new_body
+
+        self._batch_edit(mutate)
+        self._open_module_at(mod.id, line + 1, 5)
+        self.status.config(text=f"Added Sub {name} to {mod.current_name}.")
+
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self.open_file())
         self.root.bind("<Control-n>", lambda _e: self.new_file())
@@ -1259,6 +1407,8 @@ class MainWindow:
             editor.text.bind("<Control-k>", lambda _e: self.open_command_palette() or "break")
         for sequence, step in (("<Control-equal>", 1), ("<Control-plus>", 1), ("<Control-minus>", -1), ("<Control-0>", 0)):
             self.root.bind(sequence, lambda _e, step=step: self.zoom(step))
+        for index in range(4):
+            self.root.bind(f"<Control-Key-{index + 1}>", lambda _e, i=index: self._show_view(i))
 
     # -- command palette ----------------------------------------------------------
 
@@ -1687,6 +1837,8 @@ class MainWindow:
         if part is None:
             return
         self.current_xml_part_path = path
+        if rs.is_ribbon_part(path):
+            self._ribbon_surface = "xml"
         # Re-enable before replacing widget contents in case the previously
         # selected baseline part was read-only.
         self.xml_editor.text.config(state="normal")
@@ -1695,7 +1847,7 @@ class MainWindow:
             self.xml_editor.text.config(state="disabled")
         self.xml_editor.set_part_info(part)
         self.validate_xml_btn.config(state="normal")
-        self._refresh_ribbon_panel()
+        self._refresh_ribbon_views()
         self._refresh_state()
 
     def _refresh_xml_tree(self) -> None:
@@ -1731,6 +1883,9 @@ class MainWindow:
         return self.editor
 
     def find_in_editor(self, replace: bool = False) -> None:
+        if self._designer_shown():
+            self.ribbon_designer.focus_filter()  # in the Ribbon view, Ctrl+F filters the controls
+            return
         self._active_text_editor().show_find(replace=replace)
 
     def _validate_selected_xml(self) -> None:
@@ -1810,7 +1965,8 @@ class MainWindow:
         self._refresh_tree()
         self._refresh_xml_tree()
         xml_supported = path.suffix.lower() in XML_EDITABLE_EXTENSIONS
-        self.editor_notebook.tab(self.xml_tab, state="normal" if xml_supported else "disabled")
+        for tab in (self.xml_tab, self.ribbon_tab):
+            self.editor_notebook.tab(tab, state="normal" if xml_supported else "disabled")
         if xml_supported:
             self.xml_editor.set_part_info(None)
             self.xml_editor.text.config(state="normal")
@@ -1819,6 +1975,8 @@ class MainWindow:
         first = next((m.id for m in draft.modules if not m.is_deleted), None)
         if first:
             self.tree.selection_set(first)
+        self._ribbon_surface = "design"
+        self._refresh_ribbon_views()
         self._refresh_state()
         self._remember_recent(path)
         self.status.config(text=f"Opened {path.name}")
@@ -1923,9 +2081,8 @@ class MainWindow:
         part = added[0]
         text = part.text or ""
         _tab_id, group_id = spec.ids()
-        at = text.find(f'id="{rs.xml_attr(group_id)}"')
-        line = text.count("\n", 0, max(at, 0)) + 1
-        self._open_xml_at(part.path, line, 1)
+        at = max(text.find(f'id="{rs.xml_attr(group_id)}"'), 0)
+        self._reveal_ribbon(part.path, at, 0)
         self.status.config(
             text=f'Added ribbon tab "{spec.tab_label}" with group "{spec.group_label}". '
             "Nothing is written until Save File."
@@ -2298,7 +2455,7 @@ class MainWindow:
                 if part is not None:
                     self.xml_editor.set_text(part.text)
                     self.xml_editor.set_part_info(part)
-            self._refresh_ribbon_panel()
+            self._refresh_ribbon_views()
             self._refresh_state()
             name = self.draft.baseline.path.name if self.draft else ""
             if note or warning:
@@ -2555,7 +2712,7 @@ class MainWindow:
         self.xml_editor.set_text("")
         self.xml_editor.set_part_info(None)
         self.validate_xml_btn.config(state="disabled")
-        self._refresh_ribbon_panel()
+        self._refresh_ribbon_views()
         first = next((m.id for m in self.draft.modules if not m.is_deleted), None)
         if first:
             self.tree.selection_set(first)
@@ -2961,64 +3118,42 @@ class MainWindow:
 
     def _on_vba_edited(self) -> None:
         self._note_text_edit(kind="vba")
+        self._schedule_outline()
 
     def _on_xml_edited(self) -> None:
         self._note_text_edit(kind="xml")
-        if self._ribbon_after is not None:
-            self.root.after_cancel(self._ribbon_after)
-        self._ribbon_after = self.root.after(RIBBON_PANEL_REFRESH_MS, self._refresh_ribbon_panel)
 
-    def _refresh_ribbon_panel(self) -> None:
-        """Show the ribbon structure beside ribbon XML (from the editor's current text)."""
-        if self._ribbon_after is not None:
-            try:
-                self.root.after_cancel(self._ribbon_after)
-            except tk.TclError:
-                pass
-            self._ribbon_after = None
-        path = self.current_xml_part_path
-        if self.draft is None or path is None or not rs.is_ribbon_part(path):
-            self.ribbon_panel.pack_forget()
-            self.ribbon_panel_line.pack_forget()
-            self.ribbon_panel.refresh(None, "")
-            return
-        if not self.ribbon_panel.winfo_manager():
-            self.ribbon_panel.pack(side="right", fill="y", before=self.xml_editor)
-            self.ribbon_panel_line.pack(side="right", fill="y", before=self.xml_editor)
-        self._flush_active_xml_editor()
-        self.ribbon_panel.refresh(path, self.xml_editor.get_text())
+    def _refresh_ribbon_views(self) -> None:
+        """After the draft or the open XML part changed: the Design button, and the Ribbon view."""
+        ribbon = self.draft is not None and rs.is_ribbon_part(self.current_xml_part_path or "")
+        if ribbon and not self.design_btn.winfo_manager():
+            self.design_btn.pack(side="right", after=self.validate_xml_btn)
+        elif not ribbon and self.design_btn.winfo_manager():
+            self.design_btn.pack_forget()
+        if self._designer_shown():
+            self.ribbon_designer.refresh()
 
-    def add_ribbon_button_from_panel(self) -> None:
-        """Pick a macro, then add a ribbon button for it (the panel's Button action)."""
+    def show_ribbon_design(self) -> None:
+        """The Ribbon view, on the control the XML cursor is in when ribbon XML is showing."""
         draft = self.draft
         if draft is None:
             return
         self._flush_all_editors()
-        subs = sorted(
-            (
-                loc
-                for locs in rs.procedure_index(draft).values()
-                for loc in locs
-                if loc.is_standard and loc.kind == "Sub"
-            ),
-            key=lambda loc: (loc.module_name.casefold(), loc.line),
-        )
-        if not subs:
-            messagebox.showinfo(
-                APP_NAME, "Add a Sub to a standard module first, then add a ribbon button for it."
-            )
+        path = self.current_xml_part_path
+        from_xml = self._current_view() == str(self.xml_tab) and path is not None and rs.is_ribbon_part(path)
+        offset = len(self.xml_editor.text.get("1.0", "insert")) if from_xml else None
+        self._show_view(self.editor_notebook.index(self.ribbon_tab))
+        if from_xml and path is not None and offset is not None:
+            self.ribbon_designer.select_offset(path, offset)
+        self.ribbon_designer.tree.focus_set()
+
+    def _reveal_ribbon(self, part_path: str, offset: int, length: int) -> None:
+        """Show a ribbon control after an edit, in the ribbon view used last (Design or XML)."""
+        if self._ribbon_surface == "xml" or not rs.is_ribbon_part(part_path):
+            self._select_xml_range(part_path, offset, length)
             return
-        index = choose(
-            self.root,
-            "Add Ribbon Button",
-            "Which macro should the new button run?",
-            [f"{loc.module_name}.{loc.name}" for loc in subs],
-        )
-        if index is None:
-            return
-        target = subs[index]
-        self._open_module_at(target.module_id, target.line)
-        self.add_ribbon_button()
+        self._show_view(self.editor_notebook.index(self.ribbon_tab))
+        self.ribbon_designer.select_offset(part_path, offset)
 
     # -- change bars ---------------------------------------------------------------
 
@@ -3117,7 +3252,7 @@ class MainWindow:
             part = self.draft.xml_part_by_path(self.current_xml_part_path)
             if part is not None:
                 self.xml_editor.set_text(part.text or "")
-        self._refresh_ribbon_panel()
+        self._refresh_ribbon_views()
         self._refresh_state()
 
     def project_search(self) -> None:
@@ -3170,6 +3305,8 @@ class MainWindow:
             return
         self._flush_all_editors()
         self.editor_notebook.select(self.xml_tab)
+        if rs.is_ribbon_part(part_path):
+            self._ribbon_surface = "xml"
         if self.current_xml_part_path != part_path:
             self.current_xml_part_path = part_path
             self.xml_editor.text.config(state="normal")
@@ -3178,7 +3315,7 @@ class MainWindow:
                 self.xml_editor.text.config(state="disabled")
             self.xml_editor.set_part_info(part)
             self.validate_xml_btn.config(state="normal")
-            self._refresh_ribbon_panel()
+            self._refresh_ribbon_views()
         try:
             self.xml_tree.selection_set("xml::" + part_path)
             self.xml_tree.see("xml::" + part_path)
@@ -3216,6 +3353,10 @@ class MainWindow:
 
     def goto_callback_under_cursor(self) -> None:
         if self.draft is None:
+            return
+        if self._designer_shown():
+            if not self.ribbon_designer.goto_macro():
+                self.status.config(text="Select a button that runs a macro, then press F12 to open it.")
             return
         if self._active_text_editor() is self.editor:
             self.show_buttons_for_macro()
@@ -3264,7 +3405,11 @@ class MainWindow:
             self.status.config(text=f"{callback.name} → {match.module_name}, line {match.line}")
 
     def goto_callback_xml(self, callback) -> None:
-        self._open_xml_at(callback.part_path, callback.line, callback.column, callback.length)
+        """Show the control that has ``callback``: in the Ribbon view, or in its XML if that was used last."""
+        if self._ribbon_surface == "xml":
+            self._open_xml_at(callback.part_path, callback.line, callback.column, callback.length)
+        else:
+            self._reveal_ribbon(callback.part_path, callback.tag_start, 0)
 
     def _batch_edit(self, mutate) -> None:
         """Apply a programmatic multi-target edit as one undoable step."""
@@ -3400,10 +3545,21 @@ class MainWindow:
         if spec is not None:
             self.apply_ribbon_button(mod.id, callback_name, wrapper, spec)
 
+    def add_ribbon_control(self, kind: str) -> None:
+        """Ribbon → Add …: a new button, menu, group or separator at the Ribbon view's selection."""
+        if self.draft is None or self._saving:
+            return
+        if not self._designer_shown():
+            self._show_view(self.editor_notebook.index(self.ribbon_tab))
+        self.ribbon_designer.add_control(kind)
+
     def add_ribbon_menu(self) -> None:
-        """Ask for a new ribbon menu (and optionally its buttons) and insert the XML."""
+        """A new ribbon menu: in the Ribbon view directly, from the XML editor through a form."""
         draft = self.draft
         if draft is None:
+            return
+        if self._current_view() != str(self.xml_tab):
+            self.add_ribbon_control("menu")
             return
         self._flush_all_editors()
         if not self._ensure_ribbon("the menu"):
@@ -3478,9 +3634,7 @@ class MainWindow:
             part.text = new_text
 
         self._batch_edit(mutate)
-        line = new_text.count("\n", 0, offset) + 1
-        column = offset - (new_text.rfind("\n", 0, offset) + 1) + 1
-        self._open_xml_at(part.path, line, column, len(element.split("\n", 1)[0]))
+        self._reveal_ribbon(part.path, offset, len(element.split("\n", 1)[0]))
         count = f" with {len(children)} button(s)" if children else ""
         self.status.config(
             text=f'Added menu "{spec.label}"{count}. Nothing is written until Save File.'
@@ -3564,9 +3718,7 @@ class MainWindow:
             messagebox.showwarning(
                 APP_NAME, "The button was added without its icon:\n\n" + icon_problems[0]
             )
-        line = new_text.count("\n", 0, offset) + 1
-        column = offset - (new_text.rfind("\n", 0, offset) + 1) + 1
-        self._open_xml_at(part.path, line, column, length)
+        self._reveal_ribbon(part.path, offset, length)
         extra = f" and {callback_name} in {mod.current_name}" if wrapper else ""
         self.status.config(
             text=f'Added button "{spec.label}"{extra}. Nothing is written until Save File.'
@@ -3662,7 +3814,7 @@ class MainWindow:
 
         self._batch_edit(mutate)
         if plan.part_path:
-            self._select_xml_range(plan.part_path, plan.element_offset, plan.element_length)
+            self._reveal_ribbon(plan.part_path, plan.element_offset, plan.element_length)
         added = len(plan.new_module_ids)
         modules = f" and {added} module(s)" if added else ""
         self.status.config(
@@ -3741,7 +3893,9 @@ class MainWindow:
         )
 
     def move_ribbon_control(self, direction: int) -> bool:
-        """Swap the control at the XML cursor with the one before (-1) or after (+1) it."""
+        """Swap the selected control (Ribbon view) or the one at the XML cursor with its neighbour."""
+        if self._designer_shown():
+            return self.ribbon_designer.move_selected(direction)
         context = self._ribbon_xml_context()
         if context is None:
             return False
@@ -3765,11 +3919,23 @@ class MainWindow:
 
     def group_selection_into_menu(self) -> None:
         """Ask for a menu label, then wrap the selected controls in a new <menu>."""
+        if self._designer_shown():
+            self.ribbon_designer.group_selected_into_menu()
+            return
         context = self._ribbon_xml_context(dialog=True)
         if context is None:
             return
-        draft, part, text, offset = context
+        _draft, part, _text, offset = context
         start, end = self._xml_selection_offsets(offset)
+        self.group_range_into_menu(part.path, start, end)
+
+    def group_range_into_menu(self, part_path: str, start: int, end: int) -> None:
+        """Ask for the menu, then wrap the sibling controls between two offsets of a ribbon part in it."""
+        draft = self.draft
+        part = draft.xml_part_by_path(part_path) if draft is not None else None
+        if draft is None or part is None or part.text is None:
+            return
+        text = part.text
         try:
             parent, run = rs.selected_siblings(text, start, end)
             rs.group_into_menu(text, start, end, control_id="mnuCheck", label="Check")
@@ -3820,7 +3986,7 @@ class MainWindow:
                     icon_problems.append(str(exc))
 
         self._batch_edit(mutate)
-        self._select_xml_range(part.path, offset, length)
+        self._reveal_ribbon(part.path, offset, length)
         self.status.config(
             text=f'Grouped into menu "{spec.label}". Nothing is written until Save File.'
         )
@@ -3831,9 +3997,15 @@ class MainWindow:
         return True
 
     def set_ribbon_icon_from_clipboard(self) -> None:
+        if self._designer_shown():
+            self.ribbon_designer.set_icon_from_clipboard()
+            return
         self._set_ribbon_icon(icon_service.icon_from_clipboard)
 
     def set_ribbon_icon_from_file(self) -> None:
+        if self._designer_shown():
+            self.ribbon_designer.set_icon_from_file()
+            return
         if not self._ribbon_edit_enabled():
             self._ribbon_xml_context(dialog=True)  # explains what to do
             return
@@ -3879,7 +4051,7 @@ class MainWindow:
         part = draft.xml_part_by_path(part_path)
         element = rs.element_at(part.text or "", control_start) if part is not None else None
         if element is not None:
-            self._select_xml_range(part_path, element.start, element.open_end - element.start)
+            self._reveal_ribbon(part_path, element.start, element.open_end - element.start)
         what = element.describe() if element is not None else "the control"
         self.status.config(
             text=f"Set a custom icon on {what} ({icon.describe()}). "
@@ -4053,7 +4225,8 @@ class MainWindow:
         self.current_xml_part_path = None
         path = session.original_path
         xml_supported = path.suffix.lower() in XML_EDITABLE_EXTENSIONS
-        self.editor_notebook.tab(self.xml_tab, state="normal" if xml_supported else "disabled")
+        for tab in (self.xml_tab, self.ribbon_tab):
+            self.editor_notebook.tab(tab, state="normal" if xml_supported else "disabled")
         self._reload_editors_from_draft()
         first = next((m.id for m in session.draft.modules if not m.is_deleted), None)
         if first:
@@ -4216,7 +4389,7 @@ class MainWindow:
         self._release_prescan_gc()
         for attr in (
             "_idle_after", "_max_after", "_poll_after", "_recovery_after", "_prescan_after",
-            "_queue_after",
+            "_queue_after", "_outline_after", "_outline_idle",
         ):
             handle = getattr(self, attr, None)
             if handle is None:

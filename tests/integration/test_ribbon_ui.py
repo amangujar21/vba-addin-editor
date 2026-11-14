@@ -87,7 +87,7 @@ def test_add_button_with_wrapper_saves_and_undoes(window, tmp_path: Path):
     window.root.update()
 
     assert 'onAction="TidySheetsCallback"' in part.text
-    assert window.xml_editor.text.get("sel.first", "sel.last").startswith('<button id="btnTidy"')
+    assert window.ribbon_designer.selected_element().attr("id") == "btnTidy"
     body = window.draft.find_current("Module1").body
     assert "Public Sub TidySheetsCallback(control As IRibbonControl)\n    TidySheets\nEnd Sub" in body
     assert rs.new_issues(window.draft) == []
@@ -174,7 +174,7 @@ def test_add_menu_with_macros_is_one_undo_step_and_saves(window):
         "          </menu>\n"
         "        </group>"
     ) in part.text
-    assert window.xml_editor.text.get("sel.first", "sel.last").startswith('<menu id="mnuReports"')
+    assert window.ribbon_designer.selected_element().attr("id") == "mnuReports"
     assert rs.new_issues(window.draft) == []
     # The new menu is itself somewhere buttons and further menus can go.
     assert "mnuReports" in {c.control_id for c in rs.find_containers(part.text, PART)}

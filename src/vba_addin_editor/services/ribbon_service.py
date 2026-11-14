@@ -333,7 +333,8 @@ def build_button_xml(
         parts.append(f'size="{_attr(size)}"')
     if image_mso:
         parts.append(f'imageMso="{_attr(image_mso)}"')
-    parts.append(f'onAction="{_attr(on_action)}"')
+    if on_action:
+        parts.append(f'onAction="{_attr(on_action)}"')
     if screentip:
         parts.append(f'screentip="{_attr(screentip)}"')
     if supertip:
@@ -1230,3 +1231,239 @@ def set_control_image(text: str, element: RibbonElement, rid: str) -> str:
     tag = text[element.start : element.open_end]
     tag = set_tag_attr(_remove_attrs(tag, {"imageMso", "getImage"}), "image", rid)
     return text[: element.start] + tag + text[element.open_end :]
+
+
+# -- designer edits: attributes, add, delete, move to another container ----------------
+
+_GROUP_CHILDREN = frozenset(
+    {
+        "button",
+        "toggleButton",
+        "checkBox",
+        "menu",
+        "splitButton",
+        "gallery",
+        "dynamicMenu",
+        "comboBox",
+        "dropDown",
+        "editBox",
+        "labelControl",
+        "box",
+        "buttonGroup",
+        "separator",
+        "control",
+        "dialogBoxLauncher",
+    }
+)
+# What each container may hold, by local element name (the customUI schema).
+CHILD_ELEMENTS: dict[str, frozenset[str]] = {
+    "tabs": frozenset({"tab"}),
+    "tab": frozenset({"group"}),
+    "group": _GROUP_CHILDREN,
+    "box": _GROUP_CHILDREN - {"separator", "dialogBoxLauncher"},
+    "buttonGroup": frozenset(
+        {"button", "toggleButton", "menu", "splitButton", "gallery", "dynamicMenu", "control"}
+    ),
+    "menu": frozenset(MENU_CHILD_ELEMENTS),
+}
+# Parents whose children may carry size="large".
+SIZED_PARENTS = frozenset({"group", "box"})
+
+
+def local_name(name: str) -> str:
+    """'mso:button' -> 'button'."""
+    return _local_name(name)
+
+
+def can_contain(parent: RibbonElement, child_name: str) -> bool:
+    """Whether the schema lets ``parent`` hold a ``child_name`` element."""
+    return _local_name(child_name) in CHILD_ELEMENTS.get(_local_name(parent.name), frozenset())
+
+
+def element_by_start(text: str, start: int) -> RibbonElement | None:
+    """The element whose opening tag begins at ``start``."""
+    return next((e for e in element_tree(text) if e.start == start), None)
+
+
+def is_free(elements: list[RibbonElement], element: RibbonElement) -> bool:
+    """Whether ``element`` may be moved or deleted (not a fixed part of the skeleton)."""
+    if not element.complete or element.parent < 0:
+        return False
+    if _local_name(element.name) in _PINNED_ELEMENTS:
+        return False
+    return _local_name(elements[element.parent].name) not in _FIXED_ORDER_PARENTS
+
+
+def callback_attrs(element: RibbonElement) -> list[tuple[str, str]]:
+    """(attribute, macro name) for each callback attribute ``element`` carries."""
+    return [
+        (name, _unescape(value).strip())
+        for name, value, _offset in element.attrs
+        if _CALLBACK_ATTR_RE.fullmatch(name) and value.strip()
+    ]
+
+
+def set_element_attrs(text: str, element: RibbonElement, changes: dict[str, str | None]) -> str:
+    """``text`` with attributes of ``element`` set (a value) or removed (None)."""
+    tag = text[element.start : element.open_end]
+    dropped = {name for name, value in changes.items() if value is None}
+    if dropped:
+        tag = _remove_attrs(tag, dropped)
+    for name, value in changes.items():
+        if value is not None:
+            tag = set_tag_attr(tag, name, value)
+    return text[: element.start] + tag + text[element.open_end :]
+
+
+def _own_lines(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """The whole lines ``text[start:end]`` sits on, when nothing else shares them."""
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    if line_end < 0:
+        line_end = len(text)
+    if text[line_start:start].strip() or text[end:line_end].strip():
+        return None
+    return line_start, min(line_end + 1, len(text))
+
+
+def delete_element(text: str, element: RibbonElement) -> str:
+    """``text`` without ``element`` (and without its lines, when it had them to itself)."""
+    if not element.complete:
+        raise RibbonEditError(f"The {element.name} element is not closed, so it cannot be removed.")
+    start, end = _own_lines(text, element.start, element.end) or (element.start, element.end)
+    return text[:start] + text[end:]
+
+
+def _child_indent(text: str, elements: list[RibbonElement], parent: RibbonElement) -> str:
+    """Indentation the children of ``parent`` use, or would use."""
+    for child in _children(elements, parent.index):
+        indent, first = _line_indent(text, child.start)
+        if first:
+            return indent
+    indent = _line_indent(text, parent.start)[0]
+    above = _line_indent(text, elements[parent.parent].start)[0] if parent.parent >= 0 else ""
+    unit = indent[len(above) :] if above != indent and indent.startswith(above) else ""
+    return indent + (unit or "  ")
+
+
+def _indent_block(block: str, indent: str) -> str:
+    lines = block.split("\n")
+    return "\n".join([lines[0]] + [indent + line if line.strip() else line for line in lines[1:]])
+
+
+def _relative_block(text: str, element: RibbonElement) -> str:
+    """The element's markup with its own indentation taken off the later lines."""
+    indent = _line_indent(text, element.start)[0]
+    lines = text[element.start : element.end].split("\n")
+    return "\n".join(
+        [lines[0]] + [line[len(indent) :] if indent and line.startswith(indent) else line for line in lines[1:]]
+    )
+
+
+def insert_child(
+    text: str,
+    parent: RibbonElement,
+    element_xml: str,
+    *,
+    before: RibbonElement | None = None,
+    after: RibbonElement | None = None,
+) -> tuple[str, int, int]:
+    """Add ``element_xml`` to ``parent``: before/after a child, else as its last child.
+
+    ``element_xml`` starts at column 0; its later lines are indented to fit.
+    Returns (new_text, offset, length) of the inserted markup.
+    """
+    if not parent.complete:
+        raise RibbonEditError(f"The {parent.name} element is not closed, so nothing can be added to it.")
+    elements = element_tree(text)
+    indent = _child_indent(text, elements, parent)
+    if before is None and after is None:
+        children = [e for e in _children(elements, parent.index) if e.complete]
+        if children and _local_name(children[-1].name) in _PINNED_ELEMENTS:
+            before = children[-1]
+    block = _indent_block(element_xml, indent)
+    if after is not None:
+        at = after.end
+        return text[:at] + "\n" + indent + block + text[at:], at + 1 + len(indent), len(block)
+    if before is not None:
+        own_indent, first = _line_indent(text, before.start)
+        if first:
+            at = before.start - len(own_indent)
+            return text[:at] + indent + block + "\n" + text[at:], at + len(indent), len(block)
+        at = before.start
+        return text[:at] + block + "\n" + indent + text[at:], at, len(block)
+    own_indent = _line_indent(text, parent.start)[0]
+    if parent.end == parent.open_end:  # <group ... />: open it up first
+        tag = re.sub(r"\s*/>$", ">", text[parent.start : parent.open_end])
+        at = parent.start + len(tag)
+        inserted = "\n" + indent + block + "\n" + own_indent + f"</{parent.name}>"
+        return text[: parent.start] + tag + inserted + text[parent.open_end :], at + 1 + len(indent), len(block)
+    close = text.rfind("<", parent.open_end, parent.end)
+    _close_indent, close_first = _line_indent(text, close)
+    if close_first:
+        at = text.rfind("\n", 0, close) + 1
+        return text[:at] + indent + block + "\n" + text[at:], at + len(indent), len(block)
+    inserted = "\n" + indent + block + "\n" + own_indent
+    return text[:close] + inserted + text[close:], close + 1 + len(indent), len(block)
+
+
+def relocate_element(
+    text: str,
+    element: RibbonElement,
+    parent: RibbonElement,
+    *,
+    before: RibbonElement | None = None,
+    after: RibbonElement | None = None,
+) -> tuple[str, RibbonElement]:
+    """Move ``element`` into ``parent`` (before/after one of its children, else last).
+
+    Returns the new text and the element as it is there. Controls leaving a
+    group lose their size, which only a group's own controls may carry.
+    """
+    elements = element_tree(text)
+    if not is_free(elements, element):
+        raise RibbonEditError(f"{element.describe()} has a fixed position in the ribbon XML.")
+    anchor = before or after
+    if anchor is not None and anchor.index == element.index:
+        raise RibbonEditError(f"{element.describe()} is already there.")
+    for target in (parent, anchor):
+        current = target
+        while current is not None:
+            if current.index == element.index:
+                raise RibbonEditError(f"{element.describe()} cannot be moved into itself.")
+            current = elements[current.parent] if current.parent >= 0 else None
+    if not can_contain(parent, element.name):
+        raise RibbonEditError(
+            f"A {_local_name(parent.name)} cannot hold a {_local_name(element.name)}."
+        )
+    if after is not None and _local_name(after.name) in _PINNED_ELEMENTS:
+        raise RibbonEditError(f"The dialog box launcher must stay last in its {parent.name}.")
+    block = _relative_block(text, element)
+    if _local_name(parent.name) not in SIZED_PARENTS:
+        open_length = element.open_end - element.start
+        block = _remove_attrs(block[:open_length], {"size", "getSize"}) + block[open_length:]
+    start, end = _own_lines(text, element.start, element.end) or (element.start, element.end)
+    removed = text[:start] + text[end:]
+
+    def shifted(target: RibbonElement | None) -> RibbonElement | None:
+        if target is None:
+            return None
+        offset = target.start if target.start < start else target.start - (end - start)
+        return element_by_start(removed, offset)
+
+    new_parent = shifted(parent)
+    assert new_parent is not None
+    new_text, offset, _length = insert_child(
+        removed, new_parent, block, before=shifted(before), after=shifted(after)
+    )
+    moved = element_by_start(new_text, offset)
+    assert moved is not None
+    return new_text, moved
+
+
+def build_group_xml(*, control_id: str, label: str) -> str:
+    return f'<group id="{_attr(control_id)}" label="{_attr(label)}">\n</group>'
+
+
+def build_separator_xml(*, control_id: str, in_menu: bool) -> str:
+    return f'<{"menuSeparator" if in_menu else "separator"} id="{_attr(control_id)}" />'

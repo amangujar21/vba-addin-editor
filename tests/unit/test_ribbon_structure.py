@@ -140,3 +140,138 @@ def test_set_control_image_replaces_imagemso():
     assert rs.set_control_image(xml, element, "rIdImg1") == (
         '<group id="g"><button id="b" onAction="X" image="rIdImg1"/></group>'
     )
+
+
+# -- designer edits ----------------------------------------------------------------------
+
+
+def _element(text: str, control_id: str) -> rs.RibbonElement:
+    return next(e for e in rs.element_tree(text) if e.attr("id") == control_id)
+
+
+def _valid(text: str) -> None:
+    assert not validate_xml_bytes(text.encode("utf-8"), part_path="customUI/customUI14.xml")
+
+
+def test_set_element_attrs_sets_adds_and_removes():
+    text = rs.set_element_attrs(
+        RIBBON, _element(RIBBON, "btnHello"), {"label": "Hi & Bye", "size": None, "screentip": "Greets"}
+    )
+    assert '<button id="btnHello" label="Hi &amp; Bye" onAction="Hello" screentip="Greets" />' in text
+    assert text.count("\n") == RIBBON.count("\n")
+    _valid(text)
+
+
+def test_delete_element_takes_its_lines_and_keeps_the_rest():
+    text = rs.delete_element(RIBBON, _element(RIBBON, "btnMissing"))
+    assert _group(text, "grpMain") == (
+        '<group id="grpMain" label="Main">\n'
+        '          <button id="btnHello" label="Say Hello" size="large" onAction="Hello" />\n'
+        '          <!-- <button id="btnOld" onAction="Ghost" /> -->\n'
+        "        </group>"
+    )
+    whole = rs.delete_element(RIBBON, _element(RIBBON, "grpMenus"))
+    assert "mnuMore" not in whole and 'id="grpEmpty"' in whole
+    inline = '<group id="g"><button id="a"/><button id="b"/></group>'
+    assert rs.delete_element(inline, _element(inline, "a")) == '<group id="g"><button id="b"/></group>'
+    _valid(text)
+    _valid(whole)
+
+
+def test_insert_child_appends_or_goes_beside_a_sibling():
+    button = '<button id="btnNew" label="New" />'
+    text, offset, length = rs.insert_child(RIBBON, _element(RIBBON, "grpMain"), button)
+    assert text[offset : offset + length] == button
+    assert _group(text, "grpMain").endswith('onAction="NoSuchMacro" />\n          ' + button + "\n        </group>")
+    after, offset, _n = rs.insert_child(
+        RIBBON, _element(RIBBON, "grpMain"), button, after=_element(RIBBON, "btnHello")
+    )
+    assert 'onAction="Hello" />\n          ' + button + "\n          <!--" in after
+    assert after[offset:].startswith(button)
+    before, offset, _n = rs.insert_child(
+        RIBBON, _element(RIBBON, "grpMain"), button, before=_element(RIBBON, "btnHello")
+    )
+    assert '<group id="grpMain" label="Main">\n          ' + button + '\n          <button id="btnHello"' in before
+    assert before[offset:].startswith(button)
+    for result in (text, after, before):
+        _valid(result)
+
+
+def test_insert_child_into_empty_and_self_closing_containers():
+    menu = rs.build_menu_xml(control_id="mnuNew", label="New", indent="", unit="")
+    text, offset, length = rs.insert_child(RIBBON, _element(RIBBON, "grpEmpty"), menu)
+    assert (
+        '<group id="grpEmpty" label="Empty">\n'
+        '          <menu id="mnuNew" label="New">\n'
+        "          </menu>\n"
+        "        </group>"
+    ) in text
+    assert text[offset : offset + length].startswith('<menu id="mnuNew"')
+    closed = '<tab id="t">\n  <group id="g" label="G"/>\n</tab>'
+    opened, offset, _n = rs.insert_child(closed, _element(closed, "g"), '<button id="b" />')
+    assert opened == '<tab id="t">\n  <group id="g" label="G">\n    <button id="b" />\n  </group>\n</tab>'
+    assert opened[offset:].startswith('<button id="b" />')
+    group = rs.build_group_xml(control_id="grpNew", label="New")
+    tabbed, _o, _n = rs.insert_child(RIBBON, _element(RIBBON, "tabTools"), group)
+    assert '        <group id="grpNew" label="New">\n        </group>\n      </tab>' in tabbed
+    _valid(text)
+    _valid(tabbed)
+
+
+def test_insert_child_stays_ahead_of_a_dialog_box_launcher():
+    xml = (
+        '<group id="g" label="G">\n'
+        '  <button id="a" />\n'
+        '  <dialogBoxLauncher><button id="dlg" /></dialogBoxLauncher>\n'
+        "</group>"
+    )
+    text, _o, _n = rs.insert_child(xml, _element(xml, "g"), '<button id="b" />')
+    assert text.index('id="b"') < text.index("<dialogBoxLauncher>")
+
+
+def test_relocate_moves_into_a_menu_and_drops_size():
+    text, moved = rs.relocate_element(RIBBON, _element(RIBBON, "btnHello"), _element(RIBBON, "mnuMore"))
+    assert _group(text, "grpMenus") == (
+        '<group id="grpMenus" label="Menus">\n'
+        '          <menu id="mnuMore" label="More">\n'
+        '            <toggleButton id="tglX" label="Toggle" onAction="OnToggle" getPressed="GetToggle" />\n'
+        '            <button id="btnHello" label="Say Hello" onAction="Hello" />\n'
+        "          </menu>\n"
+        "        </group>"
+    )
+    assert moved.attr("id") == "btnHello" and 'id="btnHello"' not in _group(text, "grpMain")
+    _valid(text)
+
+
+def test_relocate_moves_a_whole_menu_and_reindents_it():
+    text, moved = rs.relocate_element(
+        RIBBON, _element(RIBBON, "mnuMore"), _element(RIBBON, "grpMain"), before=_element(RIBBON, "btnHello")
+    )
+    assert _group(text, "grpMain").startswith(
+        '<group id="grpMain" label="Main">\n'
+        '          <menu id="mnuMore" label="More">\n'
+        '            <toggleButton id="tglX"'
+    )
+    assert _group(text, "grpMenus") == '<group id="grpMenus" label="Menus">\n        </group>'
+    assert text[moved.start : moved.end].endswith("          </menu>")
+    # Groups reorder inside their tab the same way.
+    regrouped, group = rs.relocate_element(
+        RIBBON, _element(RIBBON, "grpMain"), _element(RIBBON, "tabTools"), after=_element(RIBBON, "grpEmpty")
+    )
+    assert regrouped.index('id="grpEmpty"') < regrouped.index('id="grpMain"')
+    assert group.attr("id") == "grpMain"
+    _valid(text)
+    _valid(regrouped)
+
+
+def test_relocate_refuses_what_the_schema_forbids():
+    with pytest.raises(rs.RibbonEditError, match="cannot hold"):
+        rs.relocate_element(RIBBON, _element(RIBBON, "grpMain"), _element(RIBBON, "mnuMore"))
+    with pytest.raises(rs.RibbonEditError, match="into itself"):
+        rs.relocate_element(RIBBON, _element(RIBBON, "mnuMore"), _element(RIBBON, "mnuMore"))
+    tabs = next(e for e in rs.element_tree(RIBBON) if e.name == "tabs")
+    with pytest.raises(rs.RibbonEditError, match="fixed position"):
+        rs.relocate_element(RIBBON, tabs, _element(RIBBON, "tabTools"))
+    assert rs.can_contain(_element(RIBBON, "tabTools"), "group")
+    assert not rs.can_contain(_element(RIBBON, "tabTools"), "button")
+    assert rs.callback_attrs(_element(RIBBON, "tglX")) == [("onAction", "OnToggle"), ("getPressed", "GetToggle")]
