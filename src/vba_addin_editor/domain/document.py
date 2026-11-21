@@ -38,7 +38,6 @@ class FileFingerprint:
 
 @dataclass(frozen=True)
 class ProjectSafetyInfo:
-    password_protected: bool
     signature_present: bool
     signature_kinds: tuple[str, ...]
     writable: bool

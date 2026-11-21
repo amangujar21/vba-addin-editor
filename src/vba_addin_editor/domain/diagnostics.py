@@ -34,7 +34,6 @@ RECOVERY_REQUIRED = "recovery_required"
 RECOVERY_WRITE_FAILED = "recovery_write_failed"
 STALE_PROPOSAL = "stale_proposal"
 NO_CHANGES = "no_changes"
-PASSWORD_PROTECTED = "password_protected"
 PACKAGE_SIGNED = "package_signed"
 UNSUPPORTED_EXTENSION = "unsupported_extension"
 REPARSE_POINT = "reparse_point"
@@ -129,10 +128,6 @@ REASON_EXPLANATIONS: dict[str, tuple[str, str]] = {
         "Rebuild the review, then continue.",
     ),
     NO_CHANGES: ("There are no changes to save.", "Continue editing, or Save a Copy."),
-    PASSWORD_PROTECTED: (
-        "This VBA project is password-protected and cannot be modified safely.",
-        "XML-only package edits remain possible when they do not touch VBA.",
-    ),
     PACKAGE_SIGNED: (
         "This Office package has an OPC digital signature, so XML editing is blocked.",
         "Remove the package signature outside this editor, or edit VBA only.",

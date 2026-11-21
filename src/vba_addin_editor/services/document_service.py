@@ -84,8 +84,6 @@ def snapshot_report(snapshot: DocumentSnapshot) -> str:
     """Human-readable one-line status used by banners."""
     bits = [f"{snapshot.extension} ", snapshot.project_name or "(unnamed project)"]
     flags: list[str] = []
-    if snapshot.safety.password_protected:
-        flags.append("password-protected")
     if snapshot.safety.signature_present:
         flags.append("digitally signed")
     if snapshot.package_safety.opc_signature_present:

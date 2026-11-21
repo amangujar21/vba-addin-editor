@@ -14,7 +14,7 @@ from vba_addin_editor.domain.diagnostics import (
     utc_now,
 )
 
-BlockedReason = str  # "office_running" | "external_change" | "password_protected" | ...
+BlockedReason = str  # "office_running" | "external_change" | "package_signed" | ...
 
 
 @dataclass(frozen=True)

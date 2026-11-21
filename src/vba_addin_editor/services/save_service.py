@@ -141,13 +141,6 @@ class SaveService:
         """Mutation-specific protection/signature policy (XML plan 12.4)."""
         has_vba = changes.has_vba_changes
         has_xml = changes.has_xml_changes
-        # Password-protected VBA: block only VBA mutations; XML-only edits do
-        # not touch vbaProject.bin, so the protected project stays intact.
-        if has_vba and draft.baseline.safety.password_protected:
-            return SaveResult.blocked(
-                "password_protected",
-                "This VBA project is password-protected and cannot be modified safely.",
-            )
         # VBA signature: confirmation required only when VBA will be rewritten.
         if has_vba and draft.baseline.safety.signature_present and not draft.signed_save_confirmed:
             return SaveResult.needs_signature_confirmation()

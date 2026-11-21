@@ -188,10 +188,9 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   reverts it all; nothing is written until Save File.
 
   The import is refused if the code uses a UserForm this file does not have
-  (import the form in the VBA editor first), or if either project is
-  password-protected. The summary lists what to check afterwards:
-  references this file lacks (Tools → References), sheets of the other
-  add-in the code reads, and a cross-host import (Excel ↔ PowerPoint).
+  (import the form in the VBA editor first). The summary lists what to check
+  afterwards: references this file lacks (Tools → References), sheets of the
+  other add-in the code reads, and a cross-host import (Excel ↔ PowerPoint).
 - **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA code tab.
 - **Ribbon → Ribbon Buttons…** lists every callback with its module and
   status; **Check Ribbon Callbacks** and **Validate XML** report callbacks
@@ -214,9 +213,9 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   alternate data streams the new file would not have, Windows `ReplaceFileW`
   does the move so they are kept.
 - **No change means no write.** Saving without edits never rewrites the file.
-- **Password-protected projects are read-only.** No bypass exists. (XML-only
-  package edits on `.xlam`/`.ppam`/`.pptm` remain possible; they never modify the
-  protected VBA project.)
+- **All files open and stay editable.** Password-protection detection was
+  removed after it produced false positives on legitimate files; an
+  authentication layer will be added in a future version.
 - **Strict encoding.** Characters that cannot be stored in the project's code
   page block the save instead of being silently replaced.
 - **XML edits stay inside their package.** Only the exact XML parts you edited

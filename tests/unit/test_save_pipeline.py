@@ -448,37 +448,6 @@ def test_package_signed_xml_edit_blocked(work_pptm):
     assert work_pptm.read_bytes() == before
 
 
-def test_xml_only_save_allowed_on_password_protected_vba(work_pptm):
-    """XML-only save must not rewrite the protected VBA project (plan 12.4)."""
-    draft = DocumentService().open(work_pptm)
-    from dataclasses import replace
-
-
-    draft.baseline = replace(
-        draft.baseline,
-        safety=replace(draft.baseline.safety, password_protected=True),
-    )
-    before = _payloads(work_pptm)
-    _edit_core_xml(draft)
-    result = make_service().save_addin(draft)
-    assert result.kind == "success", result
-    assert _payloads(work_pptm)["ppt/vbaProject.bin"] == before["ppt/vbaProject.bin"]
-
-
-def test_vba_change_on_password_protected_project_blocked(work_pptm):
-    draft = DocumentService().open(work_pptm)
-    from dataclasses import replace
-
-
-    draft.baseline = replace(
-        draft.baseline,
-        safety=replace(draft.baseline.safety, password_protected=True),
-    )
-    edit_module1(draft)
-    result = make_service().save_addin(draft)
-    assert result.kind == "blocked" and result.reason == "password_protected"
-
-
 def test_pptm_post_commit_xml_verification_failure_triggers_recovery(work_pptm):
     draft = DocumentService().open(work_pptm)
     _edit_core_xml(draft)

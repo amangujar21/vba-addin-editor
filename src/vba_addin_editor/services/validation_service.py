@@ -84,8 +84,6 @@ def validate_draft(draft: DocumentDraft) -> list[str]:
         if key in seen:
             problems.append(f"Duplicate module name: {m.current_name!r}.")
         seen[key] = m.id
-    if draft.baseline.safety.password_protected:
-        problems.append("The VBA project is password-protected.")
     problems.extend(validate_destructive_ops(draft))
     return problems
 

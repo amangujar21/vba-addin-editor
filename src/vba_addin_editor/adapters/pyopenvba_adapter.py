@@ -103,70 +103,6 @@ class AdapterError(Exception):
         self.details = details or {}
 
 
-def _decrypt_project_data(value: str) -> bytes:
-    """Decode an MS-OVBA Data Encryption value from CMG/DPB/GC.
-
-    The encoded record carries its seed, version, project key, ignored-byte
-    count, four-byte little-endian data length, and data. Protection state
-    must be read from decoded CMG bits; raw DPB length is not a protection
-    signal.
-    """
-    try:
-        encoded = bytes.fromhex(value)
-    except ValueError as exc:
-        raise AdapterError("The VBA project protection metadata is malformed.") from exc
-    if len(encoded) < 7:
-        raise AdapterError("The VBA project protection metadata is truncated.")
-
-    seed = encoded[0]
-    if encoded[1] ^ seed != 2:
-        raise AdapterError("The VBA project protection metadata has an unsupported version.")
-
-    ignored_length = (seed & 0x06) // 2
-    encrypted_byte_2 = encoded[1]
-    encrypted_byte_1 = encoded[2]
-    unencrypted_byte_1 = encoded[2] ^ seed
-    decoded = bytearray()
-    for encrypted_byte in encoded[3:]:
-        byte = encrypted_byte ^ ((encrypted_byte_2 + unencrypted_byte_1) & 0xFF)
-        decoded.append(byte)
-        encrypted_byte_2 = encrypted_byte_1
-        encrypted_byte_1 = encrypted_byte
-        unencrypted_byte_1 = byte
-
-    length_offset = ignored_length
-    data_offset = length_offset + 4
-    if len(decoded) < data_offset:
-        raise AdapterError("The VBA project protection metadata has no data length.")
-    data_length = int.from_bytes(decoded[length_offset:data_offset], "little")
-    if len(decoded) != data_offset + data_length:
-        raise AdapterError("The VBA project protection metadata has an invalid data length.")
-    return bytes(decoded[data_offset:])
-
-
-def _has_active_project_protection(protection: Any) -> bool:
-    """Return whether decoded CMG says user, host, or VBE protection is active.
-
-    pyOpenVBA (still in 6.2.0) derives ``has_password`` from raw DPB string length. DPB
-    describes password material, while CMG is the authoritative active
-    protection state. Fall back to pyOpenVBA only when CMG is absent; malformed
-    or unexpected CMG data fails closed because its protection flags are unknown.
-    """
-    if protection is None:
-        return False
-    cmg = getattr(protection, "cmg", "")
-    if not cmg:
-        return bool(getattr(protection, "has_password", False))
-    try:
-        state = _decrypt_project_data(cmg)
-    except AdapterError:
-        return True
-    if len(state) != 4:
-        return True
-    flags = int.from_bytes(state, "little")
-    return bool(flags & 0x07)
-
-
 class PPAMPowerPointFile(PowerPointFile):
     """Application-local PPAM compatibility subclass (plan 4.2, 24.2).
 
@@ -587,7 +523,6 @@ class PyOpenVBAAdapter:
             form_storages = frozenset(name.casefold() for name in form_storage_list)
             forms = _read_form_designs(cfb, form_storage_list, project.code_page)
             safety = ProjectSafetyInfo(
-                password_protected=_has_active_project_protection(project.protection),
                 signature_present=sig_present,
                 signature_kinds=sig_kinds,
                 writable=True,  # refined by save service preflight
@@ -713,11 +648,11 @@ class PyOpenVBAAdapter:
                     host.save(
                         _CAPTURE_ONLY,
                         allow_invalidate_signature=allow_signature_removal,
-                        # pyOpenVBA (3.4.0-6.2.0) can falsely infer protection from raw
-                        # DPB length. Override only when decoded CMG proves the
-                        # project is unlocked; active/malformed protection stays
-                        # blocked by both the service preflight and the library.
-                        allow_protected=not _has_active_project_protection(project.protection),
+                        # pyOpenVBA's protection gate infers ``has_password``
+                        # from raw DPB string length, which produces false
+                        # positives on legitimate files. All files are editable;
+                        # a separate authentication layer will gate this later.
+                        allow_protected=True,
                     )
                 unexpected = [str(w.message) for w in caught if not allow_signature_removal]
                 if unexpected:

@@ -812,13 +812,6 @@ def plan_port(
         return _blocked("Choose a different add-in: this is the file that is open.")
     if not _SUFFIX_RE.match(suffix):
         return _blocked("The name suffix must be 1-24 letters, digits or underscores.")
-    if source.baseline.safety.password_protected:
-        return _blocked(
-            f"{source.baseline.path.name}'s VBA project is password-protected; unlock it in "
-            "the VBA editor and save it first."
-        )
-    if target.baseline.safety.password_protected:
-        return _blocked("This add-in's VBA project is password-protected and read-only.")
     if target.baseline.package_safety.opc_signature_present:
         return _blocked(
             "This file has a package digital signature; editing its ribbon would break it."

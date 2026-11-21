@@ -1194,9 +1194,7 @@ class MainWindow:
                 self.proc_button.pack(side="left", after=self.crumb_proc_sep)
             self._update_procedure_crumb()
             note, style = "", "CrumbMuted.TLabel"
-            if draft is not None and draft.baseline.safety.password_protected:
-                note, style = "Password-protected project: VBA is read-only", "CrumbWarn.TLabel"
-            elif mod.is_new:
+            if mod.is_new:
                 note, style = "New module · not saved yet", "CrumbOk.TLabel"
             elif mod.origin_name and mod.current_name.casefold() != mod.origin_name.casefold():
                 note, style = f"Renamed from {mod.origin_name}", "CrumbInfo.TLabel"
@@ -1365,9 +1363,6 @@ class MainWindow:
         draft = self.draft
         mod = draft.module_by_id(self.current_module_id) if draft and self.current_module_id else None
         if draft is None or mod is None or mod.is_deleted:
-            return
-        if draft.baseline.safety.password_protected:
-            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
             return
         name = self._prompt_name("New Sub", "")
         if not name:
@@ -1675,11 +1670,6 @@ class MainWindow:
             )
         elif self._recovery_warning:
             self._set_banner(self._recovery_warning)
-        elif draft.baseline.safety.password_protected:
-            self._set_banner(
-                "This VBA project is password-protected. VBA editing is disabled; "
-                "XML package editing remains available for .xlam/.ppam/.pptm files."
-            )
         elif self._live_host_probe_failed:
             self._set_banner(
                 "Windows could not list running programs. Close Excel and PowerPoint "
@@ -2564,10 +2554,6 @@ class MainWindow:
         lines.extend(changes.summary_lines())
         lines += ["", "Safety"]
         lines.append("  ✓ File has not changed on disk")
-        if draft.baseline.safety.password_protected:
-            lines.append("  ! VBA project is password-protected")
-        elif has_vba:
-            lines.append("  ✓ VBA project is not password-protected")
         if draft.baseline.package_safety.opc_signature_present:
             lines.append("  ! OPC package signature detected")
         else:
@@ -2729,9 +2715,6 @@ class MainWindow:
     def add_module(self, *, standard: bool) -> None:
         draft = self.draft
         if draft is None:
-            return
-        if draft.baseline.safety.password_protected:
-            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
             return
         kind_label = "Standard" if standard else "Class"
         name = self._prompt_name(f"New {kind_label} Module", "")
@@ -3444,9 +3427,6 @@ class MainWindow:
         if draft is None:
             return False
         self._flush_all_editors()
-        if draft.baseline.safety.password_protected:
-            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
-            return False
         module_name, proc_name = rs.split_callback_name(callback.name)
         if not rs.is_valid_procedure_name(proc_name):
             messagebox.showerror(APP_NAME, f"'{callback.name}' is not a valid VBA procedure name.")
@@ -3506,9 +3486,6 @@ class MainWindow:
         mod, proc = self._cursor_procedure()
         if mod is None or proc is None:
             messagebox.showinfo(APP_NAME, "Put the cursor inside the Sub you want a button for.")
-            return
-        if draft.baseline.safety.password_protected:
-            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
             return
         if not self._ensure_ribbon("the button"):
             return
@@ -3732,9 +3709,6 @@ class MainWindow:
         if draft is None or self._saving:
             return
         self._flush_all_editors()
-        if draft.baseline.safety.password_protected:
-            messagebox.showwarning(APP_NAME, "This project is password-protected and read-only.")
-            return
         if draft.baseline.package_safety.opc_signature_present:
             messagebox.showinfo(
                 APP_NAME,

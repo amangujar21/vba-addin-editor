@@ -19,7 +19,6 @@ UNKNOWN = "unknown"
 CONFLICTING_METADATA = "conflicting_metadata"
 DECODING_LOSS = "decoding_loss"
 MISSING_PROJECT = "missing_project"
-PASSWORD_PROTECTED = "password_protected"
 
 RESTRICTION_MESSAGES = {
     READ_ONLY: "This module is marked read-only, so renaming or deleting it is disabled.",
@@ -51,7 +50,6 @@ RESTRICTION_MESSAGES = {
         "The VBA PROJECT stream is missing or unreadable, so renaming or "
         "deleting modules is disabled."
     ),
-    PASSWORD_PROTECTED: "This VBA project is password-protected and cannot be modified safely.",
 }
 
 

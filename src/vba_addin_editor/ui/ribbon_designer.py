@@ -1179,7 +1179,7 @@ class RibbonDesigner(ttk.Frame):
         plain_button = attr == "onAction" and rs.local_name(element.name) == "button"
         if plain_button and resolution.status == rs.STATUS_OK:
             match = resolution.matches[0]
-            if not rs.is_ribbon_ready(match.signature) and not draft.baseline.safety.password_protected:
+            if not rs.is_ribbon_ready(match.signature):
                 module = draft.module_by_id(match.module_id)
                 plan = app._plan_button_callback(module, match) if module is not None else None
                 if plan is None:
