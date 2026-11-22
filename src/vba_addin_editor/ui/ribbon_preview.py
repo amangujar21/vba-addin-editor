@@ -3,7 +3,8 @@
 It shows what the XML cannot: which controls are large, which stack three to a
 column, where the separators fall and how wide each group gets. Built-in icons
 (imageMso) are not available offline, so they are drawn as a neutral square;
-custom pictures are shown as they are. Clicking a control picks it.
+custom pictures are shown as they are. Clicking a control picks it; the faint
+"+" at the end of a custom group's name adds to that group.
 """
 
 from __future__ import annotations
@@ -63,19 +64,29 @@ class RibbonPreview(ttk.Frame):
         master,
         on_pick: Callable[[int], None],
         on_open: Callable[[int], None] | None = None,
+        *,
+        on_add: Callable[[int, int, int], None] | None = None,
+        on_context: Callable[[int, int, int], None] | None = None,
+        on_scroll: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, style="Panel.TFrame")
         self.on_pick = on_pick
         self.on_open = on_open
+        self.on_add = on_add  # (group index, x_root, y_root)
+        self.on_context = on_context  # (element index, x_root, y_root)
+        self.on_scroll = on_scroll
         self.canvas = tk.Canvas(self, height=HEIGHT, highlightthickness=0, cursor="hand2")
         self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
         self.canvas.configure(xscrollcommand=theme.autohide(self.hsb, side="bottom", fill="x"))
         self.canvas.pack(side="top", fill="x")
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.canvas.bind("<Configure>", lambda _e: self._center(), add=True)
         self._hits: list[tuple[int, int, int, int, int]] = []  # x1, y1, x2, y2, element index
+        self._adds: list[tuple[int, int, int, int, int]] = []  # the "+" of each group: x1, y1, x2, y2, group index
+        self._cells: dict[int, tuple[int, int, int, int]] = {}  # element index -> its box, canvas coordinates
         self._photos: list[tk.PhotoImage] = []
         self._focus_box: tuple[int, int] | None = None
         self._state: tuple | None = None
@@ -105,6 +116,8 @@ class RibbonPreview(ttk.Frame):
         canvas = self.canvas
         canvas.delete("all")
         self._hits.clear()
+        self._adds.clear()
+        self._cells.clear()
         self._photos.clear()
         self._focus_box = None
         tabs = [e for e in elements if rs.local_name(e.name) == "tab"]
@@ -170,14 +183,22 @@ class RibbonPreview(ttk.Frame):
                         self._focus_box = (x - 2, x + width + 2)
                     self._draw_cell(cell, x, y, width, image_for, cell.element.index in ancestors)
                     self._hits.append((x - 2, y, x + width + 2, y + height, cell.element.index))
+                    self._cells[cell.element.index] = (x - 2, y, x + width + 2, y + height)
                     y += height
                 x += width + 6
             x = max(x, left + group.width)
             label = element_label(group.element)
+            addable = self.on_add is not None and _addable(group.element)
             canvas.create_text(
-                (left + x) // 2, bottom + GROUP_LABEL // 2 + 1, text=label, font=theme.SMALL_FONT,
-                fill=colors.muted if group.element.index in selected else colors.faint,
+                (left + x - (14 if addable else 0)) // 2, bottom + GROUP_LABEL // 2 + 1, text=label,
+                font=theme.SMALL_FONT, fill=colors.muted if group.element.index in selected else colors.faint,
             )
+            if addable:
+                canvas.create_text(
+                    x, bottom + GROUP_LABEL // 2 + 1, anchor="e", text="+", font=theme.SMALL_BOLD_FONT,
+                    fill=colors.accent if group.element.index in selected else colors.faint,
+                )
+                self._adds.append((x - 14, bottom, x + 4, bottom + GROUP_LABEL, group.element.index))
             self._hits.append((left - 4, bottom, x + 4, bottom + GROUP_LABEL, group.element.index))
             self._hits.append((left - 4, top - 4, x + 4, bottom, group.element.index))
             x += 8
@@ -227,7 +248,8 @@ class RibbonPreview(ttk.Frame):
         if column:
             result.columns.append(column)
         body = sum(max(c.width for c in col) + 6 for col in result.columns)
-        result.width = max(body, self._measure(element_label(group)) + 12, 44)
+        extra = 16 if self.on_add is not None and _addable(group) else 0
+        result.width = max(body, self._measure(element_label(group)) + 12 + extra, 44)
         return result
 
     def _cell(self, element: rs.RibbonElement, name: str, in_group: bool) -> _Cell:
@@ -312,7 +334,20 @@ class RibbonPreview(ttk.Frame):
         if left < first + PAD or right > first + view - PAD:
             self.canvas.xview_moveto(max(left - view / 3, 0) / total)
 
+    def cell_box(self, index: int) -> tuple[int, int, int, int] | None:
+        """Where control ``index`` is drawn, in widget coordinates (None: not drawn)."""
+        box = self._cells.get(index)
+        if box is None:
+            return None
+        shift = int(self.canvas.canvasx(0))
+        return box[0] - shift, box[1], box[2] - shift, box[3]
+
     # -- picking ---------------------------------------------------------------
+
+    def add_at(self, x: int, y: int) -> int | None:
+        """The group whose "+" is at widget coordinates (x, y)."""
+        cx, cy = self.canvas.canvasx(x), self.canvas.canvasy(y)
+        return next((i for x1, y1, x2, y2, i in self._adds if x1 <= cx < x2 and y1 <= cy < y2), None)
 
     def element_at(self, x: int, y: int) -> int | None:
         """Index of the element drawn at widget coordinates (x, y)."""
@@ -320,6 +355,10 @@ class RibbonPreview(ttk.Frame):
         return next((i for x1, y1, x2, y2, i in self._hits if x1 <= cx < x2 and y1 <= cy < y2), None)
 
     def _on_click(self, event) -> None:
+        group = self.add_at(event.x, event.y)
+        if group is not None and self.on_add is not None:
+            self.on_add(group, event.x_root, event.y_root)
+            return
         index = self.element_at(event.x, event.y)
         if index is not None:
             self.on_pick(index)
@@ -329,6 +368,19 @@ class RibbonPreview(ttk.Frame):
         if index is not None and self.on_open is not None:
             self.on_open(index)
 
+    def _on_right_click(self, event) -> str:
+        index = self.element_at(event.x, event.y)
+        if index is not None and self.on_context is not None:
+            self.on_context(index, event.x_root, event.y_root)
+        return "break"
+
     def _on_wheel(self, event) -> str:
         self.canvas.xview_scroll(-3 if event.delta > 0 else 3, "units")
+        if self.on_scroll is not None:
+            self.on_scroll()
         return "break"
+
+
+def _addable(group: rs.RibbonElement) -> bool:
+    """A custom group (built-in ones cannot take controls of ours)."""
+    return group.complete and bool(group.attr("id"))

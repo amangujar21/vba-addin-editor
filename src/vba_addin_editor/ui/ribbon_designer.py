@@ -3,6 +3,8 @@
 This is the Ribbon view. The tree on the left is the ribbon (tab > group > menu
 > button); the strip on top draws the tab the selection is in; the form under
 it edits the selected control in place; the bottom shows the macro it runs.
+Clicking a menu in the drawing drops down its list (``menu_dropdown``), where
+macros, submenus and separators are opened, added and rearranged.
 Nothing here parses or writes XML itself: every change is a pure text edit from
 ``ribbon_service`` applied through ``MainWindow._batch_edit``, so it is one
 undo step and the XML view shows exactly what was done.
@@ -21,6 +23,7 @@ from vba_addin_editor.services import icon_service
 from vba_addin_editor.services import ribbon_service as rs
 from vba_addin_editor.ui import theme
 from vba_addin_editor.ui.highlight import TAGS, Highlighter
+from vba_addin_editor.ui.menu_dropdown import MenuDropdown, menu_of
 from vba_addin_editor.ui.ribbon_dialogs import ask_image_file
 from vba_addin_editor.ui.ribbon_preview import RibbonPreview, element_label
 from vba_addin_editor.ui.widgets import Sidebar, icon
@@ -588,7 +591,10 @@ class RibbonDesigner(ttk.Frame):
         ).pack(side="right")
         self.note = ttk.Label(bar, text="", style="CrumbWarn.TLabel")
         self.note.pack(side="right", padx=(8, 8))
-        self.preview = RibbonPreview(main, self._pick, self._open_index)
+        self.preview = RibbonPreview(
+            main, self._pick, self._open_index,
+            on_add=self._on_group_add, on_context=self._on_preview_context, on_scroll=self._sync_dropdown,
+        )
         self.preview.pack(fill="x", side="top")
         ttk.Frame(main, style="Line.TFrame", height=1).pack(fill="x", side="top")
         self.inspector = _Inspector(main, self)
@@ -610,6 +616,9 @@ class RibbonDesigner(ttk.Frame):
         self.empty_button.pack(anchor="w")
 
         self._build_menus()
+        self.dropdown = MenuDropdown(self)
+        self.bind("<Configure>", lambda _e: self._sync_dropdown(), add=True)
+        app.root.bind("<Button-1>", self._on_root_click, add="+")
         self._drop_line = tk.Frame(self.tree, height=2)
         tree = self.tree
         tree.bind("<<TreeviewSelect>>", self._on_select)
@@ -641,6 +650,11 @@ class RibbonDesigner(ttk.Frame):
         add.add_command(label="Separator", command=lambda: self.add_control("separator"))
         add.add_separator()
         add.add_command(label="Import from Another Add-in…", command=app.import_ribbon_control)
+        group_add = self.group_add_menu = tk.Menu(self, tearoff=0)
+        group_add.add_command(label="Button for a Macro…", command=lambda: self._group_add("macro"))
+        group_add.add_command(label="Menu", command=lambda: self._group_add("menu"))
+        group_add.add_command(label="Separator", command=lambda: self._group_add("separator"))
+        self._group_add_target: tuple[rs.RibbonElement, int, int] | None = None
         menu = self.context_menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Add Button", accelerator="Ins", command=lambda: self.add_control("button"))
         menu.add_command(label="Add Menu", command=lambda: self.add_control("menu"))
@@ -657,7 +671,7 @@ class RibbonDesigner(ttk.Frame):
         menu.add_separator()
         menu.add_command(label="Edit XML", command=self.show_xml)
         menu.add_command(label="Delete", accelerator="Del", command=self.delete_selected)
-        app._menus.extend([add, menu, self.part_menu])
+        app._menus.extend([add, menu, self.part_menu, group_add])
 
     def apply_palette(self) -> None:
         colors = theme.palette()
@@ -672,6 +686,8 @@ class RibbonDesigner(ttk.Frame):
         self.preview.apply_palette()
         self.peek.apply_palette()
         self.sidebar.apply_palette()
+        if hasattr(self, "dropdown"):
+            self.dropdown.apply_palette()
 
     # -- reading the draft -------------------------------------------------------
 
@@ -737,6 +753,7 @@ class RibbonDesigner(ttk.Frame):
 
     def show_part(self, path: str) -> None:
         self.inspector.commit_pending()
+        self.dropdown.close()
         self.part_path = path
         self._collapsed.clear()
         self.tree.selection_set(())
@@ -786,6 +803,8 @@ class RibbonDesigner(ttk.Frame):
     @staticmethod
     def _key(element: rs.RibbonElement) -> str:
         return element.attr("id") or element.attr("idMso") or f"#{element.index}"
+
+    key_of = _key
 
     def _filtering(self) -> bool:
         return bool(self.filter_var.get().strip()) or self._problems_only
@@ -879,6 +898,9 @@ class RibbonDesigner(ttk.Frame):
     def selected_elements(self) -> list[rs.RibbonElement]:
         found = [self._element_of(iid) for iid in self.tree.selection()]
         return sorted((e for e in found if e is not None), key=lambda e: e.start)
+
+    def selected_indices(self) -> frozenset[int]:
+        return frozenset(e.index for e in self.selected_elements())
 
     def selected_element(self) -> rs.RibbonElement | None:
         elements = self.selected_elements()
@@ -997,6 +1019,7 @@ class RibbonDesigner(ttk.Frame):
         self._show_peek(single)
         part = self._part()
         self.note.config(text="Read-only: malformed when opened" if part is not None and not part.editable else "")
+        self._sync_dropdown()
 
     def _tab_of(self, element: rs.RibbonElement | None) -> rs.RibbonElement | None:
         while element is not None and rs.local_name(element.name) != "tab":
@@ -1059,6 +1082,21 @@ class RibbonDesigner(ttk.Frame):
             if loc.is_standard and loc.kind == "Sub"
         }
         return sorted(names, key=str.casefold)
+
+    def macro_choices(self) -> list[tuple[str, str]]:
+        """(Sub, module) for each Sub a new button can run: standard module, no other arguments."""
+        draft = self.app.draft
+        if draft is None:
+            return []
+        found = {
+            (loc.name, loc.module_name)
+            for locations in rs.procedure_index(draft).values()
+            for loc in locations
+            if loc.is_standard
+            and loc.kind == "Sub"
+            and (rs.is_ribbon_ready(loc.signature) or not rs.takes_arguments(loc.signature))
+        }
+        return sorted(found, key=lambda item: (item[0].casefold(), item[1].casefold()))
 
     def image_names(self) -> list[str]:
         draft = self.app.draft
@@ -1281,12 +1319,7 @@ class RibbonDesigner(ttk.Frame):
             return False
         parent, after, name = place
         ids = self._all_ids()
-        sized = rs.local_name(parent.name) == "group" and kind in ("button", "menu")
-        size = ""
-        if sized:
-            siblings = [e for e in self.elements if e.parent == parent.index and rs.local_name(e.name) in _SIZED]
-            model = after if after is not None and after in siblings else (siblings[-1] if siblings else None)
-            size = "large" if model is None or model.attr("size") == "large" else ""
+        size = self._size_for(parent, after, kind)
         if kind == "button":
             ident = rs.unique_control_id(ids, "NewButton")
             xml = rs.build_button_xml(control_id=ident, label="New Button", on_action="", size=size)
@@ -1501,12 +1534,28 @@ class RibbonDesigner(ttk.Frame):
             self.sidebar.filter_entry.focus_set()
 
     def _pick(self, index: int) -> None:
-        if index < len(self.elements):
-            self.inspector.commit_pending()
-            self.select_start(self.elements[index].start)
+        """A click on the drawing: select the control; a menu also drops down (or folds up)."""
+        if index >= len(self.elements):
+            return
+        key = self._key(self.elements[index])
+        self.inspector.commit_pending()  # may rewrite the XML: find the control again by key
+        element = next((e for e in self.elements if self._key(e) == key), None)
+        if element is None:
+            return
+        drops = menu_of(self.elements, element) is not None
+        if drops and self.dropdown.root_key != key:
+            self.dropdown.set_root(key)
+        else:
+            self.dropdown.close()
+        self.select_start(element.start)
+        if self.dropdown.is_open:
+            self.dropdown.focus()
+        else:
             self.tree.focus_set()
 
     def _open_index(self, index: int) -> None:
+        if index < len(self.elements) and menu_of(self.elements, self.elements[index]) is not None:
+            return  # the first click already dropped it down
         self._pick(index)
         self.goto_macro()
 
@@ -1516,6 +1565,260 @@ class RibbonDesigner(ttk.Frame):
         if self.tree.identify_row(event.y) and self.goto_macro():
             return "break"
         return None
+
+    def _size_for(self, parent: rs.RibbonElement, after: rs.RibbonElement | None, kind: str) -> str:
+        """size= for a new button or menu in ``parent``: like its neighbour's (large in an empty group)."""
+        if rs.local_name(parent.name) != "group" or kind not in ("button", "menu"):
+            return ""
+        siblings = [e for e in self.elements if e.parent == parent.index and rs.local_name(e.name) in _SIZED]
+        model = after if after is not None and after in siblings else (siblings[-1] if siblings else None)
+        return "large" if model is None or model.attr("size") == "large" else ""
+
+    # -- menu drop-downs ------------------------------------------------------------------
+
+    def _sync_dropdown(self) -> None:
+        dropdown = getattr(self, "dropdown", None)
+        if dropdown is not None and dropdown.is_open:
+            dropdown.sync()
+
+    def _on_root_click(self, event) -> None:
+        """A click anywhere else in the window folds the drop-down up."""
+        dropdown = self.dropdown
+        if not dropdown.is_open and not dropdown.picker.shown:
+            return
+        widget = event.widget
+        if dropdown.contains(widget) or str(widget) == str(self.preview.canvas):
+            return
+        dropdown.close()
+
+    def open_dropdown(self, element: rs.RibbonElement) -> bool:
+        """Select a menu (or split button) and drop its list down under it in the drawing."""
+        if menu_of(self.elements, element) is None:
+            return False
+        self.dropdown.set_root(self._key(element))
+        self.select_start(element.start)
+        self.dropdown.focus()
+        return self.dropdown.is_open
+
+    def open_item(self, element: rs.RibbonElement) -> bool:
+        """A row of a drop-down was clicked: open the macro it runs (or select it, when it runs none)."""
+        self.dropdown.close()
+        self.select_start(element.start)
+        if rs.callback_attrs(element) and self.goto_macro():
+            return True
+        self.tree.focus_set()
+        return False
+
+    def reveal(self, element: rs.RibbonElement) -> None:
+        self.select_start(element.start)
+        self.tree.focus_set()
+
+    def _module_for_new_macro(self, module_name: str | None, parent: rs.RibbonElement | None):
+        """The standard module a new macro goes in: where its neighbours' macros are, else the busiest."""
+        draft = self.app.draft
+        if draft is None:
+            return None
+        standard = [m for m in draft.modules if not m.is_deleted and m.pyopenvba_kind == "standard"]
+        if module_name is not None:
+            found = draft.find_current(module_name)
+            return found if found in standard else None
+        if not standard:
+            return None
+        score: dict[str, int] = {}
+        if parent is not None:
+            for sibling in self.elements:
+                if sibling.parent != parent.index:
+                    continue
+                for _attr, name in rs.callback_attrs(sibling):
+                    for match in self.resolve(name).matches:
+                        score[match.module_id] = score.get(match.module_id, 0) + 100
+        for entry in rs.ribbon_entries(draft):
+            for match in entry.resolution.matches:
+                score[match.module_id] = score.get(match.module_id, 0) + 1
+        return max(standard, key=lambda m: score.get(m.id, 0))
+
+    def _macro_plan(self, name: str, element_name: str, parent: rs.RibbonElement | None):
+        """(onAction value, module to change or None, its new body or None, note) to run macro ``name``.
+
+        A plain Sub gets a small callback that calls it; a name that is no macro yet
+        becomes a new, empty callback Sub. None (and a status line) when it cannot be.
+        """
+        app = self.app
+        draft = app.draft
+        if draft is None:
+            return None
+        name = name.strip()
+        resolution = self.resolve(name)
+        if resolution.status == rs.STATUS_OK:
+            match = resolution.matches[0]
+            if element_name == "button" and match.is_standard and not rs.is_ribbon_ready(match.signature):
+                module = draft.module_by_id(match.module_id)
+                plan = app._plan_button_callback(module, match) if module is not None else None
+                if module is None or plan is None:
+                    return None
+                callback, wrapper, _note = plan
+                if wrapper:
+                    body = rs.append_procedure(module.body, wrapper)[0]
+                    return callback, module, body, f" ({callback} in {module.current_name} calls {match.name})"
+                return callback, None, None, ""
+            return name, None, None, ""
+        if resolution.status != rs.STATUS_MISSING:
+            return name, None, None, f". {resolution.message}" if resolution.message else ""
+        module_name, proc = rs.split_callback_name(name)
+        if not rs.is_valid_procedure_name(proc):
+            app.status.config(text=f'"{name}" is not a valid VBA procedure name.')
+            return None
+        module = self._module_for_new_macro(module_name, parent)
+        if module is None:
+            app.status.config(
+                text=f"There is no standard module {module_name} to add {proc} to."
+                if module_name
+                else "A new macro needs a standard module to go in. Add one in the Code view first."
+            )
+            return None
+        stub = rs.callback_stub(proc, "onAction", element_name)
+        body = rs.append_procedure(module.body, stub)[0]
+        return name, module, body, f", a new Sub in {module.current_name}: click it to write the code"
+
+    def insert_at(
+        self, parent: rs.RibbonElement, slot: int | None, kind: str, *, macro: str = "", label: str = ""
+    ) -> str | None:
+        """Add to ``parent`` (a menu or group) before its ``slot``-th control (None or past the end: last).
+
+        ``kind`` is "button" (running ``macro``), "menu" or "separator". Returns the new control's id.
+        """
+        app = self.app
+        if app.draft is None:
+            return None
+        self.inspector.commit_pending()
+        if self._editable_part() is None:
+            return None
+        current = self._resolve(self.text, parent, self.text)
+        if current is None:
+            return None
+        local = rs.local_name(current.name)
+        items = [e for e in self.elements if e.parent == current.index and e.complete]
+        before = items[slot] if slot is not None and slot < len(items) else None
+        after = items[slot - 1] if slot is not None and 0 < slot <= len(items) else (items[-1] if items else None)
+        ids = self._all_ids()
+        size = self._size_for(current, after, kind)
+        new_body = module = None
+        if kind == "button":
+            plan = self._macro_plan(macro, "button", current)
+            if plan is None:
+                return None
+            callback, module, new_body, note = plan
+            proc = rs.split_callback_name(macro)[1]
+            ident = rs.unique_control_id(ids, proc)
+            text_label = label or rs.suggested_label(proc)
+            xml = rs.build_button_xml(control_id=ident, label=text_label, on_action=callback, size=size)
+            status = f'Added "{text_label}", which runs {callback}{note}.'
+            element_name = "button"
+        elif kind == "menu":
+            ident = rs.unique_control_id(ids, "NewMenu", "mnu")
+            xml = rs.build_menu_xml(control_id=ident, label="New Menu", size=size, indent="", unit="")
+            status = "Added a submenu: type its name." if local == "menu" else "Added a menu: type its name."
+            element_name = "menu"
+        else:
+            taken = {item.casefold() for item in ids}
+            ident = next(f"sep{n}" for n in range(1, len(taken) + 2) if f"sep{n}" not in taken)
+            element_name = "menuSeparator" if local == "menu" else "separator"
+            xml = rs.build_separator_xml(control_id=ident, in_menu=element_name == "menuSeparator")
+            status = "Added a separator."
+        if not rs.can_contain(current, element_name):
+            app.status.config(text=f"A {local} cannot hold a {element_name}.")
+            return None
+
+        def transform(text: str, target: rs.RibbonElement):
+            sibling = self._resolve(text, before, self.text) if before is not None else None
+            new_text, offset, _length = rs.insert_child(text, target, xml, before=sibling)
+            return new_text, offset
+
+        def also() -> None:
+            if module is not None and new_body is not None:
+                module.body = new_body
+
+        if not self._apply(
+            current, self.text, transform, also=also if new_body is not None else None,
+            status=status + " Nothing is written until you save.",
+        ):
+            return None
+        if kind == "menu":
+            self._fresh.add(ident)
+        return ident
+
+    def change_macro(self, element: rs.RibbonElement, macro: str) -> bool:
+        """Point ``element``'s onAction at ``macro`` (a new name becomes a new, empty Sub)."""
+        if self.app.draft is None or not macro.strip():
+            return False
+        self.inspector.commit_pending()
+        plan = self._macro_plan(macro, rs.local_name(element.name), self.parent_of(element))
+        if plan is None:
+            return False
+        callback, module, new_body, note = plan
+
+        def also() -> None:
+            if module is not None and new_body is not None:
+                module.body = new_body
+
+        return self._apply(
+            element, self.text,
+            lambda text, target: rs.set_element_attrs(text, target, {"onAction": callback}),
+            also=also if new_body is not None else None,
+            status=f"{element_label(element) or 'The control'} runs {callback}{note}.",
+        )
+
+    def rename_control(self, element: rs.RibbonElement, label: str) -> bool:
+        self.inspector.commit_pending()
+        return self.set_label(element, self.text, label)
+
+    def move_control(self, element: rs.RibbonElement, direction: int) -> bool:
+        if not self.select_start(element.start):
+            return False
+        return self.move_selected(direction)
+
+    def delete_control(self, element: rs.RibbonElement) -> bool:
+        if not self.select_start(element.start):
+            return False
+        return self.delete_selected()
+
+    def _on_group_add(self, index: int, x_root: int, y_root: int) -> None:
+        """The "+" after a group's name in the drawing: what to add to that group."""
+        if index >= len(self.elements):
+            return
+        self.dropdown.close()
+        group = self.elements[index]
+        self.select_start(group.start)
+        self._group_add_target = (group, x_root, y_root)
+        self.group_add_menu.tk_popup(x_root, y_root)
+
+    def _group_add(self, what: str) -> None:
+        if self._group_add_target is None:
+            return
+        group, x_root, y_root = self._group_add_target
+        self.add_to_group(group, what, x_root - self.winfo_rootx(), y_root - self.winfo_rooty())
+
+    def add_to_group(self, group: rs.RibbonElement, what: str, x: int = 40, y: int = 120) -> None:
+        """Add to the end of ``group``: "macro" (asks which, picker at x, y), "menu" or "separator"."""
+        if what == "macro":
+            self.dropdown.pick_macro(
+                f"Add a button to {element_label(group) or 'the group'}", x, y,
+                lambda name, label: self.insert_at(group, None, "button", macro=name, label=label),
+            )
+            return
+        ident = self.insert_at(group, None, what)
+        if ident and what == "menu":
+            self.after_idle(self.inspector.focus_label)
+
+    def _on_preview_context(self, index: int, x_root: int, y_root: int) -> None:
+        if index >= len(self.elements):
+            return
+        self.dropdown.close()
+        element = self.elements[index]
+        self.select_start(element.start)
+        iid = f"e{element.index}"
+        menu = self.prepare_context_menu(iid if self.tree.exists(iid) else "")
+        menu.tk_popup(x_root, y_root)
 
     # -- right-click ------------------------------------------------------------------------
 

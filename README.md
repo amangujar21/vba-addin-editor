@@ -99,6 +99,19 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   - **+** or **Ins** adds a button at the selection and puts the cursor in
     Label; its id follows the label until you give it one. The + menu also
     adds a menu, group or separator.
+  - Clicking a menu (or split button) in the drawing drops down its list,
+    as Office does: each row shows the macro it runs (⚠ when it is
+    missing). Click a row to open its macro in the Code view; a row with no
+    macro asks for one; a submenu opens beside its row. Hover the line
+    between two rows for **+ Macro**, **+ Submenu** and **+ Separator**
+    there; the same buttons at the bottom add at the end. **+ Macro** opens a
+    list of your Subs to filter; a name that is not a Sub yet becomes a new
+    empty callback Sub (in the module the menu's other macros use) that you
+    can click to write. A new submenu is named in place. Right-click a row to
+    change its macro, rename, insert above/below, move or delete it. Esc or a
+    click elsewhere closes the list.
+  - The faint **+** after a custom group's name in the drawing adds a button
+    for a macro, a menu or a separator at the end of that group.
   - Typing a macro name that exists links it; a plain `Sub X()` gets its
     `XCallback(control As IRibbonControl)` wrapper. A name that does not
     exist shows **Create Sub**.
