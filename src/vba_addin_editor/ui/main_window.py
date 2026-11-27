@@ -15,7 +15,6 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import TypeVar
 
-from vba_addin_editor.adapters.ooxml_package_adapter import XML_EDITABLE_EXTENSIONS
 from vba_addin_editor.adapters.pyopenvba_adapter import AdapterError, enable_source_disk_cache
 from vba_addin_editor.domain.capabilities import RESTRICTION_MESSAGES
 from vba_addin_editor.domain.changes import compute_changes, dirty_count
@@ -70,6 +69,8 @@ from vba_addin_editor.ui.command_palette import (
     PaletteItem,
 )
 from vba_addin_editor.ui.conflict_dialog import ConflictDialog
+from vba_addin_editor.ui.document_tabs import TabsMixin
+from vba_addin_editor.ui.export_dialog import ExportDialog
 from vba_addin_editor.ui.form_designer import FormDesigner
 from vba_addin_editor.ui.review_dialog import REVERT, SAVE, ReviewView, ask_review, entry_from_item
 from vba_addin_editor.ui.ribbon_designer import RibbonDesigner
@@ -174,17 +175,20 @@ def _draft_signature(draft: DocumentDraft) -> str:
     return digest.hexdigest()
 
 
-class MainWindow:
+def _export_key(draft: DocumentDraft, module: ModuleDraft) -> str:
+    """The copy dialog's row for a whole module or UserForm."""
+    return ("f:" if draft.is_form(module) else "mod:") + module.current_name
+
+
+class MainWindow(TabsMixin):
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.draft: DocumentDraft | None = None
-        self.session = None
-        self.current_module_id: str | None = None
+        # Each open add-in is a tab; self.draft, self.session, ... are the active tab's.
+        self._init_tabs()
         self._saving = False
         self._live_host_running = False
         self._live_host_probe_failed = False
         self._host_label = "Office"
-        self._recovery_warning = ""
         self._idle_after = None
         self._max_after = None
         self._poll_after = None
@@ -200,8 +204,6 @@ class MainWindow:
         self._last_xml_text = ""
         self._follow_after = None
         self._shown_view = ""
-        # Where a ribbon edit is shown afterwards: the view used last, "design" or "xml".
-        self._ribbon_surface = "design"
         self.doc_service = DocumentService()
         session_root = os.environ.get("VBAAE_SESSION_ROOT")
         if session_root:
@@ -231,6 +233,7 @@ class MainWindow:
         self.save_service.auto_backup = self.settings.auto_backup
         self.auto_backup_var = tk.BooleanVar(master=root, value=self.settings.auto_backup)
         self.live_reload_var = tk.BooleanVar(master=root, value=self.settings.live_reload)
+        self.reopen_tabs_var = tk.BooleanVar(master=root, value=self.settings.reopen_tabs)
         if root_path is None:
             enable_source_disk_cache(appdata_root() / "source-cache" / f"pyopenvba-{PYOPENVBA_PIN}")
 
@@ -264,7 +267,13 @@ class MainWindow:
         self._recovery_after = None
         self._schedule_host_poll()
         if not os.environ.get("PYTEST_CURRENT_TEST"):
-            self._recovery_after = self.root.after_idle(self._offer_recovery)
+            self._recovery_after = self.root.after_idle(self._startup)
+
+    def _startup(self) -> None:
+        """After the window is up: offer recovered drafts, then reopen last time's tabs."""
+        self._recovery_after = None
+        self._offer_recovery()
+        self.reopen_tabs()
 
     # -- construction ------------------------------------------------------
 
@@ -304,7 +313,14 @@ class MainWindow:
         self._menus.append(self.recent_menu)
         file_menu.add_cascade(label="Open Recent", menu=self.recent_menu)
         file_menu.add_command(label="Save File", accelerator="Ctrl+S", command=self.save)
+        file_menu.add_command(label="Save All", accelerator="Ctrl+Alt+S", command=self.save_all)
         file_menu.add_command(label="Save a Copy…", accelerator="Ctrl+Shift+S", command=self.save_copy)
+        file_menu.add_command(label="Close Tab", accelerator="Ctrl+W", command=self.close_active_tab)
+        file_menu.add_checkbutton(
+            label="Reopen Tabs on Start",
+            variable=self.reopen_tabs_var,
+            command=self._on_reopen_tabs_toggled,
+        )
         file_menu.add_separator()
         file_menu.add_command(label="Back Up Now", command=self.backup_now)
         file_menu.add_checkbutton(
@@ -321,6 +337,9 @@ class MainWindow:
         file_menu.add_command(label="Backup Browser…", command=self.backup_browser)
         file_menu.add_command(label="Compare External Changes…", command=self.compare_external_changes)
         file_menu.add_command(label="Open File Location", command=self.open_location)
+        file_menu.add_separator()
+        file_menu.add_command(label="Copy to Another Add-in…", command=lambda: self.export_to())
+        file_menu.add_command(label="Copy from Another Add-in…", command=lambda: self.import_from())
         file_menu.add_separator()
         file_menu.add_command(label="Export Source Folder…", command=self.export_source_folder)
         file_menu.add_command(label="Preview Folder Changes…", command=self.preview_folder_changes)
@@ -351,6 +370,9 @@ class MainWindow:
         )
         module_menu.add_command(label="Rename…", command=self.rename_module)
         module_menu.add_command(label="Delete", command=self.delete_module)
+        module_menu.add_command(
+            label="Copy Module to Another Add-in…", command=self.export_current_module
+        )
         module_menu.add_separator()
         module_menu.add_command(label="Import .bas/.cls…", command=self.import_file)
         module_menu.add_command(label="Export Current Module…", command=self.export_module)
@@ -368,6 +390,9 @@ class MainWindow:
         ribbon_menu.add_command(label="Add Separator", command=lambda: self.add_ribbon_control("separator"))
         ribbon_menu.add_command(
             label="Import Button from Another Add-in…", command=self.import_ribbon_control
+        )
+        ribbon_menu.add_command(
+            label="Copy Controls to Another Add-in…", command=self.export_ribbon_selection
         )
         ribbon_menu.add_separator()
         ribbon_menu.add_command(
@@ -496,6 +521,9 @@ class MainWindow:
             self._fit_header()
 
     def _build_panes(self) -> None:
+        # One browser-style tab per open add-in, under the header (packed once a file is open).
+        self._build_tab_strip()
+        self.tab_strip_line.configure(background=theme.palette().border)
         # The activity rail picks the view; the notebook keeps the pages but shows no tabs.
         self.rail = ttk.Frame(self.root, style="Chrome.TFrame", padding=(0, 6, 0, 6))
         self.rail.pack(side="left", fill="y")
@@ -825,6 +853,8 @@ class MainWindow:
         self.host_dot.configure(background=colors.bg0)
         self.welcome_card.configure(background=colors.bg2, highlightbackground=colors.border_strong)
         self.ribbon_designer.apply_palette()
+        self.tab_strip.apply_palette()
+        self.tab_strip_line.configure(background=colors.border)
         palette_window = self.command_palette.window
         if palette_window is not None:
             palette_window.destroy()  # rebuilt with the new colours when next opened
@@ -929,6 +959,13 @@ class MainWindow:
         self._menus.append(self.outline_menu)
         self.outline_menu.add_command(label="Add Ribbon Button for This Macro…", command=self.add_ribbon_button)
         self.outline_menu.add_command(label="Show Its Ribbon Button", command=self.show_buttons_for_macro)
+        self.outline_menu.add_separator()
+        self.outline_menu.add_command(
+            label="Copy Macro to Another Add-in…", command=self.export_current_macro
+        )
+        # A macro or module dragged onto another add-in's tab is copied there.
+        self._bind_drag_to_tab(self.outline, self._outline_drag_keys)
+        self._bind_drag_to_tab(self.tree, self._module_drag_keys)
         lists.add(outline, weight=2)
         self._outline_rows: dict[str, int] = {}
         self._outline_signature: tuple | None = None
@@ -1311,6 +1348,13 @@ class MainWindow:
         self.root.bind("<Control-n>", lambda _e: self.new_file())
         self.root.bind("<Control-s>", lambda _e: self.save())
         self.root.bind("<Control-S>", lambda _e: self.save_copy())
+        self.root.bind("<Control-Alt-s>", lambda _e: self.save_all())
+        self.root.bind("<Control-w>", lambda _e: self.close_active_tab())
+        self.root.bind("<Control-F4>", lambda _e: self.close_active_tab())
+        self.root.bind("<Control-Tab>", lambda _e: self.next_tab(1))
+        self.root.bind("<Control-Shift-Tab>", lambda _e: self.next_tab(-1))
+        self.root.bind("<Control-Next>", lambda _e: self.next_tab(1))
+        self.root.bind("<Control-Prior>", lambda _e: self.next_tab(-1))
         # Reached only when focus is outside an editor's text; the text widget
         # handles these keys itself and stops them there.
         self.root.bind("<Control-f>", lambda _e: self.find_in_editor())
@@ -1361,6 +1405,12 @@ class MainWindow:
                         lambda m=menu, i=index: m.invoke(i),
                     )
                 )
+        for tab in self.other_tabs():
+            items.append(
+                PaletteItem(
+                    COMMAND, f"Switch to {tab.path.name}", "Tab", "", lambda k=tab.key: self.select_tab(k)
+                )
+            )
         for path in self._recent_files():
             items.append(PaletteItem(COMMAND, f"Open {path.name}", "Recent", "", lambda p=path: self.open_recent(p)))
         draft = self.draft
@@ -1551,6 +1601,7 @@ class MainWindow:
 
     def _refresh_state(self) -> None:
         draft = self.draft
+        self._update_tab_strip()
         self._show_wait_bar()
         self._update_status_cells()
         if draft is None:
@@ -1840,11 +1891,19 @@ class MainWindow:
             return
         self.load_path(Path(path))
 
-    def load_path(self, path: Path, *, written=None) -> bool:
-        """Open ``path``; ``written`` = (bytes, fingerprint) of a file this editor just made."""
+    def load_path(self, path: Path, *, written=None, remember: bool = True) -> bool:
+        """Open ``path`` in a new tab (or show its tab when it is open already).
+
+        ``written`` = (bytes, fingerprint) of a file this editor just made.
+        """
         if self._saving:
             return False
         self._flush_all_editors()
+        existing = self.tab_for_path(path)
+        if existing is not None and existing.is_dirty():
+            self.select_tab(existing.key)  # its unsaved changes stay; nothing is re-read
+            self.status.config(text=f"{path.name} is already open, with unsaved changes.")
+            return True
 
         def work():
             try:
@@ -1868,30 +1927,12 @@ class MainWindow:
             return False
         finally:
             self._saving = False
-        if self.session is not None:
-            self.session_service.close(self.session)
-        self.session = session
-        self.draft = draft
-        self._refresh_host_status()
-        self.current_module_id = None
-        self.current_xml_part_path = None
-        self._refresh_tree()
-        self._refresh_xml_tree()
-        xml_supported = path.suffix.lower() in XML_EDITABLE_EXTENSIONS
-        for tab in (self.xml_tab, self.ribbon_tab):
-            self.editor_notebook.tab(tab, state="normal" if xml_supported else "disabled")
-        if xml_supported:
-            self.xml_editor.set_part_info(None)
-            self.xml_editor.text.config(state="normal")
-            self.xml_editor.set_text("")
-            self.validate_xml_btn.config(state="disabled")
-        first = next((m.id for m in draft.modules if not m.is_deleted), None)
-        if first:
-            self.tree.selection_set(first)
-        self._ribbon_surface = "design"
-        self._refresh_ribbon_views()
-        self._refresh_state()
-        self._remember_recent(path)
+        if existing is not None and existing in self._tabs:
+            self._replace_tab(existing, session, draft)  # opened again: read afresh, same place
+        else:
+            self._add_tab(session, draft)
+        if remember:
+            self._remember_recent(path)
         self.status.config(text=f"Opened {path.name}")
         self._offer_icon_repair()
         return True
@@ -2224,27 +2265,45 @@ class MainWindow:
         self._schedule_queued_save_poll()
 
     def cancel_queued_save(self) -> None:
+        """The active tab no longer waits to save (other tabs keep waiting)."""
+        if self._queued_save is not None:
+            self._queued_save = None
+            self._refresh_state()
+        if not any(t.queued_save is not None for t in self._tabs):
+            self._stop_queued_save_poll()
+
+    def _stop_queued_save_poll(self) -> None:
         if self._queue_after is not None:
             try:
                 self.root.after_cancel(self._queue_after)
             except tk.TclError:
                 pass
             self._queue_after = None
-        if self._queued_save is not None:
-            self._queued_save = None
-            self._refresh_state()
 
     def _schedule_queued_save_poll(self) -> None:
+        self._stop_queued_save_poll()
         self._queue_after = self.root.after(QUEUED_SAVE_POLL_MS, self._poll_queued_save)
 
     def _poll_queued_save(self) -> None:
         self._queue_after = None
-        if self._queued_save is None or self.draft is None:
-            self.cancel_queued_save()
+        waiting = [t for t in self._tabs if t.queued_save is not None and t.draft is not None]
+        if not waiting:
             return
-        if self._saving or self.save_service.host_block(self.draft.baseline.path) is not None:
+        if self._saving:
             self._schedule_queued_save_poll()
             return
+        # The active tab first; another tab is brought forward when its file is free.
+        waiting.sort(key=lambda t: t is not self._tab)
+        free = next(
+            (t for t in waiting if self.save_service.host_block(t.draft.baseline.path) is None), None
+        )
+        if free is None:
+            self._schedule_queued_save_poll()
+            return
+        if free is not self._tab:
+            self.select_tab(free.key)
+        if len(waiting) > 1:
+            self._schedule_queued_save_poll()
         self._flush_all_editors()
         reviewed = self._queued_save
         self._queued_save = None
@@ -3183,6 +3242,16 @@ class MainWindow:
         if self._max_after is None:
             self._max_after = self.root.after(MAX_INTERVAL_MS, self._checkpoint_now)
 
+    def _cancel_autosave(self) -> None:
+        for attr in ("_idle_after", "_max_after"):
+            handle = getattr(self, attr)
+            if handle is not None:
+                try:
+                    self.root.after_cancel(handle)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+
     def _checkpoint_now(self, _event=None) -> None:
         self._idle_after = None
         if self._max_after is not None:
@@ -3939,12 +4008,23 @@ class MainWindow:
             ps.apply_port(draft, plan)
 
         self._batch_edit(mutate)
+        added = len(plan.new_module_ids)
         if plan.part_path:
             self._reveal_ribbon(plan.part_path, plan.element_offset, plan.element_length)
-        added = len(plan.new_module_ids)
-        modules = f" and {added} module(s)" if added else ""
+            modules = f" and {added} module(s)" if added else ""
+            what = f"the ribbon control(s){modules}"
+        else:
+            new = [m for m in draft.modules if m.id in plan.new_module_ids]
+            forms = [m for m in new if draft.is_form(m)]
+            if forms:
+                self._show_view(2)
+                self.form_designer.select(forms[0].current_name)
+            elif new:
+                self._open_module_at(new[0].id, 1)
+            changed = len(plan.changed_module_ids)
+            what = f"{added} new module(s)" + (f", {changed} changed" if changed else "")
         self.status.config(
-            text=f"Imported the control{modules}. Nothing is written until Save File."
+            text=f"Copied {what} into {draft.baseline.path.name}. Nothing is written until Save File."
         )
         if plan.warnings:
             messagebox.showinfo(
@@ -3953,6 +4033,179 @@ class MainWindow:
                 + "\n".join(f"• {w}" for w in plan.warnings),
             )
         return True
+
+    # -- copying between add-ins (open tabs or files) ---------------------------------
+
+    def export_to(self, target_key: str | None = None, preselect=()) -> bool:
+        """Copy from the add-in shown into another: an open tab, or a file opened in a new tab."""
+        source = self._tab
+        if source is None or self._saving:
+            return False
+        self._flush_all_editors()
+        target = self.tab_by_key(target_key) if target_key else self._choose_other_addin(
+            "Copy to Another Add-in", f"Copy from {source.path.name} into which add-in?", open_file=True
+        )
+        if target is None:
+            return False
+        if target is source:
+            messagebox.showinfo(APP_NAME, "Choose a different add-in: this is the file that is open.")
+            return False
+        plan = self.ask_export(
+            source.draft, target.draft, preselect=list(preselect), title=f"Copy to {target.path.name}"
+        )
+        return plan is not None and self.apply_export(target, plan)
+
+    def import_from(self, path: Path | None = None, preselect=()) -> bool:
+        """Copy into the add-in shown, from an open tab or from a file (read only, not opened)."""
+        target = self._tab
+        if target is None or self._saving:
+            return False
+        self._flush_all_editors()
+        source_draft = None
+        if path is None:
+            chosen = self._choose_other_addin(
+                "Copy from Another Add-in", f"Copy into {target.path.name} from which add-in?"
+            )
+            if chosen is None:
+                return False
+            if isinstance(chosen, Path):
+                path = chosen
+            else:
+                source_draft = chosen.draft
+        if source_draft is None:
+            assert path is not None
+            open_tab = self.tab_for_path(path)
+            if open_tab is target:
+                messagebox.showinfo(APP_NAME, "Choose a different add-in: this is the file that is open.")
+                return False
+            source_draft = open_tab.draft if open_tab is not None else self.load_port_source(path)
+            if source_draft is None:
+                return False
+        plan = self.ask_export(
+            source_draft, target.draft, preselect=list(preselect), title=f"Copy into {target.path.name}"
+        )
+        return plan is not None and self.apply_export(target, plan)
+
+    def _choose_other_addin(self, title: str, prompt: str, *, open_file: bool = False):
+        """Another open tab; or a file: opened in a new tab (``open_file``), else its path."""
+        others = self.other_tabs()
+        index = len(others)
+        if others:
+            options = [f"{t.path.name}   (open, {t.path.parent})" for t in others]
+            options.append("Another add-in file…")
+            index = choose(self.root, title, prompt, options)
+            if index is None:
+                return None
+        if index < len(others):
+            return others[index]
+        chosen = filedialog.askopenfilename(title=title, filetypes=_FILETYPES)
+        if not chosen:
+            return None
+        path = Path(chosen)
+        if not open_file:
+            return path
+        source = self._tab
+        if source is not None and self.tab_for_path(path) is source:
+            return source  # refused by the caller
+        if not self.load_path(path):
+            return None
+        return self.tab_for_path(path)
+
+    def ask_export(self, source: DocumentDraft, target: DocumentDraft, *, preselect=(), title: str = ""):
+        """The copy dialog; the confirmed plan (computed on a copy of ``target``) or None."""
+        dialog = ExportDialog(
+            self.root,
+            source=source,
+            target_name=target.baseline.path.name,
+            targets_for=lambda control: ps.port_targets(target, control),
+            plan=lambda items, suffix, label: ps.plan_export(
+                source, target, items, suffix=suffix, group_label=label
+            ),
+            suffix=ps.default_suffix(target),
+            show_part=len([p for p in rs.ribbon_parts(target) if p.editable]) > 1,
+            preselect=preselect,
+            title=title or "Copy to Another Add-in",
+        )
+        return dialog.wait()
+
+    def apply_export(self, target_tab, plan: ps.PortPlan) -> bool:
+        """Apply a copy into ``target_tab`` (shown first) as one undoable edit there."""
+        if target_tab not in self._tabs or not plan.ok:
+            return False
+        if target_tab is not self._tab and not self.select_tab(target_tab.key):
+            return False
+        return self.apply_port_plan(plan)
+
+    def export_current_macro(self) -> bool:
+        module = self.draft.module_by_id(self.current_module_id) if self.draft and self.current_module_id else None
+        proc = self._current_procedure()
+        if module is None or proc is None:
+            return False
+        return self.export_to(preselect=[f"m:{module.current_name}.{proc}"])
+
+    def export_current_module(self) -> bool:
+        module = self._selected_module() or (
+            self.draft.module_by_id(self.current_module_id) if self.draft and self.current_module_id else None
+        )
+        if module is None:
+            return False
+        return self.export_to(preselect=[_export_key(self.draft, module)])
+
+    def export_ribbon_selection(self, target_key: str | None = None) -> bool:
+        return self.export_to(target_key, preselect=self.ribbon_designer.export_keys())
+
+    # Dragging onto a tab: what is being dragged, as export keys.
+
+    def _outline_drag_keys(self) -> list[str]:
+        module = self.draft.module_by_id(self.current_module_id) if self.draft and self.current_module_id else None
+        proc = self._current_procedure()
+        return [f"m:{module.current_name}.{proc}"] if module is not None and proc else []
+
+    def _module_drag_keys(self) -> list[str]:
+        module = self._selected_module()
+        return [_export_key(self.draft, module)] if module is not None else []
+
+    def _bind_drag_to_tab(self, widget, keys) -> None:
+        """Dragging from ``widget`` onto another tab copies ``keys()`` into that add-in."""
+        state: dict = {}
+
+        def press(event) -> None:
+            state.clear()
+            state.update(x=event.x_root, y=event.y_root, moving=False)
+
+        def motion(event) -> None:
+            if not state or self._saving or len(self._tabs) < 2:
+                return
+            if not state["moving"] and abs(event.x_root - state["x"]) + abs(event.y_root - state["y"]) < 8:
+                return
+            state["moving"] = True
+            self.drag_over_tabs(event.x_root, event.y_root)
+
+        def release(event) -> None:
+            moving = state.get("moving")
+            state.clear()
+            if moving:
+                self.drop_on_tab(event.x_root, event.y_root, keys())
+
+        widget.bind("<ButtonPress-1>", press, add=True)
+        widget.bind("<B1-Motion>", motion, add=True)
+        widget.bind("<ButtonRelease-1>", release, add=True)
+
+    def drag_over_tabs(self, x_root: int, y_root: int) -> bool:
+        """Highlight the other add-in's tab under the pointer; True when there is one."""
+        key = self.tab_strip.tab_at(x_root, y_root)
+        if key is not None and self._tab is not None and key == self._tab.key:
+            key = None
+        self.tab_strip.show_drop(key)
+        return key is not None
+
+    def drop_on_tab(self, x_root: int, y_root: int, keys) -> bool:
+        """A drag ended: over another tab, copy ``keys`` there (the dialog shows how)."""
+        key = self.tab_strip.tab_at(x_root, y_root)
+        self.tab_strip.show_drop(None)
+        if key is None or self._tab is None or key == self._tab.key or not keys:
+            return False
+        return self.export_to(key, preselect=list(keys))
 
     # -- ribbon structure: move, group into menu, custom icons ----------------------
 
@@ -4343,32 +4596,24 @@ class MainWindow:
         text.config(state="disabled")
 
     def _adopt_session(self, session) -> None:
-        if self.session is not None and self.session is not session:
-            self.session_service.close(self.session)
-        self.session = session
-        self.draft = session.draft
-        self.current_module_id = None
-        self.current_xml_part_path = None
+        """Show a recovered session: in its own tab, or in place of the same file's tab."""
         path = session.original_path
-        xml_supported = path.suffix.lower() in XML_EDITABLE_EXTENSIONS
-        for tab in (self.xml_tab, self.ribbon_tab):
-            self.editor_notebook.tab(tab, state="normal" if xml_supported else "disabled")
-        self._reload_editors_from_draft()
-        first = next((m.id for m in session.draft.modules if not m.is_deleted), None)
-        if first:
-            try:
-                self.tree.selection_set(first)
-            except tk.TclError:
-                pass
-        self._refresh_host_status()
-        self._refresh_state()
+        existing = self.tab_for_path(path)
+        if existing is not None and existing.session is not session:
+            self._drop_tab(existing)
+        if existing is not None and existing.session is session:
+            self.select_tab(existing.key)
+        else:
+            self._add_tab(session, session.draft)
         self.status.config(text=f"Recovered {path.name}")
 
     def _offer_recovery(self) -> None:
-        listings = self.recovery_service.list_recoverable()
-        if not listings:
-            return
-        first = listings[0]
+        """Offer each recovered draft in turn (several tabs may have been open)."""
+        for listing in self.recovery_service.list_recoverable():
+            if not listing.source_path or self.tab_for_path(Path(listing.source_path)) is None:
+                self._offer_one_recovery(listing)
+
+    def _offer_one_recovery(self, first) -> None:
         if first.invalid:
             messagebox.showwarning(
                 APP_NAME,
@@ -4482,28 +4727,12 @@ class MainWindow:
         if self._saving:
             return  # never tear down mid-commit
         self._flush_all_editors()
-        if self.draft is not None and self.draft.is_dirty():
-            self._refresh_host_status()
-            extra = ""
-            if self._live_host_running:
-                extra = (
-                    f"\n\nClose {self._host_label} before saving this add-in. "
-                    "Saving now will be blocked until that application is closed."
-                )
-            choice = messagebox.askyesnocancel(
-                APP_NAME, "You have unsaved changes. Save before exiting?" + extra
-            )
-            if choice is None:
-                return
-            if choice:
-                self.save()
-                if self.draft is not None and self.draft.is_dirty():
-                    return  # save failed or was blocked; keep window open
-            else:
-                if self.session is not None:
-                    self.recovery_service.mark_discard(self.session)
-        if self.session is not None:
-            self.session_service.close(self.session)
+        self._remember_open_tabs()  # reopened next time, before any tab is closed
+        if not self._confirm_close_all():
+            return
+        for tab in self._tabs:
+            if tab.session is not None:
+                self.session_service.close(tab.session)
         self._cancel_afters()
         self.root.destroy()
 

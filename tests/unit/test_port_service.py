@@ -65,7 +65,7 @@ def _body(draft, name: str) -> str:
 def test_lists_controls_that_run_macros(pair):
     source, _target_draft = pair
     controls = {c.control_id: c for c in ps.portable_controls(source)}
-    assert set(controls) == {"grpReports", "btnReport", "btnOther", "mnuMore", "btnMenuItem"}
+    assert set(controls) == {"tabSrc", "grpReports", "btnReport", "btnOther", "mnuMore", "btnMenuItem"}
     assert controls["btnReport"].display == "Source › Reports › Run Report"
     assert controls["btnReport"].callbacks == ("RunReport",)
 

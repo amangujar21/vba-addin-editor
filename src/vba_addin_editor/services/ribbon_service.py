@@ -916,31 +916,51 @@ def find_tabs(text: str, part_path: str = "") -> list[RibbonContainer]:
         control_id = e.attr("id") or e.attr("idMso") or e.attr("idQ")
         if not control_id:
             continue
-        close_start = text.rfind("<", e.open_end, e.end)
-        indent = _line_indent(text, e.start)[0]
-        child_indent = None
-        for child in _children(elements, e.index):
-            child_line_indent, first = _line_indent(text, child.start)
-            if first:
-                child_indent = child_line_indent
-                break
-        if child_indent is None:
-            parent_indent = _line_indent(text, elements[e.parent].start)[0] if e.parent >= 0 else ""
-            unit = indent[len(parent_indent):] if indent.startswith(parent_indent) else ""
-            child_indent = indent + (unit or "  ")
-        found.append(
-            RibbonContainer(
-                part_path=part_path,
-                element="tab",
-                control_id=_unescape(control_id),
-                display=_unescape(e.attr("label") or control_id),
-                close_start=close_start,
-                indent=indent,
-                child_indent=child_indent,
-                open_start=e.start,
-            )
-        )
+        display = _unescape(e.attr("label") or control_id)
+        found.append(_element_container(text, elements, e, part_path, _unescape(control_id), display))
     return found
+
+
+def find_tab_lists(text: str, part_path: str = "") -> list[RibbonContainer]:
+    """The ``<tabs>`` element of a ribbon, where a whole new tab can be added."""
+    elements = element_tree(text)
+    return [
+        _element_container(text, elements, e, part_path, "", "Ribbon tabs")
+        for e in elements
+        if _local_name(e.name) == "tabs"
+        and e.complete
+        and e.end != e.open_end
+        and e.parent >= 0
+        and _local_name(elements[e.parent].name) == "ribbon"
+    ]
+
+
+def _element_container(
+    text: str, elements: list[RibbonElement], e: RibbonElement, part_path: str, control_id: str, display: str
+) -> RibbonContainer:
+    """A container for children of the (non-empty, complete) element ``e``."""
+    close_start = text.rfind("<", e.open_end, e.end)
+    indent = _line_indent(text, e.start)[0]
+    child_indent = None
+    for child in _children(elements, e.index):
+        child_line_indent, first = _line_indent(text, child.start)
+        if first:
+            child_indent = child_line_indent
+            break
+    if child_indent is None:
+        parent_indent = _line_indent(text, elements[e.parent].start)[0] if e.parent >= 0 else ""
+        unit = indent[len(parent_indent):] if indent.startswith(parent_indent) else ""
+        child_indent = indent + (unit or "  ")
+    return RibbonContainer(
+        part_path=part_path,
+        element=_local_name(e.name),
+        control_id=control_id,
+        display=display,
+        close_start=close_start,
+        indent=indent,
+        child_indent=child_indent,
+        open_start=e.start,
+    )
 
 
 def set_tag_attr(tag_text: str, name: str, value: str) -> str:

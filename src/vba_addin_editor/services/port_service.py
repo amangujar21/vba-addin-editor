@@ -34,7 +34,6 @@ import re
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
-from typing import cast
 
 from vba_addin_editor.adapters.ooxml_package_adapter import open_package
 from vba_addin_editor.adapters.source_codec import fresh_designer_header, replace_vb_name
@@ -47,6 +46,7 @@ from vba_addin_editor.domain.document import (
 )
 from vba_addin_editor.services import icon_service
 from vba_addin_editor.services import ribbon_service as rs
+from vba_addin_editor.services import starter_service as ss
 from vba_addin_editor.services.validation_service import VBA_RESERVED, validate_module_name
 
 MAX_MODULE_NAME = 31
@@ -574,6 +574,11 @@ class PortableControl:
     label: str
     display: str  # Tab › Group › Control
     callbacks: tuple[str, ...]
+    end: int = 0  # just past the element in the source part
+
+    @property
+    def key(self) -> str:
+        return f"{self.part_path}@{self.start}"
 
     def describe(self) -> str:
         text = f"{self.display}   ({self.element})"
@@ -599,7 +604,7 @@ def _callback_attrs(element: rs.RibbonElement) -> list[tuple[str, str]]:
 
 
 def portable_controls(draft: DocumentDraft) -> list[PortableControl]:
-    """Custom ribbon controls (and groups) of ``draft`` that run VBA."""
+    """Custom ribbon controls (and groups and tabs) of ``draft`` that run VBA."""
     found: list[PortableControl] = []
     for part in rs.ribbon_parts(draft):
         text = part.text or ""
@@ -610,7 +615,10 @@ def portable_controls(draft: DocumentDraft) -> list[PortableControl]:
                 continue
             local, parent_local = _local(e.name), _local(parent.name)
             is_group = local == "group" and parent_local == "tab"
-            if not is_group and (local not in CONTROL_ELEMENTS or parent_local not in _CONTROL_PARENTS):
+            is_tab = local == "tab" and parent_local == "tabs"
+            if not (is_group or is_tab) and (
+                local not in CONTROL_ELEMENTS or parent_local not in _CONTROL_PARENTS
+            ):
                 continue
             callbacks = tuple(
                 rs.split_callback_name(rs.unescape(value))[1]
@@ -628,6 +636,7 @@ def portable_controls(draft: DocumentDraft) -> list[PortableControl]:
                     label=rs.unescape(e.attr("label") or ""),
                     display=rs.element_path(elements, e),
                     callbacks=callbacks,
+                    end=e.end,
                 )
             )
     return found
@@ -637,6 +646,7 @@ def portable_controls(draft: DocumentDraft) -> list[PortableControl]:
 class PortTarget:
     container: rs.RibbonContainer
     new_group: bool = False  # container is a tab: the control goes in a new group there
+    new_ribbon: bool = False  # the add-in has no ribbon: the copy gives it one (for a tab)
 
     @property
     def element(self) -> str:
@@ -647,6 +657,10 @@ class PortTarget:
         where = self.container.display
         if self.new_group:
             text = f"New group on tab {where}"
+        elif self.new_ribbon:
+            text = "New tab on a new ribbon (this add-in has none yet)"
+        elif self.container.element == "tabs":
+            text = "New tab on the ribbon"
         elif self.container.element == "tab":
             text = f"Tab {where}"
         elif self.container.element == "group":
@@ -659,6 +673,8 @@ class PortTarget:
 
 
 def _accepts(container: str, element: str) -> bool:
+    if container == "tabs" or element == "tab":
+        return container == "tabs" and element == "tab"
     if container == "tab":
         return element == "group"
     if element == "group":
@@ -673,10 +689,17 @@ def _accepts(container: str, element: str) -> bool:
 def port_targets(draft: DocumentDraft, control: PortableControl) -> list[PortTarget]:
     """Where ``control`` can go in ``draft``'s ribbon, in document order."""
     targets: list[PortTarget] = []
+    if control.element == "tab" and ss.ribbon_blocker(draft) is None:
+        # No ribbon yet: a whole tab can bring one (an empty customUI14.xml to hold it).
+        tabs = rs.find_tab_lists(ss.blank_ribbon_xml(), ss.RIBBON_PART_PATH)
+        return [PortTarget(tabs[0], new_ribbon=True)]
     for part in rs.ribbon_parts(draft):
         if not part.editable:
             continue
         text = part.text or ""
+        if control.element == "tab":
+            targets.extend(PortTarget(c) for c in rs.find_tab_lists(text, part.path))
+            continue
         tabs = rs.find_tabs(text, part.path)
         if control.element == "group":
             targets.extend(PortTarget(tab) for tab in tabs)
@@ -688,6 +711,112 @@ def port_targets(draft: DocumentDraft, control: PortableControl) -> list[PortTar
         )
         targets.extend(PortTarget(tab, new_group=True) for tab in tabs)
     return targets
+
+
+@dataclass(frozen=True)
+class PortableMacro:
+    """A procedure of a standard module that can be copied on its own."""
+
+    module: str
+    name: str
+    signature: str
+    ribbon: bool = False  # a ribbon control runs it
+
+    @property
+    def display(self) -> str:
+        return f"{self.module}.{self.name}"
+
+    def describe(self) -> str:
+        return self.display + ("   (ribbon)" if self.ribbon else "")
+
+
+def portable_macros(draft: DocumentDraft) -> list[PortableMacro]:
+    """Procedures of ``draft``'s standard modules, in module order."""
+    linked = {
+        rs.split_callback_name(entry.callback.name)[1].casefold()
+        for entry in rs.ribbon_entries(draft)
+    }
+    found: list[PortableMacro] = []
+    for module in draft.modules:
+        if module.is_deleted or _module_kind(module) != "standard":
+            continue
+        model = _model(module)
+        for item in model.items:
+            if item.kind != "proc":
+                continue
+            for key, name in item.names.items():
+                if name.what == "proc":
+                    found.append(
+                        PortableMacro(module.current_name, name.name, item.signature, key in linked)
+                    )
+    return found
+
+
+@dataclass(frozen=True)
+class PortableModule:
+    """A module of a source add-in that can be copied whole."""
+
+    name: str
+    kind: str  # standard | class | form
+
+    def describe(self) -> str:
+        label = {"standard": "module", "class": "class module"}.get(self.kind, "UserForm")
+        return f"{self.name}   ({label})"
+
+
+def portable_modules(draft: DocumentDraft) -> list[PortableModule]:
+    """Standard modules, class modules and UserForms of ``draft`` (not sheets or ThisWorkbook)."""
+    out: list[PortableModule] = []
+    for module in draft.modules:
+        if module.is_deleted:
+            continue
+        kind = _module_kind(module)
+        if kind == "form" and not draft.is_form(module):
+            continue
+        if kind in ("standard", "class", "form"):
+            out.append(PortableModule(module.current_name, kind))
+    return out
+
+
+@dataclass(frozen=True)
+class ExportItem:
+    """One thing to copy into another add-in.
+
+    ``control``: a ribbon control, group or tab (with ``where`` it goes);
+    ``macro``: one procedure of ``module`` (``procedure``); ``module``: a whole
+    standard or class module; ``form``: a whole UserForm. What each needs comes along.
+    """
+
+    kind: str  # control | macro | module | form
+    control: PortableControl | None = None
+    where: PortTarget | None = None
+    module: str = ""
+    procedure: str = ""
+
+    @staticmethod
+    def of_control(control: PortableControl, where: PortTarget) -> ExportItem:
+        return ExportItem("control", control=control, where=where)
+
+    @staticmethod
+    def of_macro(module: str, procedure: str) -> ExportItem:
+        return ExportItem("macro", module=module, procedure=procedure)
+
+    @staticmethod
+    def of_module(module: str) -> ExportItem:
+        return ExportItem("module", module=module)
+
+    @staticmethod
+    def of_form(form: str) -> ExportItem:
+        return ExportItem("form", module=form)
+
+    def describe(self) -> str:
+        if self.control is not None:
+            return self.control.describe()
+        if self.kind == "macro":
+            return f"Macro {self.module}.{self.procedure}"
+        if self.kind == "form":
+            return f"UserForm {self.module}"
+        return f"Module {self.module}"
 
 
 def default_suffix(target: DocumentDraft) -> str:
@@ -810,24 +939,60 @@ def plan_port(
     check_references: bool = True,
 ) -> PortPlan:
     """Work out the whole port on a copy of ``target``; ``target`` is not changed."""
+    return plan_export(
+        source,
+        target,
+        [ExportItem.of_control(control, where)],
+        suffix=suffix,
+        group_label=group_label,
+        check_references=check_references,
+    )
+
+
+def plan_export(
+    source: DocumentDraft,
+    target: DocumentDraft,
+    items: list[ExportItem],
+    *,
+    suffix: str,
+    group_label: str = "",
+    check_references: bool = True,
+) -> PortPlan:
+    """Copy ``items`` (and everything they need) from ``source`` into a copy of ``target``.
+
+    The items are copied together: code several of them use is copied once,
+    and names are decided for all of them at once. Controls bound for the same
+    "new group" share one new group. ``target`` is not changed.
+    """
     if Path(source.baseline.path).resolve() == Path(target.baseline.path).resolve():
         return _blocked("Choose a different add-in: this is the file that is open.")
     if not _SUFFIX_RE.match(suffix):
         return _blocked("The name suffix must be 1-24 letters, digits or underscores.")
-    if target.baseline.package_safety.opc_signature_present:
+    if not items:
+        return _blocked("Choose at least one thing to copy.")
+    controls = [item for item in items if item.kind == "control"]
+    if controls and target.baseline.package_safety.opc_signature_present:
         return _blocked(
             "This file has a package digital signature; editing its ribbon would break it."
         )
-    src_part = source.xml_part_by_path(control.part_path)
-    tgt_part = target.xml_part_by_path(where.container.part_path)
-    if src_part is None or src_part.text is None:
-        return _blocked(f"{control.part_path} could not be read in {source.baseline.path.name}.")
-    if tgt_part is None or tgt_part.text is None or not tgt_part.editable:
-        return _blocked(f"{where.container.part_path} is not editable in this add-in.")
-    if not _accepts(where.element, control.element):
-        return _blocked(f"A {control.element} cannot go in a {where.element}.")
+    for item in controls:
+        control, where = item.control, item.where
+        if control is None or where is None:
+            return _blocked("Choose where each ribbon control goes.")
+        src_part = source.xml_part_by_path(control.part_path)
+        tgt_part = target.xml_part_by_path(where.container.part_path)
+        if src_part is None or src_part.text is None:
+            return _blocked(f"{control.part_path} could not be read in {source.baseline.path.name}.")
+        if where.new_ribbon:
+            problem = ss.ribbon_blocker(target)
+            if problem:
+                return _blocked(problem)
+        elif tgt_part is None or tgt_part.text is None or not tgt_part.editable:
+            return _blocked(f"{where.container.part_path} is not editable in this add-in.")
+        if not _accepts(where.element, control.element):
+            return _blocked(f"A {control.element} cannot go in a {where.element}.")
     try:
-        return _Porter(source, target, control, where, suffix, group_label, check_references).run()
+        return _Porter(source, target, suffix, group_label, check_references).run(items)
     except PortError as exc:
         return _blocked(str(exc))
 
@@ -886,16 +1051,27 @@ def plan_form_port(
     its code uses come along as for a ribbon button; names that clash are
     renamed with ``suffix``, and references follow the renames.
     """
-    if Path(source.baseline.path).resolve() == Path(target.baseline.path).resolve():
-        return _blocked("Choose a different add-in: this is the file that is open.")
-    if not _SUFFIX_RE.match(suffix):
-        return _blocked("The name suffix must be 1-24 letters, digits or underscores.")
     if not names:
         return _blocked("Choose at least one UserForm.")
-    try:
-        return _Porter(source, target, None, None, suffix, "", check_references).run_forms(names)
-    except PortError as exc:
-        return _blocked(str(exc))
+    return plan_export(
+        source,
+        target,
+        [ExportItem.of_form(name) for name in names],
+        suffix=suffix,
+        check_references=check_references,
+    )
+
+
+@dataclass
+class _Placed:
+    """A ribbon control being copied: where it is in the source, and where it goes."""
+
+    control: PortableControl
+    where: PortTarget
+    text: str  # the source part
+    elements: list[rs.RibbonElement]
+    top: rs.RibbonElement
+    subtree: list[rs.RibbonElement]
 
 
 class _Porter:
@@ -903,17 +1079,15 @@ class _Porter:
         self,
         source: DocumentDraft,
         target: DocumentDraft,
-        control: PortableControl | None,
-        where: PortTarget | None,
         suffix: str,
         group_label: str,
         check_references: bool,
     ) -> None:
         self.source = source
         self.target = target
-        # None only for run_forms, which never reads them.
-        self.control = cast(PortableControl, control)
-        self.where = cast(PortTarget, where)
+        self.placed: list[_Placed] = []
+        # The new group a "new group on tab" placement makes, per (part, tab start).
+        self.group_ids: dict[tuple[str, int], str] = {}
         self.suffix = suffix
         self.group_label = group_label
         self.check_references = check_references
@@ -953,49 +1127,101 @@ class _Porter:
 
     # -- 1. the XML subtree and its callbacks ----------------------------------------------
 
-    def run_forms(self, names: list[str]) -> PortPlan:
-        """Copy the UserForms ``names`` (and the code they need) into a copy of the target."""
-        roots: list[_Module] = []
-        for name in names:
-            mod = self.src.modules.get(name.casefold())
-            if mod is None or mod.kind != "form":
-                raise PortError(f"{self.src_file} has no UserForm named {name}.")
-            roots.append(mod)
-        self._collect([], roots)
-        self._decide_names([])
+    def run(self, items: list[ExportItem]) -> PortPlan:
+        roots: list[tuple[_Module, _Item]] = []
+        form_roots: list[_Module] = []
+        class_roots: list[_Module] = []
+        callback_refs: dict[str, tuple[_Module, str] | None] = {}
+        parsed: dict[str, tuple[str, list[rs.RibbonElement]]] = {}
+        for item in items:
+            if item.kind == "control":
+                assert item.control is not None and item.where is not None
+                self._place(item.control, item.where, parsed, callback_refs)
+                continue
+            mod = self.src.modules.get(item.module.casefold())
+            if mod is None:
+                what = "UserForm" if item.kind == "form" else "module"
+                raise PortError(f"{self.src_file} has no {what} named {item.module}.")
+            if item.kind == "macro":
+                if mod.kind != "standard":
+                    raise PortError(
+                        f"{item.module}.{item.procedure} is not in a standard module; copy the "
+                        "whole module instead."
+                    )
+                key = item.procedure.casefold()
+                found = [it for it in mod.by_name.get(key, []) if it.names[key].what == "proc"]
+                if not found:
+                    raise PortError(f"{item.module} has no procedure named {item.procedure}.")
+                roots += [(mod, it) for it in found]
+                # Run by name (Alt+F8, Application.Run, OnKey): a new name, as a callback gets.
+                self.forced.add((mod.name.casefold(), key))
+            elif item.kind == "form" or mod.kind == "form":
+                if mod.kind != "form":
+                    raise PortError(f"{self.src_file} has no UserForm named {item.module}.")
+                form_roots.append(mod)
+            elif mod.kind == "standard":
+                for it in mod.items:
+                    roots.append((mod, it))
+                    if _is_macro(it):
+                        self.forced |= {
+                            (mod.name.casefold(), key)
+                            for key, name in it.names.items()
+                            if name.what == "proc" and name.public
+                        }
+            elif mod.kind == "class":
+                class_roots.append(mod)
+            else:
+                raise PortError(
+                    f"{item.module} is part of {self.src_file}'s document and cannot be "
+                    "copied; copy its macros instead."
+                )
+        for ref in callback_refs.values():
+            if ref is not None:
+                mod, key = ref
+                roots += [(mod, it) for it in mod.by_name.get(key, [])]
+                self.forced.add((mod.name.casefold(), key))
+        self._collect(roots, form_roots, class_roots)
+        self._decide_names([e for p in self.placed for e in p.subtree])
         draft = clone_draft(self.target)
+        if any(p.where.new_ribbon for p in self.placed):
+            part = ss.add_ribbon_part(draft, ss.blank_ribbon_xml())
+            self.plan.summary.append(f"A ribbon for this add-in ({part.path})")
         self._write_modules(draft)
+        for index, placed in enumerate(self.placed):
+            self._write_ribbon(draft, placed, callback_refs, index)
+        self._hook_ribbon_vars(draft)
+        self._locate_first(draft)
         self._final_checks(draft)
         self.plan.draft = None if self.plan.problems else draft
         return self.plan
 
-    def run(self) -> PortPlan:
-        assert self.control is not None and self.where is not None
-        part = self.source.xml_part_by_path(self.control.part_path)
-        text = part.text or "" if part is not None else ""
-        elements = rs.element_tree(text)
-        top = next((e for e in elements if e.start == self.control.start and e.complete), None)
+    def _place(self, control: PortableControl, where: PortTarget, parsed, callback_refs) -> None:
+        if control.part_path not in parsed:
+            part = self.source.xml_part_by_path(control.part_path)
+            text = (part.text or "") if part is not None else ""
+            parsed[control.part_path] = (text, rs.element_tree(text))
+        text, elements = parsed[control.part_path]
+        top = next((e for e in elements if e.start == control.start and e.complete), None)
         if top is None:
-            raise PortError("The chosen control is no longer in the source ribbon.")
-        subtree = _subtree(elements, top)
-        callback_refs = self._callbacks(subtree)
-        roots = [
-            (mod, item)
-            for ref in callback_refs.values()
-            if ref is not None
-            for mod, key in [ref]
-            for item in mod.by_name.get(key, [])
+            raise PortError(f"{control.display} is no longer in the source ribbon.")
+        for other in self.placed:
+            if other.control.part_path != control.part_path:
+                continue
+            if other.top.start <= top.start and top.end <= other.top.end:
+                return  # already copied with a control around it
+        # A control around ones already chosen replaces them.
+        self.placed = [
+            p
+            for p in self.placed
+            if not (
+                p.control.part_path == control.part_path
+                and top.start <= p.top.start
+                and p.top.end <= top.end
+            )
         ]
-        self.forced |= {(mod.name.casefold(), key) for mod, key in filter(None, callback_refs.values())}
-        self._collect(roots)
-        self._decide_names(subtree)
-        draft = clone_draft(self.target)
-        self._write_modules(draft)
-        self._write_ribbon(draft, text, elements, top, subtree, callback_refs)
-        self._hook_ribbon_vars(draft)
-        self._final_checks(draft)
-        self.plan.draft = None if self.plan.problems else draft
-        return self.plan
+        subtree = _subtree(elements, top)
+        self.placed.append(_Placed(control, where, text, elements, top, subtree))
+        callback_refs.update(self._callbacks(subtree))
 
     def _callbacks(self, subtree) -> dict[str, tuple[_Module, str] | None]:
         """Raw callback attribute value -> (source module, procedure key); None if missing."""
@@ -1058,7 +1284,10 @@ class _Porter:
         self._form_queue.append((mod, None))
 
     def _collect(
-        self, roots: list[tuple[_Module, _Item]], form_roots: list[_Module] | tuple = ()
+        self,
+        roots: list[tuple[_Module, _Item]],
+        form_roots: list[_Module] | tuple = (),
+        class_roots: list[_Module] | tuple = (),
     ) -> None:
         queue: list[tuple[_Module, _Item | None]] = []
         root_keys = {(m.name.casefold(), i.index) for m, i in roots}
@@ -1101,6 +1330,8 @@ class _Porter:
             add_item(mod, item)
         for mod in form_roots:
             self._add_form(mod, root=True)
+        for mod in class_roots:
+            add_class(mod)
         while queue:
             mod, item = queue.pop(0)
             span = range(len(mod.toks)) if item is None else mod.token_range(item.start, item.end)
@@ -1286,9 +1517,12 @@ class _Porter:
                 self.id_names[raw] = new
                 if new != old:
                     self.plan.renames.append(("control id", old, new))
-        if self.where is not None and self.control is not None and self.where.new_group:
-            stem = re.sub(r"[^A-Za-z0-9_]", "", self.control.control_id) or "Imported"
-            self.group_id = ids.fresh("grp" + stem[0].upper() + stem[1:])
+        for placed in self.placed:
+            key = _group_key(placed.where)
+            if key is None or key in self.group_ids:
+                continue
+            stem = re.sub(r"[^A-Za-z0-9_]", "", placed.control.control_id) or "Imported"
+            self.group_ids[key] = ids.fresh("grp" + stem[0].upper() + stem[1:])
 
     # -- 4. the VBA text ---------------------------------------------------------------------------
 
@@ -1460,10 +1694,11 @@ class _Porter:
             return f"{self.module_names.get(mod.name.casefold(), module_name)}.{new_proc}"
         return new_proc
 
-    def _copy_images(self, draft, subtree, src_root) -> dict[str, str]:
+    def _copy_images(self, draft, placed: _Placed, src_root) -> dict[str, str]:
         """Copy each image the controls show; returns source rId -> target rId."""
         images: dict[str, str] = {}
-        rels_part = self.source.xml_part_by_path(rs.relationships_path(self.control.part_path))
+        subtree, part_path = placed.subtree, placed.control.part_path
+        rels_part = self.source.xml_part_by_path(rs.relationships_path(part_path))
         rels = {
             rid: target
             for rid, kind, target in rs.relationships((rels_part.text or "") if rels_part else "")
@@ -1474,8 +1709,8 @@ class _Porter:
             if not raw or raw in images:
                 continue
             target = rels.get(rs.unescape(raw))
-            member = rs.relationship_target_path(self.control.part_path, target) if target else None
-            data = _package_member(self.source, member) if member else None
+            member = rs.relationship_target_path(part_path, target) if target else None
+            data = _source_image(self.source, member) if member else None
             if data is None or member is None:
                 loader = src_root.attr("loadImage") if src_root is not None else None
                 if loader:
@@ -1489,7 +1724,7 @@ class _Porter:
             stem = self.id_names.get(e.attr("id") or e.attr("idQ") or "", "icon")
             try:
                 path, rid = icon_service.add_image_member(
-                    draft, self.where.container.part_path, data, extension=Path(member).suffix, stem=stem
+                    draft, placed.where.container.part_path, data, extension=Path(member).suffix, stem=stem
                 )
             except icon_service.IconError as exc:
                 raise PortError(str(exc)) from exc
@@ -1497,20 +1732,39 @@ class _Porter:
             self.plan.summary.append(f"Icon {path}")
         return images
 
-    def _write_ribbon(self, draft, text, elements, top, subtree, callback_refs) -> None:
-        container = self.where.container
-        part = draft.xml_part_by_path(container.part_path)
+    def _write_ribbon(self, draft, placed: _Placed, callback_refs, index: int) -> None:
+        text, elements, top, subtree = placed.text, placed.elements, placed.top, placed.subtree
+        control = placed.control
+        where = placed.where
+        group_key = _group_key(where)
+        group_id = self.group_ids.get(group_key) if group_key is not None else None
+        part = draft.xml_part_by_path(where.container.part_path)
         assert part is not None and part.text is not None
+        # Earlier controls of this export moved the offsets: find the container again.
+        container = _current_container(self.target, part.text, where)
+        if group_id is not None:
+            made = next(
+                (
+                    c
+                    for c in rs.find_containers(part.text, part.path)
+                    if c.element == "group" and rs.unescape(c.control_id) == group_id
+                ),
+                None,
+            )
+            if made is not None:  # an earlier control of this export made the group
+                where, container, group_id = PortTarget(made), made, None
         src_root, tgt_root = rs.root_element(text), rs.root_element(part.text)
         src_prefix = rs.element_prefix(src_root.name) if src_root else ""
         tgt_prefix = rs.element_prefix(tgt_root.name) if tgt_root else ""
-        images = self._copy_images(draft, subtree, src_root)
+        images = self._copy_images(draft, placed, src_root)  # leaves the ribbon part as it is
 
         # Attributes the top element may not carry where it now goes.
         drop_top = set(_POSITION_ATTRS)
-        if self.where.element != "group":
+        if control.element == "tab":
+            drop_top = {"insertAfterQ", "insertBeforeQ"}  # Mso positions still hold here
+        if where.element != "group":
             drop_top |= {"size", "getSize"}  # only controls directly in a group have a size
-        if self.where.element != "menu":
+        if where.element != "menu":
             drop_top |= {"description", "getDescription"}  # menu items only
         dropped = sorted(name for name, _v, _o in top.attrs if name in drop_top)
 
@@ -1536,8 +1790,8 @@ class _Porter:
             sub_text = sub_text[:a] + tag + sub_text[b:]
         if dropped:
             self.note(
-                f"Left out {', '.join(dropped)} on the {self.control.element}: not valid in a "
-                f"{self.where.element}."
+                f"Left out {', '.join(dropped)} on the {control.element}: not valid in a "
+                f"{where.element}."
             )
         if any(e.attr("idQ") is not None for e in subtree):
             self.note(
@@ -1549,7 +1803,7 @@ class _Porter:
         # Re-indent for the new place.
         src_indent = rs.line_indent(text, top.start)
         child_indent = container.child_indent
-        if self.where.new_group:
+        if group_id is not None:
             unit = container.child_indent[len(container.indent) :] or "  "
             child_indent = container.child_indent + unit
         lines = sub_text.split("\n")
@@ -1560,20 +1814,17 @@ class _Porter:
                 for line in lines[1:]
             ]
         )
-        if self.where.new_group:
+        if group_id is not None:
             label = self.group_label.strip() or self._source_group_label(elements, top)
             p = f"{tgt_prefix}:" if tgt_prefix else ""
             element_xml = (
-                f'<{p}group id="{rs.xml_attr(self.group_id)}" label="{rs.xml_attr(label)}">\n'
+                f'<{p}group id="{rs.xml_attr(group_id)}" label="{rs.xml_attr(label)}">\n'
                 f"{child_indent}{element_xml}\n{container.child_indent}</{p}group>"
             )
-        new_text, offset, _length = rs.insert_into_container(part.text, container, element_xml)
+        new_text, _offset, _length = rs.insert_into_container(part.text, container, element_xml)
         part.text = new_text
-        self.plan.part_path = part.path
-        self.plan.element_offset = offset
-        self.plan.element_length = len(element_xml.split("\n", 1)[0])
-        what = self.control.label or self.control.control_id
-        self.plan.summary.insert(0, f'{self.control.element} "{what}" in {self.where.describe()}')
+        what = control.label or control.control_id
+        self.plan.summary.insert(index, f'{control.element} "{what}" in {placed.where.describe()}')
 
     def _source_group_label(self, elements, top) -> str:
         current = top
@@ -1594,8 +1845,14 @@ class _Porter:
         holders = [(key, names) for key, names in holders if names]
         if not holders:
             return
-        part = draft.xml_part_by_path(self.where.container.part_path)
-        assert part is not None and part.text is not None
+        part = self._hook_part(draft)
+        if part is None or part.text is None:
+            names = ", ".join(v for _key, vs in holders for v in vs)
+            self.note(
+                f"The copied code keeps the ribbon in {names}, which only a ribbon onLoad sets; "
+                "this add-in has no ribbon to call it from."
+            )
+            return
         root = rs.root_element(part.text)
         on_load = rs.unescape(root.attr("onLoad") or "").strip() if root else ""
         namer = _Namer(
@@ -1634,8 +1891,6 @@ class _Porter:
             tag = part.text[root.start : root.open_end]
             new_tag = rs.set_tag_attr(tag, "onLoad", first_hook)
             part.text = part.text[: root.start] + new_tag + part.text[root.open_end :]
-            if self.plan.element_offset > root.start:
-                self.plan.element_offset += len(new_tag) - len(tag)
             self.plan.summary.append(f'onLoad="{first_hook}" on the ribbon, to set the ribbon variable')
             return
         resolution = rs.resolve(rs.procedure_index(draft), on_load)
@@ -1668,6 +1923,31 @@ class _Porter:
         self.plan.changed_module_ids.append(module.id)
         self.plan.summary.append(f"{location.name} (the onLoad, in {module.current_name}) now calls {names}")
 
+    def _hook_part(self, draft: DocumentDraft):
+        """The ribbon part whose onLoad sets copied ribbon variables."""
+        if self.placed:
+            return draft.xml_part_by_path(self.placed[0].where.container.part_path)
+        parts = [p for p in rs.ribbon_parts(draft) if p.editable and p.text is not None]
+        parts.sort(key=lambda p: not p.path.lower().endswith("customui14.xml"))
+        return parts[0] if parts else None
+
+    def _locate_first(self, draft: DocumentDraft) -> None:
+        """Where the first copied control now is, for showing it after the import."""
+        if not self.placed:
+            return
+        placed = self.placed[0]
+        part = draft.xml_part_by_path(placed.where.container.part_path)
+        if part is None or part.text is None:
+            return
+        raw = placed.top.attr("id") or placed.top.attr("idQ") or ""
+        new_id = self.id_names.get(raw, rs.unescape(raw).rsplit(":", 1)[-1])
+        for e in rs.element_tree(part.text):
+            if _local(e.name) == placed.control.element and rs.unescape(e.attr("id") or "") == new_id:
+                self.plan.part_path = part.path
+                self.plan.element_offset = e.start
+                self.plan.element_length = e.open_end - e.start
+                return
+
     # -- 7. checks --------------------------------------------------------------------------------
 
     def _final_checks(self, draft: DocumentDraft) -> None:
@@ -1677,7 +1957,7 @@ class _Porter:
                 f"{self.src_file} is a {src_host.title()} file and this one is {tgt_host.title()}: "
                 f"code that uses {src_host.title()} objects will not run here."
             )
-        part_path = self.where.container.part_path if self.where is not None else ""
+        part_path = self.placed[0].where.container.part_path if self.placed else ""
         if part_path.lower().endswith("/customui.xml") and any(
             p.path.lower().endswith("customui14.xml") for p in rs.ribbon_parts(self.target)
         ):
@@ -1707,6 +1987,56 @@ class _Porter:
                     "the imported code uses it, add it in the VBA editor (Tools → References)."
                 )
         self.plan.warnings.extend(self.notes)
+
+
+def _group_key(where: PortTarget) -> tuple[str, int] | None:
+    if not where.new_group:
+        return None
+    return (where.container.part_path, where.container.open_start)
+
+
+def _containers_like(text: str, where: PortTarget) -> list[rs.RibbonContainer]:
+    element = where.container.element
+    path = where.container.part_path
+    if element == "tabs":
+        return rs.find_tab_lists(text, path)
+    if element == "tab":
+        return rs.find_tabs(text, path)
+    return [c for c in rs.find_containers(text, path) if c.element == element]
+
+
+def _current_container(target: DocumentDraft, text: str, where: PortTarget) -> rs.RibbonContainer:
+    """``where``'s container (found in ``target``'s ribbon) in ``text``, after earlier inserts."""
+    original_part = target.xml_part_by_path(where.container.part_path)
+    if where.new_ribbon or original_part is None:
+        original_part = None  # the ribbon this copy made: its one tab list
+    original = _containers_like((original_part.text or "") if original_part else ss.blank_ribbon_xml(), where)
+    same = [c for c in original if c.control_id == where.container.control_id]
+    nth = next((i for i, c in enumerate(same) if c.open_start == where.container.open_start), 0)
+    now = [c for c in _containers_like(text, where) if c.control_id == where.container.control_id]
+    if nth >= len(now):
+        raise PortError(f"{where.describe()} is no longer in this add-in's ribbon.")
+    return now[nth]
+
+
+def _is_macro(item: _Item) -> bool:
+    """A Sub without required arguments: runnable by name (Alt+F8, Application.Run, OnKey)."""
+    signature = re.sub(r"'.*$", "", item.signature)
+    if not re.match(r"^(?:(?:Public|Private|Friend|Static)\s+)*Sub\b", signature, re.IGNORECASE):
+        return False
+    match = re.search(r"\((.*)\)", signature)
+    params = [p.strip() for p in (match.group(1) if match else "").split(",") if p.strip()]
+    return all(re.match(r"(?i)(Optional|ParamArray)\b", p) for p in params)
+
+
+def _source_image(draft: DocumentDraft, member: str) -> bytes | None:
+    """An image of the source add-in, as its draft has it (unsaved icons included)."""
+    if member in draft.removed_parts:
+        return None
+    binary = draft.binary_part_by_path(member)
+    if binary is not None:
+        return binary.data
+    return _package_member(draft, member)
 
 
 def _new_module(name: str, body: str, *, standard: bool) -> ModuleDraft:

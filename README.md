@@ -46,8 +46,9 @@ away without restarting Office (see **Saving while Office is open** below).
    Automatically on Save** turns that backup off (the choice is remembered);
    **File → Back Up Now** makes one whenever you want. **Save a Copy** writes a
    separate file and does not clear the original dirty state.
-4. Closing the window with unsaved changes asks Save / Discard / Cancel.
-   Cancel keeps the draft. A blocked save keeps the window open.
+4. Closing the window with unsaved changes asks Save / Discard / Cancel (once,
+   for every tab with changes). Cancel keeps the drafts. A blocked save keeps
+   the window open.
 5. Reopen Office — the same installed file path now contains the new content.
    Draft recovery is written separately from add-in saves; a crash may lose
    only changes since the last recovery checkpoint. If the original file is
@@ -80,6 +81,52 @@ away without restarting Office (see **Saving while Office is open** below).
    main part typed as an add-in. The form that follows offers a ribbon tab with
    one group for your buttons (**No Ribbon** skips it); the ribbon is an
    unsaved edit until **Save File**. An existing file is never replaced.
+
+## Several add-ins at once (tabs)
+
+Each add-in you open gets a tab under the header, as in a browser. Opening
+another file adds a tab; opening one that is already open shows its tab (and
+re-reads it from disk only when it has no unsaved changes). **Ctrl+Tab** /
+**Ctrl+Shift+Tab** (or Ctrl+PgDn / Ctrl+PgUp) switch tabs, **Ctrl+W** (or
+Ctrl+F4, or a middle click) closes one, asking first when it has unsaved
+changes, and dragging a tab along the strip reorders it. A dot on a tab means
+unsaved changes. Each tab keeps its own draft, undo history, recovery
+checkpoint and place in every view. **File → Save All** (Ctrl+Alt+S) saves
+every tab with changes, each through its own review. The tabs open when the
+editor closes are reopened next time (**File → Reopen Tabs on Start** turns
+that off); files that no longer exist are skipped.
+
+## Copying between add-ins
+
+**File → Copy to Another Add-in…** copies from the add-in you are in into
+another open tab, or into a file it then opens in a new tab. **File → Copy
+from Another Add-in…** does the reverse, from an open tab or from a file that
+is only read. The same dialog opens from **Copy Macro to Another Add-in…**
+(right-click a procedure), **Module → Copy Module to Another Add-in…**,
+**Ribbon → Copy Controls to Another Add-in…** and the Ribbon view's
+right-click menu, with what you clicked already ticked; dragging a procedure,
+a module or a ribbon control onto another add-in's tab opens it too.
+
+Tick any mix of: whole custom tabs, groups, menus, buttons and other
+controls (a ticked tab or group brings everything in it), single macros,
+whole standard or class modules, and UserForms. Each ticked ribbon control
+gets a place in the other add-in: a whole tab becomes a new tab there, a group
+goes on one of its tabs, and buttons share one new group unless you choose a
+group or menu of theirs. Everything they need comes along and is copied once,
+even when several items share it: called procedures, declarations, classes,
+UserForms (layout byte for byte) and custom icons (`imageMso` icons simply
+stay). The preview shows every addition and rename before anything changes;
+the copy lands as one Undo step in the other add-in's tab, unsaved.
+
+Renames follow the **Import Button** rules below, so both add-ins can be
+loaded together: every macro that can be run by name (ribbon callbacks, the
+macros you ticked, the argument-less public Subs of a ticked module, and
+anything run with `Application.Run`, `OnTime`, `OnKey`, `OnAction`) gets the
+name suffix; modules, other public names and control ids only when the other
+add-in already uses them (custom control ids belong to each add-in, so equal
+ids in two loaded add-ins do not clash). Controls in a file without a ribbon
+need one first (**Ribbon → Create Ribbon**); macros, modules and UserForms do
+not.
 
 ## UserForms
 
@@ -346,7 +393,7 @@ decompress modules that have not changed. The folder can be deleted at any time.
   storage would be orphaned); a form added in this session can be renamed
   until it is saved. A deleted form's name cannot be reused until the deletion
   is saved. Folder import never deletes a UserForm.
-- **Import Button** follows calls lexically (no VBA compiler): a macro whose
+- **Import Button** and **Copy to Another Add-in** follow calls lexically (no VBA compiler): a macro whose
   name is only built at run time (`Application.Run "Do" & n`) is not found,
   and library references are reported but not added. Sheets, names and other
   workbook content of the other add-in are never copied.

@@ -87,6 +87,19 @@ def starter_ribbon_xml(spec: StarterRibbonSpec) -> str:
     )
 
 
+def blank_ribbon_xml() -> str:
+    """customUI with an empty tab list, for a whole tab copied from another add-in."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        f'<customUI xmlns="{CUSTOMUI_NAMESPACE}">\n'
+        "  <ribbon>\n"
+        "    <tabs>\n"
+        "    </tabs>\n"
+        "  </ribbon>\n"
+        "</customUI>\n"
+    )
+
+
 def validate_spec(spec: StarterRibbonSpec) -> str | None:
     """Why ``spec`` cannot be used, or None."""
     if not spec.tab_label.strip():
@@ -138,7 +151,15 @@ def add_starter_ribbon(draft: DocumentDraft, spec: StarterRibbonSpec) -> XmlPart
     application/xml, ``[Content_Types].xml``. Returns the new ribbon part.
     Raises StarterError (draft untouched) when it cannot be done.
     """
-    problem = ribbon_blocker(draft) or validate_spec(spec)
+    problem = validate_spec(spec)
+    if problem:
+        raise StarterError(problem)
+    return add_ribbon_part(draft, starter_ribbon_xml(spec))
+
+
+def add_ribbon_part(draft: DocumentDraft, text: str) -> XmlPartDraft:
+    """Add customUI14.xml holding ``text`` and link it (see ``add_starter_ribbon``)."""
+    problem = ribbon_blocker(draft)
     if problem:
         raise StarterError(problem)
     rels = draft.xml_part_by_path(ROOT_RELATIONSHIPS_PATH)
@@ -170,7 +191,7 @@ def add_starter_ribbon(draft: DocumentDraft, spec: StarterRibbonSpec) -> XmlPart
     types.text = types_text
     part = XmlPartDraft(
         path=RIBBON_PART_PATH,
-        text=starter_ribbon_xml(spec),
+        text=text,
         original_text=None,
         encoding="utf-8",
         bom=b"",

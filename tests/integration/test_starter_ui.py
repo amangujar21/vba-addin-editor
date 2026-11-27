@@ -51,8 +51,8 @@ def test_new_file_with_ribbon_then_button_saves(root, tmp_path: Path, monkeypatc
 
     # Add a macro and a button for it into the new group.
     m1 = win.draft.find_current("Module1")
+    win._open_module_at(m1.id, 1)  # a new file may show it already: open it, then edit
     m1.body += "Public Sub SayHi(control As IRibbonControl)\n    MsgBox \"hi\"\nEnd Sub\n"
-    win._open_module_at(m1.id, 1)
     win.editor.set_text(m1.body)
     part = win.draft.xml_part_by_path(PART)
     group = rs.find_containers(part.text, PART)[0]

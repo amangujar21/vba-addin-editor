@@ -20,6 +20,10 @@ class Settings:
     editor_font_size: int = 11
     # Most recently opened first.
     recent_files: list[str] = field(default_factory=list)
+    # Reopen the add-ins that were open in tabs when the editor last closed.
+    reopen_tabs: bool = True
+    open_tabs: list[str] = field(default_factory=list)  # in tab order
+    active_tab: str = ""
 
 
 def settings_path() -> Path:

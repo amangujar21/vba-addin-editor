@@ -669,6 +669,7 @@ class RibbonDesigner(ttk.Frame):
         menu.add_command(label="Paste Icon from Clipboard", command=self.set_icon_from_clipboard)
         menu.add_command(label="Icon from File…", command=self.set_icon_from_file)
         menu.add_separator()
+        menu.add_command(label="Copy to Another Add-in…", command=app.export_ribbon_selection)
         menu.add_command(label="Edit XML", command=self.show_xml)
         menu.add_command(label="Delete", accelerator="Del", command=self.delete_selected)
         app._menus.extend([add, menu, self.part_menu, group_add])
@@ -694,6 +695,18 @@ class RibbonDesigner(ttk.Frame):
     def _part(self):
         draft = self.app.draft
         return draft.xml_part_by_path(self.part_path) if draft is not None and self.part_path else None
+
+    def reset(self) -> None:
+        """Forget the shown file's state (another tab is coming); ``refresh`` shows the new one."""
+        self.dropdown.close()
+        self.part_path = None
+        self._collapsed.clear()
+        self._fresh.clear()
+        self._refreshing = True
+        try:
+            self.tree.selection_set(())
+        finally:
+            self._refreshing = False
 
     def refresh(self) -> None:
         """Rebuild from the draft (after any edit, undo, or a switch to this view)."""
@@ -1820,6 +1833,12 @@ class RibbonDesigner(ttk.Frame):
         menu = self.prepare_context_menu(iid if self.tree.exists(iid) else "")
         menu.tk_popup(x_root, y_root)
 
+    def export_keys(self) -> list[str]:
+        """The selected controls as rows of the copy dialog (ones it cannot copy are ignored)."""
+        if self.part_path is None:
+            return []
+        return [f"c:{self.part_path}@{e.start}" for e in self.selected_elements()]
+
     # -- right-click ------------------------------------------------------------------------
 
     def prepare_context_menu(self, iid: str = "") -> tk.Menu:
@@ -1839,6 +1858,7 @@ class RibbonDesigner(ttk.Frame):
             "Paste Icon from Clipboard": single is not None and rs.local_name(single.name) in rs.IMAGE_ELEMENTS,
             "Icon from File…": single is not None and rs.local_name(single.name) in rs.IMAGE_ELEMENTS,
             "Delete": bool(chosen),
+            "Copy to Another Add-in…": bool(chosen),
         }
         menu = self.context_menu
         for index in range((menu.index("end") or 0) + 1):
@@ -1893,6 +1913,10 @@ class RibbonDesigner(ttk.Frame):
             drag["moving"] = True
             self.tree.selection_set(drag["iid"])
             self.tree.configure(cursor="fleur")
+        x_root, y_root = getattr(event, "x_root", None), getattr(event, "y_root", None)
+        if x_root is not None and self.app.drag_over_tabs(x_root, y_root):
+            self._show_drop(None)  # over another add-in's tab: dropping copies it there
+            return
         height = self.tree.winfo_height()
         if event.y < 14:
             self.tree.yview_scroll(-1, "units")
@@ -1930,13 +1954,19 @@ class RibbonDesigner(ttk.Frame):
         y = top if where == "before" else top + row_height - 1
         self._drop_line.place(x=x + indent, y=y, width=max(tree.winfo_width() - x - indent - 8, 20), height=2)
 
-    def _drag_end(self, _event=None) -> None:
+    def _drag_end(self, event=None) -> None:
         drag, drop = self._drag, self._drop
         self._drag = None
         self._show_drop(None)
         if drag is None or not drag["moving"]:
             return
         self.tree.configure(cursor="")
+        x_root, y_root = getattr(event, "x_root", None), getattr(event, "y_root", None)
+        if x_root is not None and self.app.tab_strip.tab_at(x_root, y_root) is not None:
+            element = self._element_of(drag["iid"])
+            keys = [f"c:{self.part_path}@{element.start}"] if element is not None else []
+            self.app.drop_on_tab(x_root, y_root, keys)
+            return
         source = self._element_of(drag["iid"])
         target = self._element_of(drop[0]) if drop is not None else None
         if source is not None and target is not None and drop is not None:
