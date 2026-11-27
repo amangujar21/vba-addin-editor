@@ -37,6 +37,7 @@ NO_CHANGES = "no_changes"
 PACKAGE_SIGNED = "package_signed"
 UNSUPPORTED_EXTENSION = "unsupported_extension"
 REPARSE_POINT = "reparse_point"
+LIVE_UNLOAD_FAILED = "live_unload_failed"
 SAME_PATH = "same_path"
 UNKNOWN = "unknown"
 
@@ -143,6 +144,10 @@ REASON_EXPLANATIONS: dict[str, tuple[str, str]] = {
     SAME_PATH: (
         "The destination is the same file as the original.",
         "Choose a different destination.",
+    ),
+    LIVE_UNLOAD_FAILED: (
+        "Office could not close the add-in for the save.",
+        "Finish editing in Office (leave the cell, close dialogs), then Save again.",
     ),
     UNKNOWN: (
         "The operation failed for an unexpected reason.",

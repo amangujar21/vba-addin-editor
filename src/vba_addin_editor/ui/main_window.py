@@ -27,6 +27,7 @@ from vba_addin_editor.domain.document import (
     revert_all,
 )
 from vba_addin_editor.domain.history import HistoryCommand
+from vba_addin_editor.platform import office_live
 from vba_addin_editor.platform import windows_processes as wp
 from vba_addin_editor.platform.paths import appdata_root
 from vba_addin_editor.platform.prescan import READY, Prescan
@@ -229,6 +230,7 @@ class MainWindow:
         self.settings = load_settings(self._settings_path)
         self.save_service.auto_backup = self.settings.auto_backup
         self.auto_backup_var = tk.BooleanVar(master=root, value=self.settings.auto_backup)
+        self.live_reload_var = tk.BooleanVar(master=root, value=self.settings.live_reload)
         if root_path is None:
             enable_source_disk_cache(appdata_root() / "source-cache" / f"pyopenvba-{PYOPENVBA_PIN}")
 
@@ -309,6 +311,11 @@ class MainWindow:
             label="Back Up Automatically on Save",
             variable=self.auto_backup_var,
             command=self._on_auto_backup_toggled,
+        )
+        file_menu.add_checkbutton(
+            label="Save While Office Is Open (Reload the Add-in)",
+            variable=self.live_reload_var,
+            command=self._on_live_reload_toggled,
         )
         file_menu.add_command(label="Restore Backup…", command=self.restore_backup)
         file_menu.add_command(label="Backup Browser…", command=self.backup_browser)
@@ -571,6 +578,11 @@ class MainWindow:
         menu.add_separator()
         menu.add_checkbutton(
             label="Back Up Automatically on Save", variable=self.auto_backup_var, command=self._on_auto_backup_toggled
+        )
+        menu.add_checkbutton(
+            label="Save While Office Is Open (Reload the Add-in)",
+            variable=self.live_reload_var,
+            command=self._on_live_reload_toggled,
         )
         menu.add_separator()
         menu.add_command(label="Zoom In", accelerator="Ctrl+=", command=lambda: self.zoom(1))
@@ -1586,7 +1598,7 @@ class MainWindow:
                 "Windows could not list running programs. Close Excel and PowerPoint "
                 "before saving; the editor will check again on the next save."
             )
-        elif self._live_host_running and self._queued_save is None:
+        elif self._live_host_running and self._queued_save is None and not self._live_enabled():
             self._set_banner(
                 f"Close {self._host_label} before saving this add-in."
             )
@@ -2098,36 +2110,59 @@ class MainWindow:
         if not self._review_and_confirm(operation_type="save"):
             return
         path = self.draft.baseline.path
-        blocked = self.save_service.host_block(path)
+        live = self._ask_office(path)
+        if live is not None and live.loaded:
+            if live.unsaved and not messagebox.askyesno(
+                APP_NAME,
+                f"{live.label} holds unsaved changes to {path.name}, probably edits "
+                f"made in its VBA editor.\n\nSaving closes {path.name} in {live.label} "
+                "and loads the saved file, so those changes are lost.\n\n"
+                "Discard them and save?",
+                icon="warning",
+            ):
+                return
+            self._save_confirmed(live=live)
+            return
+        host_checked = live is not None  # Office answered: it does not have the file loaded
+        blocked = self.save_service.host_block(path, host_checked=host_checked)
         if blocked is not None and blocked.reason == "file_in_use":
-            blocked = self._wait_for_free_file(path)
+            blocked = self._wait_for_free_file(path, host_checked=host_checked)
         if blocked is not None:
             self._offer_queued_save(blocked)
             return
-        self._save_confirmed()
+        self._save_confirmed(live=live)
 
-    def _wait_for_free_file(self, path: Path):
+    def _wait_for_free_file(self, path: Path, *, host_checked: bool = False):
         """Give a briefly held file (antivirus, sync, indexing) a few seconds, off the Tk thread."""
         wait = self.save_service.lock_wait_seconds
         self._saving = True
         self._refresh_state()
         try:
             return self._run_in_background(
-                lambda: self.save_service.host_block(path, wait=wait),
+                lambda: self.save_service.host_block(path, wait=wait, host_checked=host_checked),
                 f"Waiting for {path.name} to be free…",
             )
         finally:
             self._saving = False
             self._refresh_state()
 
-    def _save_confirmed(self, *, merged_external: bool = False) -> None:
-        """Run the reviewed save; recover from Office holding or rewriting the file."""
+    def _save_confirmed(
+        self, *, merged_external: bool = False, live: office_live.LiveState | None = None
+    ) -> None:
+        """Run the reviewed save; recover from Office holding or rewriting the file.
+
+        ``live``: Office was asked about the file (it may have it loaded); the
+        save closes it there for the commit and loads it again.
+        """
         self._saving = True
         self._refresh_state()
         result = None
         published = None
+        label = "Saving…"
+        if live is not None and live.loaded:
+            label = f"Saving and reloading in {live.label}…"
         try:
-            result, published = self._run_in_background(self._save_work)
+            result, published = self._run_in_background(lambda: self._save_work(live), label)
         except Exception as exc:  # noqa: BLE001 - UI boundary
             from vba_addin_editor.domain.results import SaveResult
 
@@ -2151,7 +2186,7 @@ class MainWindow:
             and self.session is not None
         ):
             if self._adopt_external_changes():
-                self._save_confirmed(merged_external=True)
+                self._save_confirmed(merged_external=True, live=live)
             return
         note = ""
         if merged_external and result.kind == "success" and self.draft is not None:
@@ -2303,11 +2338,20 @@ class MainWindow:
                 self._open_module_at(moved.id, 1)
         return True
 
-    def _save_work(self):
-        """Worker-thread half of save: commit, then publish the session baseline."""
+    def _save_work(self, live: office_live.LiveState | None = None):
+        """Worker-thread half of save: commit, then publish the session baseline.
+
+        With ``live``, a HostSwap (made, used and dropped on this thread, as
+        COM requires) closes the file in Office for the commit and reloads it.
+        The user already agreed to lose changes Office held unsaved.
+        """
         draft = self.draft
         assert draft is not None
-        result = self.save_service.save_addin(draft)
+        if live is None:
+            result = self.save_service.save_addin(draft)
+        else:
+            with office_live.HostSwap(draft.baseline.path, discard_unsaved=live.unsaved) as swap:
+                result = self.save_service.save_addin(draft, swap=swap)
         published = None
         if result.kind == "success" and self.session is not None:
             saved = Path(str(result.details.get("saved") or draft.baseline.path))
@@ -2320,8 +2364,10 @@ class MainWindow:
     def _handle_save_result(self, result, *, published=None, note: str = "") -> None:
         self._last_result = result
         kind = result.kind
+        live_host = result.details.get("live_host") if kind == "success" else None
         if kind == "success":
-            if self.draft is not None:
+            if self.draft is not None and not result.details.get("live_reloaded"):
+                # A reloaded add-in was just read by Office: the scan is spent.
                 self._start_prescan(
                     Path(str(result.details.get("saved") or self.draft.baseline.path))
                 )
@@ -2359,6 +2405,12 @@ class MainWindow:
             self._refresh_ribbon_views()
             self._refresh_state()
             name = self.draft.baseline.path.name if self.draft else ""
+            reload_error = result.details.get("live_reload_error")
+            if reload_error:
+                note = (note + "\n\n" if note else "") + (
+                    f"{live_host} could not load the saved {name} again: {reload_error}\n\n"
+                    f"Load it in {live_host} (Add-ins), or restart {live_host}."
+                )
             if note or warning:
                 msg = "Saved successfully."
                 if note:
@@ -2374,9 +2426,18 @@ class MainWindow:
                     if result.backup_path
                     else "No backup was made: automatic backup is off."
                 )
-                self.toast.show(f"Saved {name}", kept + " The antivirus check runs in the status bar.")
+                if live_host:
+                    self.toast.show(
+                        f"Saved {name} and reloaded it in {live_host}",
+                        # Office rebuilds the add-in's ribbon when its window is next active.
+                        kept + f" Switch to {live_host}: new buttons and macros are ready there.",
+                    )
+                else:
+                    self.toast.show(f"Saved {name}", kept + " The antivirus check runs in the status bar.")
                 self.status.config(
-                    text=f"Saved {name} · " + ("backup kept" if result.backup_path else "no backup")
+                    text=f"Saved {name} · "
+                    + ("backup kept" if result.backup_path else "no backup")
+                    + (f" · reloaded in {live_host}" if live_host else "")
                 )
         elif kind == "no_changes":
             messagebox.showinfo(APP_NAME, result.message or "No changes to save.")
@@ -2865,6 +2926,45 @@ class MainWindow:
             + ("" if saved else " (This choice could not be saved for next time.)")
         )
 
+    def _on_live_reload_toggled(self) -> None:
+        enabled = bool(self.live_reload_var.get())
+        self.settings.live_reload = enabled
+        saved = save_settings(self.settings, self._settings_path)
+        self._refresh_state()
+        self.status.config(
+            text=(
+                "Saving while Office is open is on: the add-in is closed and reloaded there on Save."
+                if enabled
+                else "Saving while Office is open is off: close Office before saving."
+            )
+            + ("" if saved else " (This choice could not be saved for next time.)")
+        )
+
+    def _live_enabled(self) -> bool:
+        return self.settings.live_reload and office_live.available()
+
+    def _ask_office(self, path: Path) -> office_live.LiveState | None:
+        """Ask the running Office whether it has ``path`` loaded.
+
+        None when live reload is off, the host is not running (nothing to ask)
+        or Office could not be asked; the old rule (close Office first) applies.
+        """
+        if not self._live_enabled() or office_live.host_of(path) is None:
+            return None
+        if not wp.probe_host_process(path).corresponding_host_running:
+            return None
+        self._saving = True
+        self._refresh_state()
+        try:
+            state = self._run_in_background(
+                lambda: office_live.locate(path),
+                f"Asking {wp.corresponding_host_label(path)} about {path.name}…",
+            )
+        finally:
+            self._saving = False
+            self._refresh_state()
+        return None if state.error else state
+
     def backup_now(self) -> None:
         """Copy the add-in as it is on disk to a same-folder backup file."""
         if self.draft is None:
@@ -2975,7 +3075,8 @@ class MainWindow:
             "Edits VBA source inside installed .xlam / .ppam add-ins and .pptm\n"
             "presentations, in place, with verification and optional backups.\n\n"
             "Ordinary class modules can be deleted and renamed when PROJECT/dir\n"
-            "metadata agrees. Close the corresponding Office host before saving.\n\n"
+            "metadata agrees. An add-in Office has loaded is closed there for the\n"
+            "save and loaded again.\n\n"
             "Uses pyOpenVBA (MIT) — see Help → Third-party notices.",
         )
 

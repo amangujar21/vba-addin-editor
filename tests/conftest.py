@@ -409,6 +409,17 @@ def replace_package_payload():
 
 
 @pytest.fixture(autouse=True)
+def _no_live_office(monkeypatch):
+    """Tests never reach the user's running Office; live-reload tests opt back in."""
+    from vba_addin_editor.platform import office_live
+
+    def locate(path):
+        return office_live.LiveState(office_live.host_of(path), loaded=False, error="off in tests")
+
+    monkeypatch.setattr(office_live, "locate", locate)
+
+
+@pytest.fixture(autouse=True)
 def _no_modal_review(monkeypatch):
     """A test that reaches the review dialog without patching main_window.ask_review fails, not hangs."""
     from vba_addin_editor.ui import review_dialog

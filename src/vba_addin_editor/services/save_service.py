@@ -18,6 +18,7 @@ import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 from vba_addin_editor.adapters.ooxml_package_adapter import (
     XML_EDITABLE_EXTENSIONS,
@@ -38,6 +39,21 @@ from vba_addin_editor.platform import windows_processes as wp
 from vba_addin_editor.platform.session_store import sessions_root
 
 CommitFn = Callable[[Path, Path, Path | None], None]
+
+
+class HostSwap(Protocol):
+    """Office that has the file loaded: close it for the commit, load it again after.
+
+    ``platform.office_live.HostSwap`` is the real one. ``unload`` returns True
+    when it closed the file and raises an exception carrying a user message
+    when Office refused; ``reload`` runs after the commit whatever its outcome.
+    """
+
+    label: str
+
+    def unload(self) -> bool: ...
+
+    def reload(self) -> None: ...
 
 
 @dataclass
@@ -294,19 +310,26 @@ class SaveService:
             win32_name=probe.win32_name,
         )
 
-    def host_block(self, original: Path, *, wait: float = 0.0) -> SaveResult | None:
+    def host_block(
+        self, original: Path, *, wait: float = 0.0, host_checked: bool = False
+    ) -> SaveResult | None:
         """Why ``original`` cannot be replaced right now (Office running, file in use), or None.
 
         ``wait`` gives a briefly held file that long to come free; keep it 0 on
-        the Tk thread.
+        the Tk thread. ``host_checked``: Office was asked directly and does not
+        have the file loaded, so only whether the file is free matters.
         """
-        return self._office_block(original, stage="preflight") or self._lock_block(
-            original, stage="preflight", wait=wait
-        )
+        if not host_checked:
+            blocked = self._office_block(original, stage="preflight")
+            if blocked is not None:
+                return blocked
+        return self._lock_block(original, stage="preflight", wait=wait)
 
-    def _race_narrowing(self, original: Path, draft: DocumentDraft, candidate: Path) -> SaveResult | None:
+    def _race_narrowing(
+        self, original: Path, draft: DocumentDraft, candidate: Path, *, live: bool = False
+    ) -> SaveResult | None:
         self._report("Final pre-commit checks")
-        blocked = self._office_block(original, stage="pre_commit")
+        blocked = None if live else self._office_block(original, stage="pre_commit")
         if blocked is not None:
             _discard(candidate)
             return blocked
@@ -320,21 +343,34 @@ class SaveService:
             return blocked
         return None
 
-    def _initial_race_narrowing(self, draft: DocumentDraft) -> SaveResult | None:
-        """Stage B/C preflight before any candidate work."""
+    def _initial_race_narrowing(self, draft: DocumentDraft, *, live: bool = False) -> SaveResult | None:
+        """Stage B/C preflight before any candidate work.
+
+        ``live``: a HostSwap closes the file in Office just before the commit,
+        so Office running (and holding the file) is expected now; the
+        pre-commit lock probe still has to pass.
+        """
         original = draft.baseline.path
-        self._report("Checking Office is closed")
-        blocked = self._office_block(original, stage="preflight")
-        if blocked is not None:
-            return blocked
-        self._report("Checking the file is not in use")
-        blocked = self._lock_block(original, stage="preflight", wait=self.lock_wait_seconds)
-        if blocked is not None:
-            return blocked
+        if not live:
+            self._report("Checking Office is closed")
+            blocked = self._office_block(original, stage="preflight")
+            if blocked is not None:
+                return blocked
+            self._report("Checking the file is not in use")
+            blocked = self._lock_block(original, stage="preflight", wait=self.lock_wait_seconds)
+            if blocked is not None:
+                return blocked
         self._report("Checking the original file")
         return self._fingerprint_block(original, draft, stage="preflight")
 
-    def save_addin(self, draft: DocumentDraft) -> SaveResult:
+    def save_addin(self, draft: DocumentDraft, *, swap: HostSwap | None = None) -> SaveResult:
+        """Verify, write and commit the draft.
+
+        ``swap``: save while Office runs. The add-in is closed in Office right
+        before the commit (after the candidate is built and verified, so it is
+        gone for as short a time as possible) and loaded again afterwards. The
+        Office-running gate is skipped; the lock and fingerprint gates are not.
+        """
         original = draft.baseline.path
 
         # Stage A — composite change detection (no write when clean).
@@ -344,7 +380,7 @@ class SaveService:
             return SaveResult.no_changes()
 
         # Stage B/C — host/process, lock, external-change preflight.
-        preflight = self._initial_race_narrowing(draft)
+        preflight = self._initial_race_narrowing(draft, live=swap is not None)
         if preflight is not None:
             return preflight
 
@@ -390,8 +426,48 @@ class SaveService:
                 f"The edited package could not be written: {exc!r}", reason="build"
             )
 
+        if swap is None:
+            return self._commit_stage(draft, original, candidate, built, reference)
+        self._report(f"Closing {original.name} in {swap.label}")
+        try:
+            unloaded = swap.unload()
+        except Exception as exc:  # noqa: BLE001 - Office refused; nothing was replaced
+            _discard(candidate)
+            return SaveResult.blocked(
+                "live_unload_failed",
+                f"{exc}\n\nNothing was saved; {original.name} is still loaded.",
+                stage="pre_commit",
+            )
+        reload_error = None
+        try:
+            result = self._commit_stage(draft, original, candidate, built, reference, live=True)
+        finally:
+            if unloaded:
+                self._report(f"Reloading {original.name} in {swap.label}")
+                try:
+                    swap.reload()
+                except Exception as exc:  # noqa: BLE001 - reported with the result
+                    reload_error = str(exc) or type(exc).__name__
+        if unloaded:
+            result.details["live_host"] = swap.label
+            result.details["live_reloaded"] = reload_error is None
+            if reload_error is not None:
+                result.details["live_reload_error"] = reload_error
+        return result
+
+    def _commit_stage(
+        self,
+        draft: DocumentDraft,
+        original: Path,
+        candidate: Path,
+        built: bytes,
+        reference: bytes,
+        *,
+        live: bool = False,
+    ) -> SaveResult:
+        """Stages L-N for a written candidate: last checks, commit, post-commit proof."""
         # Stage L — narrow the race window.
-        race = self._race_narrowing(original, draft, candidate)
+        race = self._race_narrowing(original, draft, candidate, live=live)
         if race is not None:
             return race
 

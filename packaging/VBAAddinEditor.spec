@@ -38,7 +38,7 @@ if release_mode and dirty:
     raise SystemExit("Release builds require a clean git tree.")
 mode = "onefile" if ONEFILE else "onedir"
 identity = {
-    "version": "0.12.0",
+    "version": "0.13.0",
     "source_commit": commit,
     "dirty_tree": dirty,
     "build_time_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -46,7 +46,11 @@ identity = {
     "python_architecture": "64bit" if sys.maxsize > 2**32 else "32bit",
     "packaged_mode": mode if not dirty or not release_mode else f"{mode}-dirty",
     "pyopenvba_pin": "6.6.0",
-    "dependencies": {"pyopenvba": "6.6.0", "pillow": metadata.version("pillow")},
+    "dependencies": {
+        "pyopenvba": "6.6.0",
+        "pillow": metadata.version("pillow"),
+        "pywin32": metadata.version("pywin32"),
+    },
 }
 if dirty and not release_mode:
     identity["packaged_mode"] = f"{mode}-development-dirty"
@@ -75,7 +79,15 @@ a = Analysis(
         ("../README.md", "."),
         (str(PILLOW_LICENSE), "licenses/pillow"),
     ],
-    hiddenimports=["pyopenvba", "pyopenvba._templates"],
+    # Live reload (platform/office_live.py) imports pywin32's COM modules lazily.
+    hiddenimports=[
+        "pyopenvba",
+        "pyopenvba._templates",
+        "pythoncom",
+        "pywintypes",
+        "win32com.client",
+        "win32com.client.dynamic",
+    ],
     hookspath=[],
     runtime_hooks=[],
     # Icons only need Pillow's core, PNG/JPEG/BMP/GIF/ICO readers and ImageGrab:

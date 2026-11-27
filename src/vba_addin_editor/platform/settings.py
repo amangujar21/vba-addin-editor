@@ -14,6 +14,8 @@ from vba_addin_editor.platform.session_store import write_json_atomic
 class Settings:
     # Keep the replaced file as a same-folder backup on every in-place save.
     auto_backup: bool = True
+    # Save while Office has the add-in loaded: close it there, commit, load it again.
+    live_reload: bool = True
     theme: str = "dark"
     editor_font_size: int = 11
     # Most recently opened first.

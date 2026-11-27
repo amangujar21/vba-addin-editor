@@ -6,23 +6,27 @@ IDE, and without reinstalling the add-in. For `.xlam`/`.ppam`/`.pptm`, existing 
 package parts (`.xml`, `.rels`, `[Content_Types].xml`) can be edited too.
 
 VBA Add-in Editor safely patches the VBA project inside the actual installed
-add-in file while Office is closed, verifies the edited add-in before replacing
-anything, keeps a backup (unless you turn that off), keeps the same path, and
-lets Office load the updated code the next time it starts.
+add-in file, verifies the edited add-in before replacing anything, keeps a
+backup (unless you turn that off), and keeps the same path. If Excel or
+PowerPoint has the add-in loaded, Save closes just that add-in there, replaces
+the file and loads it again, so new macros and buttons are usable straight
+away without restarting Office (see **Saving while Office is open** below).
 
 ## What it does
 
-1. You can open the add-in while Excel or PowerPoint is running. Edits are kept
-   in the editor; the corresponding host must still be closed before a successful
-   in-place save. Close Excel for `.xlam`, or PowerPoint for `.ppam`/`.pptm`.
-   The unrelated host does not block saving. If you click **Save** while
-   the host is running (or still shutting down, or another program has the file
-   open), the editor first gives a briefly held file (antivirus, cloud sync,
-   indexing) a few seconds, and names the program holding it when Windows can
-   tell. Otherwise it offers to wait: a bar shows it is waiting, and it saves as
-   soon as the file is free (**Cancel Auto-Save** stops waiting). Edits made
-   while it waits are reviewed again before saving. Keep the window open — do
-   not reload.
+1. You can open and save the add-in while Excel or PowerPoint is running.
+   When Office has it loaded, Save reloads it there (below). When Office runs
+   without it, Save goes ahead as long as no program holds the file. With
+   **File → Save While Office Is Open** off, or when Office cannot be asked
+   (pywin32 missing, Office not responding), the old rule applies: close Excel
+   for `.xlam`, or PowerPoint for `.ppam`/`.pptm`; the unrelated host never
+   blocks saving. If the file is held (by Office, or still shutting down, or
+   by another program), the editor first gives a briefly held file
+   (antivirus, cloud sync, indexing) a few seconds, and names the program
+   holding it when Windows can tell. Otherwise it offers to wait: a bar shows
+   it is waiting, and it saves as soon as the file is free (**Cancel
+   Auto-Save** stops waiting). Edits made while it waits are reviewed again
+   before saving. Keep the window open — do not reload.
    If Office saved the add-in itself in the meantime (an add-in that calls
    `ThisWorkbook.Save`, Ctrl+S in the VBE), Save rebases your edits onto that
    version: changes that do not overlap merge automatically and the save goes
@@ -360,10 +364,46 @@ decompress modules that have not changed. The folder can be deleted at any time.
   changes VBA removes the stale signature parts, their relationships and
   content-type overrides as Office does; verification allows exactly those
   package edits.
-- The corresponding Office host must be closed to save in place. The tool does
-  not hot-patch a loaded add-in, manage add-in registration, or change file
+- A loaded add-in is never patched in memory: Save closes it in Office,
+  replaces the file, and loads it again (**Saving while Office is open**).
+  The tool does not otherwise manage add-in registration or change file
   locations — the edited file keeps the same path, so existing registration
   stays valid.
+
+## Saving while Office is open
+
+Office keeps a loaded add-in's file locked, and builds an add-in's ribbon only
+when it loads it. So when you save an add-in that Excel or PowerPoint has
+loaded (**File → Save While Office Is Open (Reload the Add-in)**, on by
+default), the editor:
+
+1. builds and verifies the edited file while the add-in stays loaded;
+2. closes only that add-in in Office. Your workbooks, presentations and other
+   add-ins stay open. Excel runs the add-in's `Auto_Close` and
+   `Workbook_BeforeClose`; PowerPoint its `Auto_Close`;
+3. replaces the file exactly as a normal save does (same checks, backup and
+   verification);
+4. loads the add-in again from the same path: Excel runs `Workbook_Open` and
+   `Auto_Open`, as at startup; PowerPoint restores the add-in's
+   registration and auto-load flags.
+
+Office is unloaded only for the commit itself, under a second for a small
+add-in. If the save fails, the old file is loaded again. Switch to Office
+afterwards: it rebuilds the add-in's ribbon when its window becomes active,
+so new tabs, groups and buttons appear then. Quick Access Toolbar entries for
+the add-in's buttons come back as long as their control ids are unchanged.
+
+- If Office holds unsaved changes to the add-in (edits in its VBA editor),
+  Save asks first: reloading discards them.
+- If Office is busy (a cell being edited, a dialog open), Save says so and
+  writes nothing; finish in Office and save again.
+- If Office cannot load the saved file again, the save still stands and the
+  editor says so; load it from Office's Add-ins dialog or restart Office.
+- Excel is found by the file's path (it registers every open workbook), so
+  several Excel instances are fine. PowerPoint runs one instance. A `.pptm`
+  presentation is closed and reopened in a new window.
+- This uses COM through pywin32 (bundled in the release executable), and
+  only on Save. Everything else in the editor stays offline and Office-free.
 
 ## Development
 
@@ -395,6 +435,15 @@ Office-authored fixtures placed in `tests/fixtures/` (`xlam/RealAddin.xlam`,
 `customUI` part containing `VBAAE_XML_ORIGINAL`). The automated live cycle
 edits that XML marker and VBA code in one save; a human then verifies Excel or
 PowerPoint opens the saved file with **no repair dialog** and runs the macro.
+
+Saving while Office is open has a live gate too:
+`tests/integration/test_live_reload_office.py` (with `VBAAE_LIVE_OFFICE=1`)
+loads a copy of the Excel and PowerPoint fixtures in a visible Office, then,
+through the editor window, adds a module and a ribbon tab with a button and
+saves while the add-in stays loaded. It asks Office to run the new macro, and
+finds the new button on Office's ribbon by its label with UI Automation
+(`scripts/ribbon_click.ps1`) and clicks it, which runs its macro. A second
+round adds another macro and button the same way.
 
 UserForms have their own live gate. `python scripts/make_office_fixtures.py`
 has Excel and PowerPoint author the fixtures (Excel needs "Trust access to the

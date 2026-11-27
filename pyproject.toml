@@ -1,6 +1,6 @@
 [project]
 name = "vba-addin-editor"
-version = "0.12.0"
+version = "0.13.0"
 description = "Safely edit VBA source inside installed Excel .xlam and PowerPoint .ppam add-ins, in place, with backup and verification."
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -10,6 +10,9 @@ dependencies = [
     "pyopenvba==6.6.0",
     # Custom ribbon icons: clipboard grab, resize, PNG encode. Imported lazily.
     "pillow>=10.1,<13",
+    # Live reload: close and reload the add-in in a running Excel/PowerPoint
+    # (COM, late bound). Imported lazily; without it saves need Office closed.
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

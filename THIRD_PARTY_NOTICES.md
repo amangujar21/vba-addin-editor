@@ -71,6 +71,15 @@ OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 PERFORMANCE OF THIS SOFTWARE.
 ```
 
+## pywin32
+
+- Version range: **>=306** — https://pypi.org/project/pywin32/
+- Used for live reload: closing and reloading an add-in in a running Excel or
+  PowerPoint through COM, so it can be saved without closing Office.
+- PSF License (Python Software Foundation License Version 2), copyright
+  Mark Hammond and contributors. Full text:
+  https://github.com/mhammond/pywin32/blob/main/Pythonwin/License.txt
+
 ## Python / Tcl/Tk
 
 This application is distributed with the Python runtime and its Tcl/Tk
