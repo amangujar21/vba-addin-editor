@@ -21,8 +21,6 @@ from vba_addin_editor.domain.capabilities import RESTRICTION_MESSAGES
 from vba_addin_editor.domain.changes import compute_changes, dirty_count
 from vba_addin_editor.domain.document import (
     DocumentDraft,
-    FormControlSnapshot,
-    FormDesignSnapshot,
     ModuleDisplayKind,
     ModuleDraft,
     new_module_id,
@@ -33,6 +31,7 @@ from vba_addin_editor.platform import windows_processes as wp
 from vba_addin_editor.platform.paths import appdata_root
 from vba_addin_editor.platform.prescan import READY, Prescan
 from vba_addin_editor.platform.settings import load_settings, save_settings
+from vba_addin_editor.services import form_service as fs
 from vba_addin_editor.services import icon_service
 from vba_addin_editor.services import port_service as ps
 from vba_addin_editor.services import ribbon_service as rs
@@ -70,6 +69,7 @@ from vba_addin_editor.ui.command_palette import (
     PaletteItem,
 )
 from vba_addin_editor.ui.conflict_dialog import ConflictDialog
+from vba_addin_editor.ui.form_designer import FormDesigner
 from vba_addin_editor.ui.review_dialog import REVERT, SAVE, ReviewView, ask_review, entry_from_item
 from vba_addin_editor.ui.ribbon_designer import RibbonDesigner
 from vba_addin_editor.ui.ribbon_dialogs import (
@@ -338,6 +338,10 @@ class MainWindow:
         module_menu = self._header_menu("Module")
         module_menu.add_command(label="Add Standard Module…", command=lambda: self.add_module(standard=True))
         module_menu.add_command(label="Add Class Module…", command=lambda: self.add_module(standard=False))
+        module_menu.add_command(label="Add UserForm…", command=self.new_userform)
+        module_menu.add_command(
+            label="Import UserForm from Another Add-in…", command=self.import_userform
+        )
         module_menu.add_command(label="Rename…", command=self.rename_module)
         module_menu.add_command(label="Delete", command=self.delete_module)
         module_menu.add_separator()
@@ -497,7 +501,13 @@ class MainWindow:
         self.ribbon_designer = RibbonDesigner(self.ribbon_tab, self)
         self.ribbon_designer.pack(fill="both", expand=True)
         self.forms_tab = ttk.Frame(self.editor_notebook)
-        self._build_forms_tab(self.forms_tab)
+        self.form_designer = FormDesigner(self.forms_tab, self)
+        self.form_designer.pack(fill="both", expand=True)
+        # Names the rest of the window (and its tests) use for the view's parts.
+        self.forms_tree = self.form_designer.tree
+        self.form_props = self.form_designer.props
+        self.form_code_btn = self.form_designer.code_btn
+        self.form_heading = self.form_designer.heading
         self.xml_tab = ttk.Frame(self.editor_notebook)
         self._build_xml_tab(self.xml_tab)
         self.editor_notebook.add(self.vba_tab, text="Code")
@@ -597,6 +607,9 @@ class MainWindow:
             self._flush_all_editors()
             self._ribbon_surface = "design"
             self.ribbon_designer.refresh()
+        elif view == str(self.forms_tab):
+            self._flush_all_editors()
+            self.form_designer.refresh()
         elif view == str(self.xml_tab) and rs.is_ribbon_part(self.current_xml_part_path or ""):
             self._ribbon_surface = "xml"
         self._sync_rail()
@@ -792,6 +805,7 @@ class MainWindow:
             button.apply_palette()
         for side in self._sidebars:
             side.apply_palette()
+        self.form_designer.apply_palette()
         self.host_pill.configure(
             background=colors.bg0, highlightbackground=colors.border_strong, highlightcolor=colors.border_strong
         )
@@ -872,8 +886,12 @@ class MainWindow:
         self._menus.append(self.add_module_menu)
         self.add_module_menu.add_command(label="Standard Module…", command=lambda: self.add_module(standard=True))
         self.add_module_menu.add_command(label="Class Module…", command=lambda: self.add_module(standard=False))
+        self.add_module_menu.add_command(label="UserForm…", command=self.new_userform)
         self.add_module_menu.add_separator()
         self.add_module_menu.add_command(label="Import .bas/.cls…", command=self.import_file)
+        self.add_module_menu.add_command(
+            label="Import UserForm from Another Add-in…", command=self.import_userform
+        )
         # Two lists share the sidebar: the modules, and the procedures of the open one.
         side = ttk.Frame(panes, width=264)
         side.pack_propagate(False)
@@ -968,118 +986,11 @@ class MainWindow:
 
         self.current_xml_part_path: str | None = None
 
-    def _build_forms_tab(self, parent) -> None:
-        """Read-only UserForm layouts, as stored in the file when it was opened."""
-        panes = ttk.Panedwindow(parent, orient="horizontal")
-        panes.pack(fill="both", expand=True)
-        side, self.forms_tree = self._build_sidebar(panes, "USERFORMS")
-        self.forms_tree.column("badge", width=0, minwidth=0)
-        self.forms_tree.bind("<<TreeviewSelect>>", self.on_form_item_selected)
-        panes.add(side, weight=0)
-
-        main = ttk.Frame(panes, style="Editor.TFrame")
-        bar = self._crumb_bar(main)
-        ttk.Label(bar, text=icon("lock"), style="CrumbSep.TLabel").pack(side="left", padx=(0, 6))
-        self.form_heading = ttk.Label(bar, text="", style="CrumbStrong.TLabel", anchor="w")
-        self.form_heading.pack(side="left", fill="x", expand=True)
-        self.form_code_btn = ttk.Button(
-            bar, text="Go to code", style="EditorText.TButton", command=self.goto_form_code,
-            state="disabled", takefocus=False,
-        )
-        self.form_code_btn.pack(side="right")
-        ttk.Label(
-            main,
-            text=(
-                "Layout is read-only. Only properties that differ from the control's "
-                "default are stored in the file, so only those are listed."
-            ),
-            style="EditorInfo.TLabel",
-            padding=(14, 8),
-        ).pack(fill="x", side="bottom")
-        props = ttk.Frame(main, style="Editor.TFrame", padding=(6, 6, 0, 0))
-        props.pack(fill="both", expand=True)
-        self.form_props = ttk.Treeview(
-            props, columns=("value",), show="tree headings", selectmode="browse", style="Editor.Treeview"
-        )
-        self.form_props.heading("#0", text="Property", anchor="w")
-        self.form_props.heading("value", text="Value", anchor="w")
-        self.form_props.column("#0", width=220, stretch=False)
-        props_sb = ttk.Scrollbar(props, orient="vertical", command=self.form_props.yview)
-        self.form_props.configure(yscrollcommand=theme.autohide(props_sb, side="right", fill="y"))
-        self.form_props.pack(side="left", fill="both", expand=True)
-        panes.add(main, weight=1)
-
-        self._form_items: dict[str, tuple[str, FormDesignSnapshot | FormControlSnapshot]] = {}
-
     def _refresh_forms(self) -> None:
-        self.forms_tree.delete(*self.forms_tree.get_children())
-        self.form_props.delete(*self.form_props.get_children())
-        self._form_items.clear()
-        self.form_code_btn.config(state="disabled")
-        draft = self.draft
-        if draft is None:
-            self.form_heading.config(text="")
-            return
-        if not draft.baseline.forms:
-            self.form_heading.config(text="This project has no UserForms")
-            return
-        self.form_heading.config(text="Select a form or control to see its stored properties")
-        deleted = {
-            (m.origin_name or m.current_name).casefold() for m in draft.deleted_original_modules()
-        }
-        orphans = draft.baseline.orphan_form_names()
-        for form in draft.baseline.forms:
-            label = form.name
-            if form.problem:
-                label += " [unreadable]"
-            elif form.name.casefold() in orphans:
-                label += " [layout only — no code module]"
-            elif form.name.casefold() in deleted:
-                label += " [deleted — pending save]"
-            iid = f"form::{form.name}"
-            self.forms_tree.insert("", "end", iid=iid, text=label, open=True)
-            self._form_items[iid] = (form.name, form)
-            self._insert_form_controls(iid, form.name, form.controls)
-
-    def _insert_form_controls(self, parent: str, form_name: str, controls) -> None:
-        for control in controls:
-            iid = f"{parent}/{control.name}"
-            kind = control.kind.rsplit(".", 1)[-1]
-            self.forms_tree.insert(parent, "end", iid=iid, text=f"{control.name}  ({kind})", open=True)
-            self._form_items[iid] = (form_name, control)
-            self._insert_form_controls(iid, form_name, control.children)
-
-    def on_form_item_selected(self, _event=None) -> None:
-        selection = self.forms_tree.selection()
-        if not selection or selection[0] not in self._form_items:
-            return
-        form_name, item = self._form_items[selection[0]]
-        self.form_props.delete(*self.form_props.get_children())
-        if isinstance(item, FormDesignSnapshot):
-            heading = f"{item.name}  ·  {item.control_count()} control(s)"
-            if item.problem:
-                heading += f"  ·  the layout could not be read: {item.problem}"
-        else:
-            heading = f"{form_name}  ›  {item.name}  ({item.kind.rsplit('.', 1)[-1]})"
-        self.form_heading.config(text=heading)
-        for name, value in item.properties:
-            self.form_props.insert("", "end", text=name, values=(value,))
-        self.form_code_btn.config(
-            state="normal" if self._form_code_module(form_name) is not None else "disabled"
-        )
-
-    def _form_code_module(self, form_name: str) -> ModuleDraft | None:
-        if self.draft is None:
-            return None
-        return self.draft.find_current(form_name)
+        self.form_designer.refresh()
 
     def goto_form_code(self) -> None:
-        selection = self.forms_tree.selection()
-        if not selection or selection[0] not in self._form_items:
-            return
-        mod = self._form_code_module(self._form_items[selection[0]][0])
-        if mod is not None:
-            self._open_module_at(mod.id, 1)
+        self.form_designer.open_code()
 
     def _build_statusbar(self) -> None:
         self.statusbar = ttk.Frame(self.root, style="Chrome.TFrame", padding=(6, 0))
@@ -2783,8 +2694,8 @@ class MainWindow:
         self._refresh_tree()
         self._refresh_state()
 
-    def delete_module(self) -> None:
-        mod = self._selected_module()
+    def delete_module(self, mod: ModuleDraft | None = None) -> None:
+        mod = mod or self._selected_module()
         if mod is None or self.draft is None:
             return
         if not (mod.can_delete or mod.is_new):
@@ -2800,11 +2711,11 @@ class MainWindow:
             prompt = (
                 f'Delete UserForm "{mod.current_name}"?\n\nThis removes the form\'s code '
                 "AND its layout (all of its controls) from the VBA project when you save. "
-                "The layout cannot be exported or re-imported by this editor; "
                 + (
-                    "the pre-save backup is the only way to get it back."
+                    "To get it back after saving, import it from the pre-save backup "
+                    "(Module → Import UserForm from Another Add-in)."
                     if self.save_service.auto_backup
-                    else "automatic backup is off, so use File → Back Up Now before "
+                    else "Automatic backup is off, so use File → Back Up Now before "
                     "saving if you may want it back."
                 )
                 + "\n\nIt is not written to the file until Save File."
@@ -2831,7 +2742,7 @@ class MainWindow:
         self._refresh_tree()
         self._refresh_state()
 
-    def _prompt_name(self, title: str, initial: str) -> str | None:
+    def _prompt_name(self, title: str, initial: str, action: str | None = None) -> str | None:
         win = tk.Toplevel(self.root)
         win.title(title)
         win.transient(self.root)
@@ -2846,7 +2757,8 @@ class MainWindow:
             result[0] = var.get().strip()
             win.destroy()
 
-        ttk.Button(win, text="Create" if initial == "" else "Rename", command=confirm).grid(row=1, column=1, sticky="e", padx=8, pady=8)
+        label = action or ("Create" if initial == "" else "Rename")
+        ttk.Button(win, text=label, command=confirm).grid(row=1, column=1, sticky="e", padx=8, pady=8)
         win.bind("<Return>", lambda _e: confirm())
         entry.focus_set()
         self.root.wait_window(win)
@@ -3700,6 +3612,145 @@ class MainWindow:
         self.status.config(
             text=f'Added button "{spec.label}"{extra}. Nothing is written until Save File.'
         )
+
+    # -- UserForms ------------------------------------------------------------------
+
+    def show_error(self, message: str) -> None:
+        messagebox.showerror(APP_NAME, message)
+
+    def new_userform(self) -> ModuleDraft | None:
+        """Add an empty UserForm (its layout and code module) to the draft."""
+        draft = self.draft
+        if draft is None or self._saving:
+            return None
+        name = self._prompt_name("New UserForm", fs.default_form_name(draft), "Create")
+        if not name:
+            return None
+        problem = validate_module_name(name, draft)
+        if problem:
+            self.show_error(problem)
+            return None
+        created: list[ModuleDraft] = []
+        try:
+            self._batch_edit(lambda: created.append(fs.add_blank_form(draft, name)))
+        except AdapterError as exc:
+            self.show_error(str(exc))
+            return None
+        if not created:
+            return None
+        self._show_view(2)
+        self.form_designer.select(name)
+        self.status.config(text=f"Added UserForm {name}. Nothing is written until Save File.")
+        return created[0]
+
+    def apply_form_edit(
+        self,
+        module: ModuleDraft,
+        edit,
+        what: str,
+        *,
+        select: str | None = None,
+        rename: tuple[str, str] | None = None,
+    ) -> bool:
+        """Edit a form's layout as one undoable step; False (after a message) when refused."""
+        draft = self.draft
+        if draft is None or self._saving or module.is_deleted:
+            return False
+        self._flush_all_editors()
+        try:
+            edited = fs.edited_layout(draft, module, edit)
+        except fs.FormError as exc:
+            self.show_error(str(exc))
+            return False
+
+        def mutate() -> None:
+            fs.set_layout(draft, module, edited)
+            if rename is not None:
+                module.body = fs.rename_in_code(module.body, *rename)
+
+        if select is not None:
+            self.form_designer.control_name = select
+        self._batch_edit(mutate)
+        self.status.config(
+            text=f"{what} — {module.current_name}. Nothing is written until Save File."
+        )
+        return True
+
+    def open_form_code(self, module: ModuleDraft, control: str | None, *, create: bool) -> None:
+        """Show a form's code: at ``control``'s event procedure (added when ``create``)."""
+        draft = self.draft
+        if draft is None or module.is_deleted:
+            return
+        self._flush_all_editors()
+        line = 1
+        if control is not None or create:
+            design = fs.design_of(draft, module)
+            item = design.control(control) if design is not None and control else None
+            name = control or "UserForm"
+            event = fs.event_for(item.short_kind if item is not None else "UserForm")
+            if create:
+                body, line = fs.ensure_handler(module.body, name, event)
+                if body != module.body:
+                    self._batch_edit(lambda: setattr(module, "body", body))
+            else:
+                found = fs.find_handler(module.body, name, event)
+                line = found + 1 if found is not None else 1
+        self._show_view(0)
+        self._open_module_at(module.id, line)
+
+    def delete_userform(self, module: ModuleDraft) -> None:
+        self.delete_module(module)
+
+    def import_userform(self, path: Path | None = None) -> bool:
+        """Copy a UserForm (layout byte for byte, its code and what the code needs) from another add-in."""
+        draft = self.draft
+        if draft is None or self._saving:
+            return False
+        self._flush_all_editors()
+        if path is None:
+            chosen = filedialog.askopenfilename(
+                title="Import UserForm from Another Add-in", filetypes=_FILETYPES
+            )
+            if not chosen:
+                return False
+            path = Path(chosen)
+        source = self.load_port_source(Path(path))
+        if source is None:
+            return False
+        forms = ps.portable_forms(source)
+        if not forms:
+            messagebox.showinfo(APP_NAME, f"{source.baseline.path.name} has no UserForms.")
+            return False
+        index = choose(
+            self.root,
+            "Import UserForm",
+            f"Copy which UserForm from {source.baseline.path.name}? Its layout is copied byte "
+            "for byte (no .frm/.frx), with the code it needs.",
+            [form.describe() for form in forms],
+        )
+        if index is None:
+            return False
+        plan = ps.plan_form_port(source, draft, [forms[index].name], suffix=ps.default_suffix(draft))
+        if not plan.ok:
+            self.show_error(plan.describe() or "This UserForm cannot be imported.")
+            return False
+        if not messagebox.askyesno(APP_NAME, plan.describe() + "\n\nImport it?"):
+            return False
+        self._batch_edit(lambda: ps.apply_port(draft, plan))
+        added = [m for m in draft.new_forms() if m.id in plan.new_module_ids]
+        self._show_view(2)
+        if added:
+            self.form_designer.select(added[0].current_name)
+        self.status.config(
+            text=f"Imported {', '.join(m.current_name for m in added) or 'the UserForm'}. "
+            "Nothing is written until Save File."
+        )
+        if plan.warnings:
+            messagebox.showinfo(
+                APP_NAME, "Imported. Nothing is written until Save File. Please check:\n\n"
+                + "\n".join(f"• {w}" for w in plan.warnings)
+            )
+        return True
 
     # -- import a button (and its macros) from another add-in ------------------------
 

@@ -36,6 +36,8 @@ class ChangeSet:
     parts_added: tuple[XmlPartChange, ...] = ()
     # Existing package members dropped (ribbon images nothing links to).
     parts_removed: tuple[XmlPartChange, ...] = ()
+    # Existing UserForms whose layout (designer storage) the draft edits.
+    layouts_modified: tuple[ModuleChange, ...] = ()
 
     @property
     def is_empty(self) -> bool:
@@ -47,11 +49,15 @@ class ChangeSet:
             or self.xml_modified
             or self.parts_added
             or self.parts_removed
+            or self.layouts_modified
         )
 
     @property
     def has_vba_changes(self) -> bool:
-        return bool(self.modified or self.added or self.renamed or self.deleted)
+        """Anything that rewrites vbaProject.bin (a form's layout lives there too)."""
+        return bool(
+            self.modified or self.added or self.renamed or self.deleted or self.layouts_modified
+        )
 
     @property
     def has_xml_changes(self) -> bool:
@@ -72,6 +78,9 @@ class ChangeSet:
         if self.deleted:
             lines.append("VBA — Deleted")
             lines.extend(f"  • {c.name}" for c in self.deleted)
+        if self.layouts_modified:
+            lines.append("UserForm layout — Modified")
+            lines.extend(f"  • {c.name}" for c in self.layouts_modified)
         if self.xml_modified:
             lines.append("XML — Modified")
             lines.extend(f"  • {c.path}" for c in self.xml_modified)
@@ -105,9 +114,13 @@ def compute_changes(draft: DocumentDraft) -> ChangeSet:
     )
     parts_added = tuple(XmlPartChange(path=path) for path in draft.added_member_paths())
     parts_removed = tuple(XmlPartChange(path=path) for path in draft.removed_member_paths())
+    layouts = tuple(
+        ModuleChange(name=m.current_name, module_id=m.id) for m in draft.changed_form_layouts()
+    )
     return ChangeSet(
         modified=modified, added=added, renamed=renamed, deleted=deleted,
         xml_modified=xml_modified, parts_added=parts_added, parts_removed=parts_removed,
+        layouts_modified=layouts,
     )
 
 
@@ -121,6 +134,7 @@ def dirty_count(draft: DocumentDraft) -> int:
         + len(cs.xml_modified)
         + len(cs.parts_added)
         + len(cs.parts_removed)
+        + len(cs.layouts_modified)
     )
 
 
@@ -136,6 +150,7 @@ def revert_module(draft: DocumentDraft, module_id: str) -> None:
         target.is_new = False
         target.current_name = b.original_name
         target.body = b.body
+        target.form_storage = None
     else:
         draft.modules.remove(target)
 

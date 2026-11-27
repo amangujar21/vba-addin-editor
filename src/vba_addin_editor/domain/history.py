@@ -34,6 +34,9 @@ def _payload_size(value: Any) -> int:
         return sum(_payload_size(v) + _payload_size(k) for k, v in value.items())
     if isinstance(value, (list, tuple)):
         return sum(_payload_size(v) for v in value)
+    size = getattr(value, "nbytes", None)  # a UserForm's designer storage
+    if isinstance(size, int):
+        return size
     return 64
 
 

@@ -105,29 +105,87 @@ class XmlPartSnapshot(_XmlPartHealth):
 
 
 @dataclass(frozen=True)
+class FormStorage:
+    """A UserForm's designer storage, byte for byte.
+
+    ``streams`` holds every stream under the form's storage by its path
+    relative to that storage (``f``, ``o``, ``\\x03VBFrame``, ``i05/f`` ...);
+    ``storages`` the 16-byte class id of the form's own storage (path ``""``)
+    and of each storage under it, since a container is bound by its CLSID.
+    Copying both copies the whole layout, pictures and fonts included: nothing
+    is re-encoded, which an ``.frm``/``.frx`` export and import cannot promise.
+    """
+
+    streams: tuple[tuple[str, bytes], ...]
+    storages: tuple[tuple[str, bytes], ...] = (("", bytes(16)),)
+
+    def stream(self, path: str) -> bytes | None:
+        return next((data for name, data in self.streams if name == path), None)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(len(data) for _name, data in self.streams)
+
+
+@dataclass(frozen=True)
 class FormControlSnapshot:
-    """One UserForm control as read from its designer storage (display only)."""
+    """One UserForm control as read from its designer storage."""
 
     name: str
     kind: str  # "MSForms.TextBox", ...
     properties: tuple[tuple[str, str], ...]  # stored (non-default) properties
     children: tuple[FormControlSnapshot, ...] = ()
+    # Geometry in points, relative to the container.
+    left: float = 0.0
+    top: float = 0.0
+    width: float | None = None
+    height: float | None = None
+    caption: str | None = None
+    tip: str | None = None
+    # (face, points, bold) when the control keeps a font of its own.
+    font: tuple[str, float, bool] | None = None
+    # False for parts a designer edit must leave alone (a MultiPage's TabStrip, its pages).
+    editable: bool = True
+
+    @property
+    def short_kind(self) -> str:
+        return self.kind.rsplit(".", 1)[-1]
 
 
 @dataclass(frozen=True)
 class FormDesignSnapshot:
-    """Read-only open-time view of one UserForm's layout."""
+    """One UserForm's layout as stored in its designer storage."""
 
     name: str
     properties: tuple[tuple[str, str], ...] = ()
     controls: tuple[FormControlSnapshot, ...] = ()
     problem: str | None = None  # set when the designer streams could not be read
+    # The exact designer storage; None when it could not be read.
+    storage: FormStorage | None = field(default=None, compare=False, repr=False)
+    caption: str = ""
+    width: float | None = None  # inside size, in points
+    height: float | None = None
 
     def control_count(self) -> int:
         def count(items: tuple[FormControlSnapshot, ...]) -> int:
             return sum(1 + count(c.children) for c in items)
 
         return count(self.controls)
+
+    def walk(self) -> list[FormControlSnapshot]:
+        out: list[FormControlSnapshot] = []
+
+        def visit(items: tuple[FormControlSnapshot, ...]) -> None:
+            for item in items:
+                out.append(item)
+                visit(item.children)
+
+        visit(self.controls)
+        return out
+
+    def control(self, name: str) -> FormControlSnapshot | None:
+        needle = name.casefold()
+        return next((c for c in self.walk() if c.name and c.name.casefold() == needle), None)
 
 
 @dataclass(frozen=True)
@@ -146,6 +204,10 @@ class DocumentSnapshot:
     # The exact package bytes file_fingerprint describes. Saves build and
     # verify from these instead of re-reading the file.
     package_bytes: bytes | None = field(default=None, compare=False, repr=False)
+
+    def form(self, name: str) -> FormDesignSnapshot | None:
+        needle = name.casefold()
+        return next((f for f in self.forms if f.name.casefold() == needle), None)
 
     def orphan_form_names(self) -> frozenset[str]:
         """Case-folded names of UserForm layouts with no code module.
@@ -178,6 +240,9 @@ class ModuleDraft:
     stream_name: str = ""
     hidden_header: str = ""
     project_item_kind: str = "unknown"
+    # A UserForm's designer storage when this draft adds the form or edits its
+    # layout; None leaves an existing form's layout byte-identical.
+    form_storage: FormStorage | None = None
 
 
 @dataclass
@@ -255,6 +320,36 @@ class DocumentDraft:
     def changed_existing_modules(self) -> list[ModuleDraft]:
         return [m for m in self.surviving_originals() if m.body != m.original_body]
 
+    def baseline_form(self, module: ModuleDraft) -> FormDesignSnapshot | None:
+        """The layout an existing UserForm module had when the file was opened."""
+        if module.is_new or module.project_item_kind != "userform":
+            return None
+        return self.baseline.form(module.origin_name or module.current_name)
+
+    def form_storage_of(self, module: ModuleDraft) -> FormStorage | None:
+        """The designer storage a save leaves for ``module``; None when it is no form."""
+        if module.form_storage is not None:
+            return module.form_storage
+        form = self.baseline_form(module)
+        return form.storage if form is not None else None
+
+    def is_form(self, module: ModuleDraft) -> bool:
+        return module.project_item_kind == "userform" or module.form_storage is not None
+
+    def new_forms(self) -> list[ModuleDraft]:
+        return [m for m in self.new_modules() if m.form_storage is not None]
+
+    def changed_form_layouts(self) -> list[ModuleDraft]:
+        """Existing UserForms whose layout this draft edits."""
+        out: list[ModuleDraft] = []
+        for m in self.surviving_originals():
+            if m.form_storage is None:
+                continue
+            form = self.baseline_form(m)
+            if form is None or form.storage != m.form_storage:
+                out.append(m)
+        return out
+
     def xml_part_by_path(self, path: str) -> XmlPartDraft | None:
         return next((p for p in self.xml_parts if p.path == path), None)
 
@@ -294,6 +389,7 @@ class DocumentDraft:
             or self.changed_names()
             or self.new_modules()
             or self.changed_existing_modules()
+            or self.changed_form_layouts()
             or self.changed_xml_parts()
             or self.binary_parts
             or self.removed_parts

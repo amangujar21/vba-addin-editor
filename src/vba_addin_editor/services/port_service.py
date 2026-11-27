@@ -34,9 +34,10 @@ import re
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
+from typing import cast
 
 from vba_addin_editor.adapters.ooxml_package_adapter import open_package
-from vba_addin_editor.adapters.source_codec import replace_vb_name
+from vba_addin_editor.adapters.source_codec import fresh_designer_header, replace_vb_name
 from vba_addin_editor.domain.document import (
     DocumentDraft,
     ModuleDisplayKind,
@@ -94,6 +95,7 @@ _STANDARD_REFERENCES = frozenset(
         "{2df8d04c-5bfa-101b-bde5-00aa0044de52}",  # Office
     }
 )
+_MSFORMS_GUID = "{0d452ee1-e08f-101a-852e-02608c4d0bb4}"
 _DEF_TYPES = frozenset(
     {
         "int", "lng", "bool", "byte", "cur", "sng", "dbl", "dec", "date", "str", "obj", "var",
@@ -830,21 +832,88 @@ def plan_port(
         return _blocked(str(exc))
 
 
+@dataclass(frozen=True)
+class PortableForm:
+    """A UserForm of a source add-in that can be copied."""
+
+    name: str
+    caption: str
+    control_count: int
+    problem: str | None = None
+
+    def describe(self) -> str:
+        text = f"{self.name}   “{self.caption}”   {self.control_count} control(s)"
+        return text + (f"   — {self.problem}" if self.problem else "")
+
+
+def portable_forms(draft: DocumentDraft) -> list[PortableForm]:
+    """The UserForms of ``draft`` (an add-in opened to import from)."""
+    out: list[PortableForm] = []
+    for module in draft.modules:
+        if module.is_deleted or not draft.is_form(module):
+            continue
+        storage = draft.form_storage_of(module)
+        design = draft.baseline_form(module)
+        problem = None
+        if storage is None:
+            problem = "its layout could not be read"
+        elif design is not None and design.problem:
+            problem = "its layout could not be parsed (it is still copied byte for byte)"
+        out.append(
+            PortableForm(
+                name=module.current_name,
+                caption=design.caption if design is not None else module.current_name,
+                control_count=design.control_count() if design is not None else 0,
+                problem=problem,
+            )
+        )
+    return out
+
+
+def plan_form_port(
+    source: DocumentDraft,
+    target: DocumentDraft,
+    names: list[str],
+    *,
+    suffix: str,
+    check_references: bool = True,
+) -> PortPlan:
+    """Copy UserForms from ``source`` into a copy of ``target``; ``target`` is not changed.
+
+    Each form keeps its layout byte for byte (the designer storage is copied,
+    not exported and re-imported, so pictures, fonts and every control property
+    survive) and gets fresh class ids. The procedures, classes and other forms
+    its code uses come along as for a ribbon button; names that clash are
+    renamed with ``suffix``, and references follow the renames.
+    """
+    if Path(source.baseline.path).resolve() == Path(target.baseline.path).resolve():
+        return _blocked("Choose a different add-in: this is the file that is open.")
+    if not _SUFFIX_RE.match(suffix):
+        return _blocked("The name suffix must be 1-24 letters, digits or underscores.")
+    if not names:
+        return _blocked("Choose at least one UserForm.")
+    try:
+        return _Porter(source, target, None, None, suffix, "", check_references).run_forms(names)
+    except PortError as exc:
+        return _blocked(str(exc))
+
+
 class _Porter:
     def __init__(
         self,
         source: DocumentDraft,
         target: DocumentDraft,
-        control: PortableControl,
-        where: PortTarget,
+        control: PortableControl | None,
+        where: PortTarget | None,
         suffix: str,
         group_label: str,
         check_references: bool,
     ) -> None:
         self.source = source
         self.target = target
-        self.control = control
-        self.where = where
+        # None only for run_forms, which never reads them.
+        self.control = cast(PortableControl, control)
+        self.where = cast(PortTarget, where)
         self.suffix = suffix
         self.group_label = group_label
         self.check_references = check_references
@@ -863,6 +932,9 @@ class _Porter:
         self.whole: set[str] = set()  # class modules copied whole
         self.reused: dict[tuple[str, int], str] = {}  # (module, item) -> target module
         self.reused_classes: set[str] = set()
+        self.forms: set[str] = set()  # UserForms copied whole, layout included
+        self.reused_forms: set[str] = set()
+        self._form_queue: list[tuple[_Module, _Item | None]] = []
         self.forced: set[tuple[str, str]] = set()  # (module, name) that must get a new name
         self.macro_strings: dict[tuple[str, int], tuple[_Module, str, str | None, str | None]] = {}
         self.id_strings: set[tuple[str, int]] = set()
@@ -881,7 +953,24 @@ class _Porter:
 
     # -- 1. the XML subtree and its callbacks ----------------------------------------------
 
+    def run_forms(self, names: list[str]) -> PortPlan:
+        """Copy the UserForms ``names`` (and the code they need) into a copy of the target."""
+        roots: list[_Module] = []
+        for name in names:
+            mod = self.src.modules.get(name.casefold())
+            if mod is None or mod.kind != "form":
+                raise PortError(f"{self.src_file} has no UserForm named {name}.")
+            roots.append(mod)
+        self._collect([], roots)
+        self._decide_names([])
+        draft = clone_draft(self.target)
+        self._write_modules(draft)
+        self._final_checks(draft)
+        self.plan.draft = None if self.plan.problems else draft
+        return self.plan
+
     def run(self) -> PortPlan:
+        assert self.control is not None and self.where is not None
         part = self.source.xml_part_by_path(self.control.part_path)
         text = part.text or "" if part is not None else ""
         elements = rs.element_tree(text)
@@ -936,7 +1025,41 @@ class _Porter:
 
     # -- 2. what VBA to copy ------------------------------------------------------------------
 
-    def _collect(self, roots: list[tuple[_Module, _Item]]) -> None:
+    def _add_form(self, mod: _Module, *, root: bool = False) -> None:
+        """Copy UserForm ``mod`` whole: its code, and its layout byte for byte."""
+        key = mod.name.casefold()
+        if key in self.forms or key in self.reused_forms:
+            return
+        storage = self.source.form_storage_of(mod.draft)
+        if storage is None:
+            self.plan.problems.append(
+                f"The layout of UserForm {mod.name} in {self.src_file} could not be read, "
+                "so it cannot be copied."
+            )
+            return
+        if self.source.baseline.code_page != self.target.baseline.code_page:
+            self.plan.problems.append(
+                f"UserForm {mod.name} is stored in code page {self.source.baseline.code_page} "
+                f"and this add-in uses {self.target.baseline.code_page}; its text would not "
+                "read the same here."
+            )
+            return
+        existing = self.tgt.modules.get(key)
+        if (
+            not root
+            and existing is not None
+            and existing.kind == "form"
+            and _normalized(existing.body) == _normalized(mod.body)
+            and self.target.form_storage_of(existing.draft) == storage
+        ):
+            self.reused_forms.add(key)
+            return
+        self.forms.add(key)
+        self._form_queue.append((mod, None))
+
+    def _collect(
+        self, roots: list[tuple[_Module, _Item]], form_roots: list[_Module] | tuple = ()
+    ) -> None:
         queue: list[tuple[_Module, _Item | None]] = []
         root_keys = {(m.name.casefold(), i.index) for m, i in roots}
 
@@ -973,8 +1096,11 @@ class _Porter:
             self.whole.add(key)
             queue.append((mod, None))
 
+        self._form_queue = queue
         for mod, item in roots:
             add_item(mod, item)
+        for mod in form_roots:
+            self._add_form(mod, root=True)
         while queue:
             mod, item = queue.pop(0)
             span = range(len(mod.toks)) if item is None else mod.token_range(item.start, item.end)
@@ -1009,14 +1135,7 @@ class _Porter:
         if target.kind == "class":
             add_class(target)
         elif target.kind == "form":
-            if target.name.casefold() in self.tgt.modules:
-                self.note(f"The code uses UserForm {target.name}, which this add-in already has.")
-            else:
-                self.plan.problems.append(
-                    f"The code uses UserForm {target.name}, and this editor cannot copy "
-                    f"UserForm layouts. Export {target.name} from {self.src_file} in the VBA "
-                    "editor (File → Export File) and import it into this add-in first."
-                )
+            self._add_form(target)
         elif target.kind == "document" and target.name.casefold() not in self.tgt.modules:
             self.note(
                 f"The code uses {target.name} (a sheet of {self.src_file}), which this add-in "
@@ -1109,7 +1228,7 @@ class _Porter:
             for entry in rs.ribbon_entries(self.target)
         }
         modules = _Namer(tgt_modules | tgt_public | tgt_callbacks, self.suffix)
-        for key in [*self.selected, *sorted(self.whole)]:
+        for key in [*self.selected, *sorted(self.whole), *sorted(self.forms)]:
             mod = self.src.modules[key]
             new = modules.fresh(mod.name, limit=MAX_MODULE_NAME)
             for _attempt in range(5):
@@ -1167,7 +1286,7 @@ class _Porter:
                 self.id_names[raw] = new
                 if new != old:
                     self.plan.renames.append(("control id", old, new))
-        if self.where.new_group:
+        if self.where is not None and self.control is not None and self.where.new_group:
             stem = re.sub(r"[^A-Za-z0-9_]", "", self.control.control_id) or "Imported"
             self.group_id = ids.fresh("grp" + stem[0].upper() + stem[1:])
 
@@ -1281,6 +1400,29 @@ class _Porter:
             draft.modules.append(new)
             self.new_modules[key] = new
             self.plan.summary.append(f"Class module {name}: copied whole from {mod.name}")
+        for key in sorted(self.forms):
+            mod = self.src.modules[key]
+            name = self.module_names[key]
+            storage = self.source.form_storage_of(mod.draft)
+            assert storage is not None  # checked by _add_form
+            new = _new_form_module(
+                name,
+                self._rewrite(mod, 0, len(mod.body)).lstrip("\n"),
+                fresh_designer_header(mod.draft.hidden_header or "", name),
+                storage,
+            )
+            draft.modules.append(new)
+            self.new_modules[key] = new
+            design = self.source.baseline.form(mod.draft.origin_name or mod.name)
+            controls = f", {design.control_count()} control(s)" if design is not None else ""
+            self.plan.summary.append(
+                f"UserForm {name}: code and layout copied exactly from {mod.name}{controls}"
+            )
+        if self.reused_forms:
+            self.plan.summary.append(
+                "Reuses identical UserForm(s) already here: "
+                + ", ".join(self.src.modules[k].name for k in sorted(self.reused_forms))
+            )
         self.plan.new_module_ids = [m.id for m in self.new_modules.values()]
         reused = sorted(
             {
@@ -1535,7 +1677,7 @@ class _Porter:
                 f"{self.src_file} is a {src_host.title()} file and this one is {tgt_host.title()}: "
                 f"code that uses {src_host.title()} objects will not run here."
             )
-        part_path = self.where.container.part_path
+        part_path = self.where.container.part_path if self.where is not None else ""
         if part_path.lower().endswith("/customui.xml") and any(
             p.path.lower().endswith("customui14.xml") for p in rs.ribbon_parts(self.target)
         ):
@@ -1556,6 +1698,8 @@ class _Porter:
                 if guid.casefold() not in _STANDARD_REFERENCES
                 and guid.casefold() not in have
                 and name.casefold() not in have
+                # Saving a copied UserForm adds Microsoft Forms itself.
+                and not (self.forms and _MSFORMS_GUID in guid.casefold())
             ]
             if missing:
                 self.note(
@@ -1579,6 +1723,25 @@ def _new_module(name: str, body: str, *, standard: bool) -> ModuleDraft:
         can_delete=True,
         can_rename=True,
         project_item_kind="standard" if standard else "class",
+    )
+
+
+def _new_form_module(name: str, body: str, header: str, storage) -> ModuleDraft:
+    return ModuleDraft(
+        id=new_module_id(),
+        origin_name=None,
+        current_name=name,
+        body=body,
+        kind=ModuleDisplayKind.AMBIGUOUS,
+        pyopenvba_kind="other",
+        is_new=True,
+        is_deleted=False,
+        destructive_ops_safe=True,
+        can_delete=True,
+        can_rename=True,
+        hidden_header=header,
+        project_item_kind="userform",
+        form_storage=storage,
     )
 
 

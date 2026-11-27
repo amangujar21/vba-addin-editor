@@ -38,15 +38,15 @@ if release_mode and dirty:
     raise SystemExit("Release builds require a clean git tree.")
 mode = "onefile" if ONEFILE else "onedir"
 identity = {
-    "version": "0.11.0",
+    "version": "0.12.0",
     "source_commit": commit,
     "dirty_tree": dirty,
     "build_time_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "python_version": sys.version.split()[0],
     "python_architecture": "64bit" if sys.maxsize > 2**32 else "32bit",
     "packaged_mode": mode if not dirty or not release_mode else f"{mode}-dirty",
-    "pyopenvba_pin": "6.2.0",
-    "dependencies": {"pyopenvba": "6.2.0", "pillow": metadata.version("pillow")},
+    "pyopenvba_pin": "6.6.0",
+    "dependencies": {"pyopenvba": "6.6.0", "pillow": metadata.version("pillow")},
 }
 if dirty and not release_mode:
     identity["packaged_mode"] = f"{mode}-development-dirty"

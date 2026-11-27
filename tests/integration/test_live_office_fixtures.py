@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from vba_addin_editor.adapters.pyopenvba_adapter import PyOpenVBAAdapter
 from vba_addin_editor.domain.document import (
     ModuleDisplayKind,
     ModuleDraft,
@@ -49,7 +50,7 @@ LIVE_PARAMS = [
 
 def _live_service() -> SaveService:
     """Real SaveService: real process/lock probes and ReplaceFileW commit."""
-    return SaveService()
+    return SaveService(adapter=PyOpenVBAAdapter())
 
 
 def _require_fixture(path: Path) -> None:

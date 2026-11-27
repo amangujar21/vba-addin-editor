@@ -60,6 +60,33 @@ def build_xlam_with_form(path: Path) -> Path:
     return path
 
 
+FORM_SOURCE_HELPERS = (
+    "Public Function Greeting(ByVal who As String) As String\r\n"
+    '    Greeting = "Hello, " & who\r\n'
+    "End Function\r\n"
+)
+FORM_SOURCE_CODE = (
+    "Private Sub cmdOK_Click()\r\n"
+    "    txtName.Value = Greeting(txtName.Value)\r\n"
+    "End Sub\r\n"
+)
+
+
+def build_form_source(path: Path) -> Path:
+    """An add-in whose UserForm EntryForm calls a public function in another module."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ExcelFile.create_new(path) as host:
+        host.vba_project().add_module("Helpers", FORM_SOURCE_HELPERS)
+        form = host.add_form("EntryForm", caption="Entry")
+        form.add_control("Frame", "fraMain")
+        form.add_control("TextBox", "txtName", container="fraMain")
+        form.add_control("CommandButton", "cmdOK", left=120, top=90)
+        form.control("cmdOK").set_property("Caption", "OK")
+        host.set_module("EntryForm", FORM_SOURCE_CODE)
+        host.save()
+    return path
+
+
 def build_xlam_with_orphan_form(path: Path) -> Path:
     """Like build_xlam_with_form, plus a layout-only form ``StaleForm``: its
     designer storage is left in the project with no code module, as other

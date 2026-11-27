@@ -32,6 +32,34 @@ class ProcessEnumerationError(OSError):
         self.win32_error = win32_error
 
 
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+
+
+def _has_exited(kernel32, pid: int) -> bool:
+    """True only when Windows says the process has ended.
+
+    An exited process stays in the snapshot while another process still holds a
+    handle to it (an Office instance a COM add-in kept from unloading cleanly).
+    Anything that cannot be queried counts as running, so a failed query never
+    lets a save through.
+    """
+    kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    kernel32.OpenProcess.restype = wt.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wt.BOOL
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = wt.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value != _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def running_process_names() -> set[str]:
     """Set of executable base names (upper-case) currently running.
 
@@ -58,7 +86,9 @@ def running_process_names() -> set[str]:
     try:
         if Process32FirstW(snap, ctypes.byref(entry)):
             while True:
-                names.add(entry.szExeFile.upper())
+                name = entry.szExeFile.upper()
+                if name not in names and not _has_exited(kernel32, entry.th32ProcessID):
+                    names.add(name)
                 if not Process32NextW(snap, ctypes.byref(entry)):
                     break
     finally:

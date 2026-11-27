@@ -29,12 +29,12 @@ lets Office load the updated code the next time it starts.
    ahead; overlapping ones open **Compare External Changes** so you choose,
    then Save again. Nothing is overwritten until the merge is resolved.
 2. Edit code; add/rename/delete standard modules and ordinary class modules.
-   UserForms can be deleted (code and layout together) but not renamed; host
-   document modules and other designer components stay locked for
-   rename/delete. The bar on the left switches between four views (Ctrl+1–4):
-   **Code** (modules and the procedures of the open module), **Ribbon** (the
-   ribbon designer, below), **UserForms** (each UserForm's controls and stored
-   properties, read-only) and **Package XML** (the existing package parts of a
+   Add, design, copy and delete UserForms (below); an existing UserForm cannot
+   be renamed. Host document modules and other designer components stay
+   locked for rename/delete. The bar on the left switches between four views
+   (Ctrl+1–4): **Code** (modules and the procedures of the open module),
+   **Ribbon** (the ribbon designer, below), **UserForms** (the form designer,
+   below) and **Package XML** (the existing package parts of a
    `.xlam`/`.ppam`/`.pptm`, edited as text).
 3. **Save** (Ctrl+S) reviews the current draft, verifies the original has not
    changed, builds a verified candidate, and atomically replaces the original,
@@ -76,6 +76,55 @@ lets Office load the updated code the next time it starts.
    main part typed as an add-in. The form that follows offers a ribbon tab with
    one group for your buttons (**No Ribbon** skips it); the ribbon is an
    unsaved edit until **Save File**. An existing file is never replaced.
+
+## UserForms
+
+The **UserForms** view (Ctrl+3) is a form designer. On the left are the
+add-in's forms and their controls. In the middle the selected form is drawn to
+scale. On the right are the properties of the selected control (or the form).
+
+- **Select** a control in the drawing or the list. **Drag** it to move it, and
+  drag the small square at its corner (or the form's) to resize it. The arrow
+  keys nudge it by a point, and Delete removes it.
+- **Properties:** Name, Caption, Left, Top, Width, Height, Tip text, Font, size
+  and Bold for a control; Caption, Width and Height for the form. Renaming a
+  control also renames it in the form's code, event procedures included
+  (`cmdOK_Click` → `cmdGo_Click`). Below them is every property the file stores
+  for the control.
+- **Add control** adds a Label, TextBox, ComboBox, ListBox, CheckBox,
+  OptionButton, ToggleButton, Frame, CommandButton, TabStrip, MultiPage,
+  ScrollBar, SpinButton or Image. It goes into the selected Frame or MultiPage
+  page, or onto the form, and is named as the VBA editor names it
+  (`CommandButton1`). A MultiPage or TabStrip keeps the size it was made at.
+- **Double-click** a control to open its event procedure in the Code view. It
+  is added if missing: `Click` for buttons, `Change` for text boxes, and so on.
+  **View code** opens the form's code.
+- **+** (or **Module → Add UserForm…**) adds an empty form.
+
+**Copy a UserForm from another add-in** (**Import…** in the view, or **Module
+→ Import UserForm from Another Add-in…**). Pick an `.xlam`, `.ppam` or `.pptm`
+and one of its forms. The form is copied without going through `.frm`/`.frx`
+files: its designer storage inside `vbaProject.bin` is copied byte for byte.
+Every control, property, font and picture arrives exactly as Office wrote it.
+Exporting and re-importing in the VBA editor is where `.frx` problems come
+from, and nothing is re-encoded here. The copy also:
+
+- gets new class ids (`VB_Base`), so it can sit beside its original;
+- brings the code it calls, as **Import Button** does: procedures, classes and
+  other forms from the other add-in. Code this file already has is reused, and
+  a name that clashes is renamed with a suffix;
+- gets the Microsoft Forms 2.0 reference when the file has no form yet.
+
+Forms can be copied between Excel and PowerPoint files. A form whose code uses
+Excel objects will not run in PowerPoint, and the import summary says so. A
+ribbon button imported with **Import Button** now brings the forms its macro
+shows.
+
+Every designer edit is one Undo step, and nothing is written until **Save
+File**. The save review lists each new or changed layout as a readable control
+list, with a diff. Saving checks that every form in the saved file holds
+exactly the layout the editor meant to write, and that every other form is
+byte-identical.
 
 ## Ribbon buttons ↔ macros
 
@@ -200,8 +249,8 @@ For files with ribbon XML (`customUI/customUI.xml` or `customUI14.xml`):
   `description` outside a menu, and `insertAfter…`/`insertBefore…`. One Undo
   reverts it all; nothing is written until Save File.
 
-  The import is refused if the code uses a UserForm this file does not have
-  (import the form in the VBA editor first). The summary lists what to check
+  A UserForm the code uses is copied with it, layout included (see
+  UserForms above). The summary lists what to check
   afterwards: references this file lacks (Tools → References), sheets of the
   other add-in the code reads, and a cross-host import (Excel ↔ PowerPoint).
 - **Show Ribbon Buttons Using This Macro** — F12 or right-click in the VBA code tab.
@@ -289,16 +338,23 @@ decompress modules that have not changed. The folder can be deleted at any time.
   the dir record agrees, and its designer storage holds a form. Deleting
   removes the code, the layout storage and every declaration; verification
   confirms nothing is left behind and that every other form's layout is
-  byte-identical. Renaming a UserForm stays disabled (the layout storage would
-  be orphaned). A deleted form's name cannot be reused until the deletion is
-  saved. Folder import never deletes a UserForm.
+  byte-identical. Renaming an existing UserForm stays disabled (the layout
+  storage would be orphaned); a form added in this session can be renamed
+  until it is saved. A deleted form's name cannot be reused until the deletion
+  is saved. Folder import never deletes a UserForm.
 - **Import Button** follows calls lexically (no VBA compiler): a macro whose
   name is only built at run time (`Application.Run "Do" & n`) is not found,
   and library references are reported but not added. Sheets, names and other
   workbook content of the other add-in are never copied.
-- UserForm layout is read-only: it can be viewed in the **UserForms** tab but not
-  created or edited; `.frm/.frx` import/export is not supported
-  (`.bas`/`.cls` only).
+- UserForm layouts are edited through pyOpenVBA's form writer, which covers
+  the properties the designer shows (and Microsoft Forms' own controls; an
+  ActiveX control from another library is kept as it is but cannot be edited).
+  An edited form drops the `TypeInfoVer` line from its designer header. Excel
+  refuses an edited form that keeps it ("The ActiveX Designer's Type
+  Information does not match what was saved"); without it, VBA rebuilds the
+  form's type information on load, as it does for a new form.
+  `.frm`/`.frx` files are not read or written: forms are copied add-in to
+  add-in instead. `.bas`/`.cls` import/export is unchanged.
 - A VBA signature is detected both inside `vbaProject.bin` and in the package
   parts beside it (where Office stores it). After you confirm, a save that
   changes VBA removes the stale signature parts, their relationships and
@@ -340,9 +396,23 @@ Office-authored fixtures placed in `tests/fixtures/` (`xlam/RealAddin.xlam`,
 edits that XML marker and VBA code in one save; a human then verifies Excel or
 PowerPoint opens the saved file with **no repair dialog** and runs the macro.
 
+UserForms have their own live gate. `python scripts/make_office_fixtures.py`
+has Excel and PowerPoint author the fixtures (Excel needs "Trust access to the
+VBA project object model"; PowerPoint does not). Among them is
+`xlam/FormSource.xlam`: a form with a frame, a MultiPage, pictures, and code
+that calls another module. `tests/integration/test_live_userforms.py` copies
+that form into Office-authored `.xlam`, `.ppam` and `.pptm` files, edits its
+layout, and builds a form with one control of each kind. All of it is saved
+through the real pipeline. With `VBAAE_LIVE_OFFICE=1`, each saved file is then
+loaded in real Excel or PowerPoint by `scripts/office_check.py`. That script
+loads every form, which compiles its code and runs its `Initialize`, and
+checks what Office reports for each control: type, position, size, caption,
+tip, font, picture and value. The scripts refuse to run while PowerPoint is
+open, because it runs a single instance they would quit.
+
 ### Dependency pin
 
-- `pyopenvba==6.2.0` (MIT) — see `THIRD_PARTY_NOTICES.md`.
+- `pyopenvba==6.6.0` (MIT) — see `THIRD_PARTY_NOTICES.md`.
 - `pillow>=10.1,<13` (HPND) for custom ribbon icons; loaded only when an icon
   is used. The packaged build leaves out its font, colour-management, WebP
   and Tk modules.

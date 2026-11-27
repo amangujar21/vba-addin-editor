@@ -19,6 +19,7 @@ from vba_addin_editor.adapters.ooxml_package_adapter import (
 from vba_addin_editor.domain.document import (
     BinaryPartDraft,
     DocumentDraft,
+    FormStorage,
     ModuleDraft,
     XmlPartDraft,
 )
@@ -41,6 +42,39 @@ MAX_INTERVAL_MS = 10000
 GENERATIONS = ("gen_a", "gen_b")
 KNOWN_XML_ENCODINGS = {"utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "utf-16le", "utf-16be"}
 ALLOWED_NEWLINES = {"\n", "\r\n"}
+
+
+def _form_storage_to_json(storage: FormStorage | None) -> dict | None:
+    if storage is None:
+        return None
+    return {
+        "streams": [[path, base64.b64encode(data).decode("ascii")] for path, data in storage.streams],
+        "storages": [[path, clsid.hex()] for path, clsid in storage.storages],
+    }
+
+
+def _form_storage_from_json(item: object) -> FormStorage | None:
+    """A designer storage from a checkpoint; ValueError/TypeError when malformed."""
+    if item is None:
+        return None
+    if not isinstance(item, dict):
+        raise TypeError("form_storage")
+    streams: list[tuple[str, bytes]] = []
+    for path, payload in item["streams"]:
+        if not isinstance(path, str) or not path or ".." in path.split("/"):
+            raise ValueError("form stream path")
+        streams.append((path, base64.b64decode(payload, validate=True)))
+    storages: list[tuple[str, bytes]] = []
+    for path, clsid in item["storages"]:
+        if not isinstance(path, str) or ".." in path.split("/"):
+            raise ValueError("form storage path")
+        raw = bytes.fromhex(clsid)
+        if len(raw) != 16:
+            raise ValueError("form storage clsid")
+        storages.append((path, raw))
+    if not any(path == "f" for path, _data in streams):
+        raise ValueError("form storage without an f stream")
+    return FormStorage(streams=tuple(streams), storages=tuple(storages))
 
 
 def _invalid(message: str) -> NoReturn:
@@ -280,6 +314,7 @@ class RecoveryService:
             "stream_name": module.stream_name,
             "hidden_header": module.hidden_header,
             "project_item_kind": module.project_item_kind,
+            "form_storage": _form_storage_to_json(module.form_storage),
         }
 
     def _xml_to_json(self, part: XmlPartDraft) -> dict:
@@ -328,6 +363,7 @@ class RecoveryService:
             stream_name=item.get("stream_name") or "",
             hidden_header=item.get("hidden_header") or "",
             project_item_kind=item.get("project_item_kind") or "unknown",
+            form_storage=_form_storage_from_json(item.get("form_storage")),
         )
 
     def _xml_from_json(self, item: dict) -> XmlPartDraft:
@@ -421,6 +457,10 @@ class RecoveryService:
             body = item.get("body")
             if body is not None and not isinstance(body, str):
                 _invalid("invalid encoding")
+            try:
+                _form_storage_from_json(item.get("form_storage"))
+            except (TypeError, ValueError, KeyError):
+                _invalid("invalid UserForm layout")
         if len(ids) != len(set(ids)):
             _invalid("duplicate ids")
         xml_parts = data["draft"].get("xml_parts", [])

@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 from dataclasses import dataclass
 
+from vba_addin_editor.adapters.pyopenvba_adapter import describe_form_storage
 from vba_addin_editor.adapters.source_codec import compose_module_source
 from vba_addin_editor.domain.changes import compute_changes
 from vba_addin_editor.domain.document import DocumentDraft
@@ -106,6 +107,29 @@ class ReviewService:
                     unified_diff=_diff(old_text, new_text, new_name or old_name or module_id),
                 )
             )
+        # UserForm layouts: what a form added or edited in this draft will hold.
+        code_page = draft.baseline.code_page
+        for mod in [*draft.new_forms(), *draft.changed_form_layouts()]:
+            label = f"{mod.current_name} (layout)"
+            base = draft.baseline_form(mod)
+            old_text = (
+                describe_form_storage(base.storage, mod.current_name, code_page)
+                if base is not None
+                else None
+            )
+            new_text = describe_form_storage(mod.form_storage, mod.current_name, code_page)
+            review_items.append(
+                ReviewItem(
+                    target_id=f"{mod.id}:layout",
+                    category="UserForm",
+                    operations=("add",) if mod.is_new else ("edit",),
+                    old_name=None if mod.is_new else label,
+                    new_name=label,
+                    old_text=old_text,
+                    new_text=new_text,
+                    unified_diff=_diff(old_text, new_text, label),
+                )
+            )
         for xml in changes.xml_modified:
             part = draft.xml_part_by_path(xml.path)
             old_text = part.original_text if part is not None else None
@@ -156,7 +180,7 @@ class ReviewService:
                     unified_diff=_diff(old_text, None, removed.path),
                 )
             )
-        vba_count = sum(1 for item in review_items if item.category == "VBA")
+        vba_count = sum(1 for item in review_items if item.category in ("VBA", "UserForm"))
         xml_count = sum(1 for item in review_items if item.category == "XML")
         signature = bool(
             changes.has_vba_changes and draft.baseline.safety.signature_present

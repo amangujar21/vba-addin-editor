@@ -3,22 +3,31 @@
 All pyopenvba imports (public and internal) live here. GUI and services
 must never import pyopenvba directly (plan sections 2.9, 5.3, 24).
 
-Internals used and why (pinned pyopenvba==6.2.0):
+Internals used and why (pinned pyopenvba==6.6.0):
 - ``_encoding_for_codepage``: maps the project's dir-stream code page to a
   Python codec for strict save-time validation; no public equivalent exists.
-- ``CFB``: reads streams and designer storages without mutating the host.
+- ``CFB`` (and its directory entries' CLSIDs): reads streams and designer
+  storages, and writes a UserForm's designer storage byte for byte.
 - ``_package_signature.without_signature``: the exact package edits
   ``host.save()`` makes when it drops a signature kept in parts beside
   ``vbaProject.bin``; verification allows those edits and nothing else.
-- ``forms.form_names`` / ``forms.read_form``: UserForm designer storages,
-  read for display and structural verification only. The editor never
-  writes form layouts; ``host.forms()`` is never called on a host that
-  saves, so ``save()`` cannot write a designer back.
+- ``forms.form_names`` / ``read_form`` / ``create_form`` and the parsed
+  form's levels and sites: UserForm layouts. ``host.forms()`` is never called
+  on a host that saves. A layout is edited on a scratch copy of its storage
+  (``edit_form_storage``), and a save only copies the finished storage into
+  the project, so what is verified is exactly what the draft holds.
+- ``VBAHostFile._ensure_forms_reference`` / ``_pending_mutation`` /
+  ``_project_root``: a form added by storage copy gets the Microsoft Forms
+  reference ``add_form`` gives a first form, and a layout-only save still
+  invalidates the compiled cache (Excel refuses an edited form otherwise).
 - ``VBAHostFile._open_zip`` / ``_write_container``: overridden so a host opens
   from bytes already in memory and returns what ``save()`` produced instead of
   writing a file. Antivirus scans a freshly written package the first time it
   is opened for read, which takes seconds for a large project, so the save
   pipeline never reads back a file it wrote.
+- ``PowerPointFile._read_only_formats``: emptied for ``.ppam`` (6.3.5 made it
+  read only in pyOpenVBA; the add-in is the pptm container with another main
+  content type).
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import re
 import threading
 import warnings
 import zipfile
@@ -36,10 +46,11 @@ from typing import Any
 
 from pyopenvba import ExcelFile, PowerPointFile
 from pyopenvba._host import VBAHostFile
+from pyopenvba._oforms_records import Size, StoredString
 from pyopenvba._package_signature import without_signature
 from pyopenvba.cfb import CFB
-from pyopenvba.exceptions import UnsupportedFormatError, VBAProjectError
-from pyopenvba.forms import FormControl, form_names, read_form
+from pyopenvba.exceptions import FormParseError, UnsupportedFormatError, VBAProjectError
+from pyopenvba.forms import create_form, form_names, read_form
 from pyopenvba.vba import (
     VBAModuleKind,
     _encoding_for_codepage,
@@ -74,6 +85,7 @@ from vba_addin_editor.domain.document import (
     FileFingerprint,
     FormControlSnapshot,
     FormDesignSnapshot,
+    FormStorage,
     HostKind,
     ModuleDisplayKind,
     ModuleDraft,
@@ -112,6 +124,9 @@ class PPAMPowerPointFile(PowerPointFile):
     """
 
     _zip_formats = frozenset({".pptm", ".potm", ".ppam"})
+    # pyOpenVBA 6.3.5 opens .ppam read only ("no writer measured"). The
+    # editor's own verification and the live gate are what qualify it here.
+    _read_only_formats = frozenset()
     _no_vba_hint = "Make sure the PowerPoint add-in contains a VBA project."
 
 
@@ -167,9 +182,9 @@ class _InMemoryHost:
         self._zip = zipfile.ZipFile(io.BytesIO(self._preloaded), mode="r")
         self._has_project = self._vba_entry in self._zip.namelist()  # type: ignore[attr-defined]
 
-    def _write_container(self, dest, new_cfb_bytes, package_edits) -> None:
+    def _write_container(self, dest, new_cfb_bytes, package_edits, **kwargs) -> None:
         if dest != _CAPTURE_ONLY:
-            super()._write_container(dest, new_cfb_bytes, package_edits)  # type: ignore[misc]
+            super()._write_container(dest, new_cfb_bytes, package_edits, **kwargs)  # type: ignore[misc]
             return
         self.saved_project = new_cfb_bytes
         self.saved_package_edits = dict(package_edits)
@@ -386,30 +401,21 @@ def _display_properties(props: dict[str, object]) -> tuple[tuple[str, str], ...]
     return tuple((name, _display_value(value)) for name, value in props.items())
 
 
-def _control_snapshot(control: FormControl) -> FormControlSnapshot:
-    return FormControlSnapshot(
-        name=control.name,
-        kind=control.kind,
-        properties=_display_properties(control.properties()),
-        children=tuple(_control_snapshot(child) for child in control.children),
-    )
-
-
 def _read_form_designs(cfb: CFB, names: list[str], code_page: int) -> tuple[FormDesignSnapshot, ...]:
-    """Display-only form layouts; a form that fails to parse reports why."""
+    """Each form's layout and exact storage; a form that fails to parse reports why."""
     designs: list[FormDesignSnapshot] = []
     for name in names:
         try:
+            storage: FormStorage | None = _read_storage(cfb, [name])
+        except Exception:  # noqa: BLE001 - an unreadable storage cannot be copied
+            storage = None
+        try:
             form = read_form(cfb, name, code_page=code_page)
-            designs.append(
-                FormDesignSnapshot(
-                    name=name,
-                    properties=_display_properties(form.properties()),
-                    controls=tuple(_control_snapshot(c) for c in form.controls),
-                )
-            )
+            designs.append(_design_of(form, storage))
         except Exception as exc:  # noqa: BLE001 - shown to the user, never fatal
-            designs.append(FormDesignSnapshot(name=name, problem=f"{type(exc).__name__}: {exc}"))
+            designs.append(
+                FormDesignSnapshot(name=name, problem=f"{type(exc).__name__}: {exc}", storage=storage)
+            )
     return tuple(designs)
 
 
@@ -630,14 +636,36 @@ class PyOpenVBAAdapter:
                 for item in rename_items:
                     project.rename_module(temp_map[item.id], item.current_name)
 
-                # 3. Add new modules.
+                # 3. Add new modules. A new UserForm's designer storage goes in
+                # first: pyOpenVBA declares a module whose name is a form
+                # storage BaseClass (a form), not Class.
+                cfb = host._get_cfb()
+                root = list(host._project_root())
+                added_form = False
                 for item in draft.new_modules():
                     kind = (
                         VBAModuleKind.standard
                         if item.pyopenvba_kind == "standard"
                         else VBAModuleKind.other
                     )
+                    if item.form_storage is not None:
+                        _write_storage(
+                            cfb,
+                            root,
+                            item.current_name,
+                            form_storage_named(item.form_storage, item.current_name, project.code_page),
+                        )
+                        added_form = True
                     project.add_module(item.current_name, _new_module_source(item), kind=kind)
+                if added_form:
+                    # Code naming MSForms types needs the library, as the VBE
+                    # adds it with a project's first form.
+                    host._ensure_forms_reference()
+
+                # 3b. Edited layouts of existing forms: the storage is replaced
+                # whole. The compiled cache must go too, as for any edit.
+                if _replace_form_storages(host, draft):
+                    host._pending_mutation = True
 
                 # 4. Body changes on surviving originals.
                 for item in draft.changed_existing_modules():
@@ -660,7 +688,7 @@ class PyOpenVBAAdapter:
                         "The VBA project signature was dropped without confirmation; save aborted.",
                         {"warnings": unexpected},
                     )
-            except ValueError as exc:
+            except (ValueError, KeyError, FormParseError) as exc:
                 raise AdapterError(str(exc)) from exc
         project_bytes = host.saved_project
         if project_bytes is None:
@@ -811,6 +839,7 @@ class PyOpenVBAAdapter:
                         f"{actual[name].kind.name} != {expected_kind}."
                     )
             problems.extend(_verify_project_cleanup(cand_host, expected))
+            problems.extend(_verify_new_forms_declared(cand_host, expected))
             if ref_vba is not None:
                 problems.extend(
                     _verify_form_storages(
@@ -1048,17 +1077,20 @@ def _verify_project_cleanup(host: VBAHostFile, expected: DocumentDraft) -> list[
 
 
 def _verify_form_storages(ref_cfb: CFB, cand_cfb: CFB, expected: DocumentDraft) -> list[str]:
-    """Deleted forms leave no storage; every other form layout is byte-identical.
+    """Every form layout in the candidate is exactly what the draft says.
 
-    The editor never writes layouts, so any designer difference is a defect.
-    "Deleted" means deleted in this draft: a layout that had no code module
-    at open (left behind by another tool) is kept like any other.
+    Deleted forms leave no storage. A form the draft adds, or whose layout it
+    edits, holds exactly the draft's storage (streams and CLSIDs); every other
+    layout is byte-identical to the original. "Deleted" means deleted in this
+    draft: a layout that had no code module at open (left behind by another
+    tool) is kept like any other.
     """
     problems: list[str] = []
     surviving = {m.current_name.casefold() for m in expected.final_module_state()}
     deleted = {
         (m.origin_name or m.current_name).casefold() for m in expected.deleted_original_modules()
     } - surviving
+    written = _expected_layouts(expected)
     ref_forms = {name.casefold(): name for name in _form_storage_names(ref_cfb)}
     try:
         cand_storages = {name.casefold(): name for name in cand_cfb.list_storages_at(())}
@@ -1073,20 +1105,517 @@ def _verify_form_storages(ref_cfb: CFB, cand_cfb: CFB, expected: DocumentDraft) 
             problems.append(f"UserForm layout missing in candidate: {name!r}")
             continue
         try:
-            before = _storage_tree(ref_cfb, [name])
-            after = _storage_tree(cand_cfb, [cand_storages[folded]])
+            after = _read_storage(cand_cfb, [cand_storages[folded]])
+            before = written.get(folded) or _read_storage(ref_cfb, [name])
         except Exception as exc:  # noqa: BLE001
             problems.append(f"Could not read UserForm layout {name!r} ({type(exc).__name__}).")
             continue
         if before != after:
             problems.append(f"UserForm layout changed: {name!r}")
     for folded in sorted(set(_form_storage_names_folded(cand_cfb)) - set(ref_forms)):
-        problems.append(f"Unexpected UserForm layout in candidate: {folded!r}")
+        want = written.get(folded)
+        if want is None:
+            problems.append(f"Unexpected UserForm layout in candidate: {folded!r}")
+            continue
+        try:
+            got = _read_storage(cand_cfb, [cand_storages[folded]])
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"Could not read new UserForm layout {folded!r} ({type(exc).__name__}).")
+            continue
+        if got != want:
+            problems.append(f"New UserForm layout differs from the draft: {folded!r}")
+    for folded in sorted(set(written) - set(cand_storages)):
+        problems.append(f"New UserForm layout missing in candidate: {folded!r}")
+    return problems
+
+
+def _verify_new_forms_declared(host: Any, expected: DocumentDraft) -> list[str]:
+    """A form the draft adds is declared BaseClass, and Microsoft Forms is referenced."""
+    new_forms = expected.new_forms()
+    if not new_forms:
+        return []
+    problems: list[str] = []
+    cfb = CFB.from_bytes(host.vba_project_bytes())
+    try:
+        parsed, _lossy = _project_bytes_lossy(cfb.get_stream("PROJECT"), expected.baseline.code_page)
+    except KeyError:
+        return ["Candidate PROJECT stream is missing."]
+    base_classes = {name.casefold() for name in getattr(parsed, "base_classes", [])}
+    for module in new_forms:
+        if module.current_name.casefold() not in base_classes:
+            problems.append(f"New UserForm {module.current_name!r} is not declared as a form.")
+    libraries = " ".join(
+        f"{ref.libid or ''} {ref.guid or ''}".casefold() for ref in host.vba_project().references
+    )
+    if _MSFORMS_GUID not in libraries:
+        problems.append("The project has UserForms but no Microsoft Forms 2.0 reference.")
     return problems
 
 
 def _form_storage_names_folded(cfb: CFB) -> list[str]:
     return [name.casefold() for name in _form_storage_names(cfb)]
+
+
+# -- UserForm designer storages ----------------------------------------------------------
+#
+# A UserForm is two things in vbaProject.bin: its code module under VBA/, and a
+# storage named after it beside VBA/ holding the layout (f, o, \x03VBFrame,
+# \x01CompObj, a child storage per Frame/MultiPage/Page). The draft carries the
+# storage as bytes (``FormStorage``); a save copies it in unchanged, so a form
+# moved between add-ins keeps every byte Office wrote, pictures and fonts too.
+
+_NO_CLSID = bytes(16)
+_VBFRAME = "\x03VBFrame"
+_TWIPS_PER_POINT = 20
+_HIMETRIC_PER_POINT = 2540 / 72
+_MSFORMS_GUID = "{0d452ee1-e08f-101a-852e-02608c4d0bb4}"
+_TYPEINFO_RE = re.compile(r"^[ \t]*TypeInfoVer[ \t]*=[^\r\n]*\r?\n", re.MULTILINE)
+_BEGIN_RE = re.compile(r"^(Begin\s+\{[0-9A-Fa-f-]+\}\s+)(\S+)", re.MULTILINE)
+
+# Controls the designer can add (pyOpenVBA's add_control kinds), in toolbox order.
+FORM_CONTROL_KINDS = (
+    "Label",
+    "TextBox",
+    "ComboBox",
+    "ListBox",
+    "CheckBox",
+    "OptionButton",
+    "ToggleButton",
+    "Frame",
+    "CommandButton",
+    "TabStrip",
+    "MultiPage",
+    "ScrollBar",
+    "SpinButton",
+    "Image",
+)
+# Kinds whose size the designer will not change: their pages are laid out
+# for the size they were made at.
+_FIXED_SIZE_KINDS = frozenset({"MultiPage", "TabStrip"})
+
+
+def _entry_clsid(cfb: CFB, path: list[str]) -> bytes:
+    raw = cfb._directory[cfb._resolve_path(path)].raw
+    clsid = bytes(raw[80:96]) if len(raw) >= 96 else b""
+    return clsid if len(clsid) == 16 else _NO_CLSID
+
+
+def _read_storage(cfb: CFB, path: list[str]) -> FormStorage:
+    """Every stream and storage CLSID under ``path``, by relative path."""
+    streams: list[tuple[str, bytes]] = []
+    storages: list[tuple[str, bytes]] = [("", _entry_clsid(cfb, path))]
+
+    def visit(rel: list[str]) -> None:
+        full = [*path, *rel]
+        for name in cfb.list_streams_at(full):
+            streams.append(("/".join([*rel, name]), cfb.get_stream_at(full, name)))
+        for name in cfb.list_storages_at(full):
+            sub = [*rel, name]
+            storages.append(("/".join(sub), _entry_clsid(cfb, [*path, *sub])))
+            visit(sub)
+
+    visit([])
+    return FormStorage(streams=tuple(sorted(streams)), storages=tuple(sorted(storages)))
+
+
+def _write_storage(cfb: CFB, root: list[str], name: str, storage: FormStorage) -> None:
+    """Create storage ``name`` under ``root`` holding exactly ``storage``."""
+    clsids = dict(storage.storages)
+    top = clsids.get("", _NO_CLSID)
+    cfb.add_substorage_at(root, name, b"" if top == _NO_CLSID else top)
+    for rel in sorted((p for p in clsids if p), key=lambda p: (p.count("/"), p)):
+        parts = rel.split("/")
+        clsid = clsids[rel]
+        cfb.add_substorage_at([*root, name, *parts[:-1]], parts[-1], b"" if clsid == _NO_CLSID else clsid)
+    for rel, data in storage.streams:
+        parts = rel.split("/")
+        cfb.add_stream_at([*root, name, *parts[:-1]], parts[-1], data)
+
+
+_SCRATCH_PROJECT: bytes | None = None
+
+
+def _scratch_cfb() -> CFB:
+    """A small real project to parse and edit a lone form storage in."""
+    global _SCRATCH_PROJECT
+    if _SCRATCH_PROJECT is None:
+        with zipfile.ZipFile(io.BytesIO(blank_template_bytes(".xlam"))) as package:
+            _SCRATCH_PROJECT = package.read(_VBA_ENTRY[".xlam"])
+    return CFB.from_bytes(_SCRATCH_PROJECT)
+
+
+def _scratch_with(storage: FormStorage, name: str) -> CFB:
+    cfb = _scratch_cfb()
+    _write_storage(cfb, [], name, storage)
+    return CFB.from_bytes(cfb.to_bytes())
+
+
+def _points(himetric: float) -> float:
+    return round(himetric / _HIMETRIC_PER_POINT, 1)
+
+
+def _himetric(points: float) -> int:
+    return round(points * _HIMETRIC_PER_POINT)
+
+
+def _vbframe_value(text: str, key: str) -> str | None:
+    match = re.search(rf"^\s*{key}\s*=\s*(.*?)\s*$", text, re.MULTILINE)
+    if match is None:
+        return None
+    value = match.group(1)
+    if value.startswith('"'):
+        end = value.rfind('"')
+        return value[1:end].replace('""', '"') if end > 0 else value[1:]
+    return value.split("'", 1)[0].strip()
+
+
+def _sites(form: Any) -> dict[int, Any]:
+    """id(FormControl) -> its site record, over every level of the form."""
+    out: dict[int, Any] = {}
+    for level in form._levels:
+        for control, site in zip(level.controls, level.stream.sites, strict=False):
+            out[id(control)] = site
+    return out
+
+
+def _font_of(control: Any) -> tuple[str, float, bool] | None:
+    props = control.properties()
+    face = props.get("Font.FontName")
+    height = props.get("Font.FontHeight")
+    if not isinstance(face, str) or not isinstance(height, int):
+        return None
+    effects = props.get("Font.FontEffects")
+    weight = props.get("Font.FontWeight")
+    bold = (isinstance(effects, int) and bool(effects & 1)) or (isinstance(weight, int) and weight >= 600)
+    return face, round(height / _TWIPS_PER_POINT, 2), bold
+
+
+def _designed_control(control: Any, sites: dict[int, Any], in_multipage: bool = False) -> FormControlSnapshot:
+    site = sites.get(id(control))
+    left, top = (site.position or (0, 0)) if site is not None else (0, 0)
+    props = control.properties()
+    size = props.get("Size") or props.get("DisplayedSize")
+    if size is None:
+        default = _DEFAULT_SIZES.get(control.kind.rsplit(".", 1)[-1])
+        size_w, size_h = default if default else (None, None)
+    else:
+        size_w, size_h = size.width, size.height
+    caption = props.get("Caption")
+    tip = site.strings.get("ControlTipText") if site is not None else None
+    kind = control.kind.rsplit(".", 1)[-1]
+    is_multipage = kind == "MultiPage"
+    return FormControlSnapshot(
+        name=control.name,
+        kind=control.kind,
+        properties=_display_properties(props),
+        children=tuple(_designed_control(c, sites, is_multipage) for c in control.children),
+        left=_points(left),
+        top=_points(top),
+        width=None if size_w is None else _points(size_w),
+        height=None if size_h is None else _points(size_h),
+        caption=caption if isinstance(caption, str) else None,
+        tip=tip.text if tip is not None else None,
+        font=_font_of(control),
+        # A MultiPage's TabStrip and its pages are laid out by the MultiPage.
+        editable=not in_multipage and bool(control.name) and control.record is not None,
+    )
+
+
+def _design_of(form: Any, storage: FormStorage | None) -> FormDesignSnapshot:
+    sites = _sites(form)
+    props = form.properties()
+    size = props.get("DisplayedSize")
+    caption = _vbframe_value(form.designer_source, "Caption")
+    if caption is None:
+        stored = props.get("Caption")
+        caption = stored if isinstance(stored, str) else form.name
+    return FormDesignSnapshot(
+        name=form.name,
+        properties=_display_properties(props),
+        controls=tuple(_designed_control(c, sites) for c in form.controls),
+        storage=storage,
+        caption=caption,
+        width=_points(size.width) if size is not None else None,
+        height=_points(size.height) if size is not None else None,
+    )
+
+
+try:  # pyOpenVBA's own default control sizes (HIMETRIC), for controls that store none
+    from pyopenvba.forms import _DEFAULT_SIZE as _DEFAULT_SIZES  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - a later pyOpenVBA may move it
+    _DEFAULT_SIZES = {}
+
+
+def read_form_design(storage: FormStorage, name: str, code_page: int) -> FormDesignSnapshot:
+    """The layout a designer storage holds; ``problem`` set when it cannot be read."""
+    try:
+        cfb = _scratch_with(storage, name)
+        return _design_of(read_form(cfb, name, code_page=code_page), storage)
+    except Exception as exc:  # noqa: BLE001 - shown to the user, never fatal
+        return FormDesignSnapshot(name=name, problem=f"{type(exc).__name__}: {exc}", storage=storage)
+
+
+def describe_form_storage(storage: FormStorage | None, name: str, code_page: int) -> str:
+    """A plain-text listing of a layout, for the save review's diff."""
+    if storage is None:
+        return ""
+    design = read_form_design(storage, name, code_page)
+    if design.problem:
+        return f"UserForm {name}: layout could not be read ({design.problem})\n"
+    lines = [f'UserForm {name}  caption="{design.caption}"  size={design.width} x {design.height}']
+
+    def visit(items: tuple[FormControlSnapshot, ...], depth: int) -> None:
+        for c in items:
+            pad = "  " * depth
+            label = c.name or "(tabs)"
+            text = f'{pad}{c.short_kind} {label}  at {c.left},{c.top}  size {c.width} x {c.height}'
+            if c.caption:
+                text += f'  caption="{c.caption}"'
+            if c.tip:
+                text += f'  tip="{c.tip}"'
+            if c.font is not None:
+                text += f"  font={c.font[0]} {c.font[1]}{' bold' if c.font[2] else ''}"
+            lines.append(text)
+            visit(c.children, depth + 1)
+
+    visit(design.controls, 1)
+    lines.append(f"({storage.nbytes} bytes of designer data)")
+    return "\n".join(lines) + "\n"
+
+
+def form_storage_named(storage: FormStorage, name: str, code_page: int) -> FormStorage:
+    """``storage`` with its designer header naming the form ``name``.
+
+    The ``\\x03VBFrame`` text opens ``Begin {GUID} <form name>``; a form copied
+    or renamed under another name gets that line rewritten and nothing else.
+    """
+    raw = storage.stream(_VBFRAME)
+    if raw is None:
+        return storage
+    encoding = _encoding_for_codepage(code_page)
+    text = raw.decode(encoding, errors="replace")
+    renamed = _BEGIN_RE.sub(lambda m: m.group(1) + name, text, count=1)
+    if renamed == text:
+        return storage
+    data = renamed.encode(encoding, errors="replace")
+    return FormStorage(
+        streams=tuple((p, data if p == _VBFRAME else d) for p, d in storage.streams),
+        storages=storage.storages,
+    )
+
+
+def same_layout(a: FormStorage | None, b: FormStorage | None) -> bool:
+    """Equal storages, or equal but for the TypeInfoVer line an edit drops."""
+    if a == b:
+        return True
+    if a is None or b is None:
+        return False
+
+    def plain(storage: FormStorage) -> FormStorage:
+        raw = storage.stream(_VBFRAME)
+        if raw is None:
+            return storage
+        stripped = _TYPEINFO_RE.sub("", raw.decode("latin-1")).encode("latin-1")
+        return FormStorage(
+            streams=tuple((p, stripped if p == _VBFRAME else d) for p, d in storage.streams),
+            storages=storage.storages,
+        )
+
+    return plain(a) == plain(b)
+
+
+def new_form_storage(name: str, caption: str, code_page: int, *, width: float | None = None,
+                     height: float | None = None) -> tuple[FormStorage, str]:
+    """An empty UserForm as Excel makes one: its storage and its module header."""
+    cfb = _scratch_cfb()
+    header = create_form(cfb, name, caption=caption, width=width, height=height, code_page=code_page)
+    cfb = CFB.from_bytes(cfb.to_bytes())
+    return _read_storage(cfb, [name]), to_editor_text(header)
+
+
+class FormLayoutEditor:
+    """Edits one form's layout through pyOpenVBA, on a scratch copy of its storage."""
+
+    def __init__(self, form: Any, code_page: int) -> None:
+        self._form = form
+        self._encoding = _encoding_for_codepage(code_page)
+
+    # lookups
+    def _control(self, name: str) -> Any:
+        try:
+            return self._form.control(name)
+        except KeyError as exc:
+            raise AdapterError(f"The form has no control named {name!r}.") from exc
+
+    def _site(self, name: str) -> Any:
+        control = self._control(name)
+        site = _sites(self._form).get(id(control))
+        if site is None:
+            raise AdapterError(f"{name!r} has no site record.")
+        return site
+
+    def names(self) -> set[str]:
+        return {c.name.casefold() for c in self._form.walk() if c.name}
+
+    # the form itself
+    def set_form_caption(self, text: str) -> None:
+        self._form.set_property("Caption", text)
+
+    def set_form_size(self, width: float, height: float) -> None:
+        width, height = max(width, 12.0), max(height, 12.0)
+        self._form.set_property("DisplayedSize", Size(_himetric(width), _himetric(height)))
+        source = self._form.designer_source
+        for key, value in (("ClientWidth", width), ("ClientHeight", height)):
+            source = re.sub(
+                rf"^(\s*{key}\s*=\s*)\d+",
+                lambda m, v=value: f"{m.group(1)}{round(v * _TWIPS_PER_POINT)}",
+                source,
+                count=1,
+                flags=re.MULTILINE,
+            )
+        if source != self._form.designer_source:
+            self._form.designer_source = source
+            self._form._header_edited = True
+
+    # controls
+    def add_control(self, kind: str, name: str, *, container: str | None = None, left: float = 6,
+                    top: float = 6, width: float | None = None, height: float | None = None) -> None:
+        if kind not in FORM_CONTROL_KINDS:
+            raise AdapterError(f"Unknown control kind {kind!r}.")
+        try:
+            self._form.add_control(kind, name, container=container, left=left, top=top,
+                                   width=width, height=height)
+        except FormParseError as exc:
+            raise AdapterError(str(exc)) from exc
+
+    def remove_control(self, name: str) -> None:
+        try:
+            self._form.remove_control(name)
+        except (FormParseError, KeyError) as exc:
+            raise AdapterError(str(exc)) from exc
+
+    def set_caption(self, name: str, text: str | None) -> None:
+        try:
+            self._control(name).set_property("Caption", text if text else None)
+        except FormParseError as exc:
+            raise AdapterError(f"{name!r} has no caption.") from exc
+
+    def set_geometry(self, name: str, *, left: float | None = None, top: float | None = None,
+                     width: float | None = None, height: float | None = None) -> None:
+        control = self._control(name)
+        if left is not None or top is not None:
+            site = self._site(name)
+            old_left, old_top = site.position or (0, 0)
+            site.position = (
+                old_left if left is None else _himetric(max(left, -10000.0)),
+                old_top if top is None else _himetric(max(top, -10000.0)),
+            )
+            site.mask |= 1 << 8
+        if width is not None or height is not None:
+            kind = control.kind.rsplit(".", 1)[-1]
+            if kind in _FIXED_SIZE_KINDS:
+                raise AdapterError(f"A {kind} keeps the size it was made at; resize it in the VBA editor.")
+            props = control.properties()
+            size = props.get("Size") or props.get("DisplayedSize")
+            if size is None:
+                default = _DEFAULT_SIZES.get(kind, (2540, 635))
+                size = Size(*default)
+            new = Size(
+                size.width if width is None else _himetric(max(width, 1.0)),
+                size.height if height is None else _himetric(max(height, 1.0)),
+            )
+            control.set_property("Size", new)
+
+    def set_tip(self, name: str, text: str | None) -> None:
+        site = self._site(name)
+        if text:
+            fits = all(ord(c) <= 0xFF for c in text)
+            site.strings["ControlTipText"] = StoredString(text, fits, b"", edited=True)
+            site.mask |= 1 << 11
+        else:
+            site.strings.pop("ControlTipText", None)
+            site.values.pop("ControlTipTextData", None)
+            site.mask &= ~(1 << 11)
+
+    def set_font(self, name: str, face: str, size: float, bold: bool) -> None:
+        try:
+            self._control(name).set_font(face, size, bold=bold)
+        except (FormParseError, ValueError) as exc:
+            raise AdapterError(str(exc)) from exc
+
+    def rename_control(self, old: str, new: str) -> None:
+        if new.casefold() != old.casefold() and new.casefold() in self.names():
+            raise AdapterError(f"The form already has a control named {new!r}.")
+        control = self._control(old)
+        site = self._site(old)
+        stored = site.strings.get("Name")
+        compressed = stored.compressed if stored is not None else True
+        site.strings["Name"] = StoredString(new, compressed and all(ord(c) <= 0xFF for c in new), b"", edited=True)
+        site.mask |= 1 << 0
+        control.name = new
+
+
+def edit_form_storage(storage: FormStorage, name: str, code_page: int, edit) -> FormStorage:
+    """Apply ``edit(FormLayoutEditor)`` to a copy of ``storage``; return the new storage."""
+    cfb = _scratch_with(storage, name)
+    try:
+        form = read_form(cfb, name, code_page=code_page)
+    except Exception as exc:
+        raise AdapterError(f"The layout of {name} could not be read: {exc}") from exc
+    edit(FormLayoutEditor(form, code_page))
+    # The designer header's TypeInfoVer names the type information VBA compiled
+    # for the form's controls. Left in place after an edit, Excel refuses the
+    # form ("The ActiveX Designer's Type Information does not match what was
+    # saved"), and a raised number does not help; without it VBA builds the
+    # type information again on load, as for a new form, which has none.
+    # Measured with Excel 365 loading the saved add-in (tests/integration/test_live_userforms.py).
+    header = _TYPEINFO_RE.sub("", form.designer_source)
+    if header != form.designer_source:
+        form.designer_source = header
+        form._header_edited = True
+    try:
+        form.write_back(cfb)
+        result = CFB.from_bytes(cfb.to_bytes())
+        edited = _read_storage(result, [name])
+        read_form(result, name, code_page=code_page)  # the edit must read back
+    except AdapterError:
+        raise
+    except Exception as exc:
+        raise AdapterError(f"The edited layout of {name} could not be written: {exc}") from exc
+    return edited
+
+
+def _replace_form_storages(host: Any, draft: DocumentDraft) -> bool:
+    """Write the layouts the draft adds or edits into the host's project; True if any."""
+    cfb = host._get_cfb()
+    root = list(host._project_root())
+    code_page = draft.baseline.code_page
+    changed = False
+    for module in draft.changed_form_layouts():
+        assert module.form_storage is not None
+        existing = {s.casefold(): s for s in cfb.list_storages_at(root)}
+        name = module.origin_name or module.current_name
+        if name.casefold() in existing:
+            cfb.remove_storage_at(root, existing[name.casefold()])
+        _write_storage(cfb, root, name, form_storage_named(module.form_storage, name, code_page))
+        changed = True
+    return changed
+
+
+def _expected_layouts(draft: DocumentDraft) -> dict[str, FormStorage]:
+    """Case-folded form name -> the storage a save must leave, for forms it writes."""
+    code_page = draft.baseline.code_page
+    out: dict[str, FormStorage] = {}
+    for module in draft.new_forms():
+        assert module.form_storage is not None
+        out[module.current_name.casefold()] = form_storage_named(
+            module.form_storage, module.current_name, code_page
+        )
+    for module in draft.changed_form_layouts():
+        assert module.form_storage is not None
+        name = module.origin_name or module.current_name
+        out[name.casefold()] = form_storage_named(module.form_storage, name, code_page)
+    return out
 
 
 def _make_unique_temp_name(project: Any) -> str:

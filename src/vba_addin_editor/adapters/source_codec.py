@@ -5,6 +5,8 @@ Pure functions — no pyOpenVBA imports here so domain/services can use them fre
 
 from __future__ import annotations
 
+import re
+import uuid
 from dataclasses import dataclass
 
 
@@ -41,6 +43,24 @@ def replace_vb_name(header: str, current_name: str) -> str:
     if not found and header.strip():
         out.append(f'Attribute VB_Name = "{current_name}"')
     return "\n".join(out)
+
+
+_VB_BASE_RE = re.compile(r'^(Attribute\s+VB_Base\s*=\s*"0)\{[^}"]*\}(?:\{[^}"]*\})?"', re.IGNORECASE | re.MULTILINE)
+
+
+def fresh_designer_header(header: str, name: str) -> str:
+    """A UserForm module header for a copy: its new name, and new class ids.
+
+    A designer's ``VB_Base`` holds the form's own two GUIDs. Nothing in the
+    layout refers to them (they are not in the designer storage), and a copy
+    beside its original, or a second copy, must not share them.
+    """
+
+    def fresh(match: re.Match) -> str:
+        first, second = (str(uuid.uuid4()).upper() for _ in range(2))
+        return f'{match.group(1)}{{{first}}}{{{second}}}"'
+
+    return _VB_BASE_RE.sub(fresh, replace_vb_name(header, name), count=1)
 
 
 def synthesize_class_header(current_name: str) -> str:

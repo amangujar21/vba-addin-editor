@@ -126,6 +126,7 @@ def _module_from_snapshot(item: dict) -> ModuleDraft:
         stream_name=item.get("stream_name") or "",
         hidden_header=item.get("hidden_header") or "",
         project_item_kind=item.get("project_item_kind") or "unknown",
+        form_storage=item.get("form_storage"),
     )
 
 
@@ -197,6 +198,8 @@ def snapshot_modules(draft: DocumentDraft) -> list[dict]:
             "stream_name": module.stream_name,
             "hidden_header": module.hidden_header,
             "project_item_kind": module.project_item_kind,
+            # Immutable, so the snapshot can share it.
+            "form_storage": module.form_storage,
         }
         for module in draft.modules
     ]

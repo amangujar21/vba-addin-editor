@@ -1,13 +1,13 @@
 [project]
 name = "vba-addin-editor"
-version = "0.11.0"
+version = "0.12.0"
 description = "Safely edit VBA source inside installed Excel .xlam and PowerPoint .ppam add-ins, in place, with backup and verification."
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     # Exact pin: adapter relies on pyopenvba internals (_encoding_for_codepage,
     # detect_signature, _package_signature, forms). Change only with a test pass.
-    "pyopenvba==6.2.0",
+    "pyopenvba==6.6.0",
     # Custom ribbon icons: clipboard grab, resize, PNG encode. Imported lazily.
     "pillow>=10.1,<13",
 ]
